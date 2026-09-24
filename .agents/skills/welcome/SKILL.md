@@ -1,99 +1,40 @@
 ---
 name: welcome
-description: Greet the user when a new chat is opened with nothing to say yet. Invoked automatically as the first message of every chat that starts without one; what it says depends on how many chats have been greeted before.
-metadata:
-  author: imbue
+description: "Greet the user when a new project starts. This mind was created from the Rosette template, so the welcome introduces that template and immediately starts the adaptation conversation."
 ---
 
-# Welcome the user
+# Welcome the user (template: Rosette)
 
-Every chat that opens without a first message from the user starts with this skill. The very first conversation in a workspace is the onboarding chat, which arrives with the user's own message and never runs this, so the first time this runs the user is opening their *second* chat. What you say depends on how many times this has run before.
+This mind was created from a template -- a published snapshot of apps
+another mind built:
 
-## Step 1: find out which greeting this is
+- Title: Rosette
+- Slug: `rosette`
+- Description: A two-column notebook for language class: your lines on the left, translations and corrections on the right
+- Manifest: `template.md` (at the repo root, with `template.toml` beside it)
 
-Run exactly this command and read the number it prints (it also records this run):
+Do ALL of the following in your FIRST response, in the same turn, without
+waiting to be asked:
 
-```
-python3 system/scripts/welcome_count.py
-```
+1. Open with a short CUSTOM welcome that names **Rosette** and gives the
+   one-line description above. Do NOT use a generic "Welcome to Mind"
+   greeting and do NOT offer a generic suggestions list.
+2. Immediately read `template.md` at the repo root (reading the
+   manifest in the first turn is required).
+3. In plain, non-technical language, present what the template is and
+   what it needs from the user -- name the manifest's activation requirements
+   (the connectors/permissions it runs on). Then ask whether they want to hook it
+   up to their own accounts now (e.g. "Want me to connect this to your own
+   Slack?"). End your first response on THAT question. This is the
+   `use-template` skill's template path; the manifest's "How to adapt
+   it" section is the full script: if they say yes, ACTIVATE FIRST -- initiate
+   each `requires_permission` via a latchkey permission request, get the
+   app showing THEIR OWN DATA (that is the definition of working; a running
+   service is not), invite them to take a look -- and only then ask how they
+   want to adapt it.
 
-Do not call any other tools, do not look at the codebase, and do not mention this command or the number to the user.
-
-## Step 2: send the greeting for that number
-
-Output the greeting below that matches the number, verbatim, as your entire response, and stop.
-
-### 0: the second chat ever
-
----
-
-### A new chat, the same Mind
-
-This is a new chat, but you are talking to the same Mind as in your other chats. Think of chats the way you think of threads with one person: separate conversations for separate things, all with someone who knows what you have been working on. You can refer to something from another chat here and I will know what you mean.
-
-Use as many chats as you like, to keep things organized and to work on several things at once. Nothing is lost between them.
-
-What would you like to work on in this one?
-
----
-
-### 1: the third chat
-
----
-
-### Welcome back
-
-A quick hint: I can build you apps you can open as tabs, not just answer questions. Describe something you would like to have, from a small tracker to a dashboard over your accounts, and I will build the first version and show it to you.
-
-What would you like to work on?
-
----
-
-### 2: the fourth chat
-
----
-
-### Welcome back
-
-Another hint: you can connect the services you already use, such as email, calendar, Slack or GitHub, one permission at a time, and take any of them back whenever you like. Once connected, I can work from what is in them.
-
-What would you like to work on?
-
----
-
-### 3: the fifth chat
-
----
-
-### Welcome back
-
-One more hint: if there is something you want done on a schedule, like a briefing every morning or a weekly summary, ask for it. I can set it up to run on its own and report back here.
-
-What would you like to work on?
-
----
-
-### 4 or more: every later chat
-
----
-
-### Welcome back
-
-What would you like to work on?
-
----
-
-## If the user asks for suggestions
-
-After the greeting the user replies. If their reply asks for suggestions, says they are not sure, or otherwise signals they do not have something specific in mind, output the following message to the user, verbatim, and nothing else. (If instead they describe something they want to do, ignore this section and help them with that directly.)
-
----
-
-Here are some popular ways people get started with Mind. Pick whichever fits, and we can build on it as a starting point.
-
-1. **Unify your email & messages:** Bring every conversation into one place and respond from there.
-2. **Organize your tasks:** Build a system to track what you need to do and get it done.
-3. **Track your team's work:** A dashboard for everything across GitHub, Linear, Slack, and email.
-4. **Keep up with what you care about:** Stay current on the products, events, or news that matter to you.
-
----
+This repo holds exactly one template. If `template.toml` lists
+`[[lineage]]` entries, those are the templates this one was built on --
+each with the repo URL and commit it was taken at, so you can go read any of
+them at the exact state that was used. They are provenance, not something to
+adapt here.

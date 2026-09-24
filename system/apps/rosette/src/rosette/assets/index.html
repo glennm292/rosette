@@ -1,0 +1,953 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rosette</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=EB+Garamond:ital,wght@0,400;0,500;1,400;1,500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --page: #fcfbf8;
+  --ink: #1b2430;
+  --ink-soft: #66707f;
+  --ink-faint: #9aa3ae;
+  --rule: #cbd8e4;
+  --pen: #c8362b;
+  --pen-faint: rgba(200, 54, 43, .3);
+  --ok: #3f7d58;
+  --serif: "EB Garamond", "Iowan Old Style", Palatino, Georgia, serif;
+  --sans: "Archivo", "Helvetica Neue", Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+}
+
+body {
+  font-family: var(--serif);
+  font-size: 19px;
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+  /* Room below the last line, so the line being written can stay clear of the
+     bottom of the window as the page fills downward. */
+  padding-bottom: 28vh;
+}
+
+/* ---- header ------------------------------------------------------- */
+
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.15rem 2rem .9rem;
+  background: var(--page);
+}
+
+/* The page slides under the header, so it needs an opaque band and a short
+   fade below it rather than text surfacing through a gradient. */
+.masthead::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  height: 20px;
+  background: linear-gradient(var(--page), rgba(252, 251, 248, 0));
+  pointer-events: none;
+}
+
+.title {
+  display: flex;
+  align-items: baseline;
+  gap: .6rem;
+}
+
+.masthead h1 {
+  margin: 0;
+  font-family: var(--serif);
+  font-style: italic;
+  font-weight: 500;
+  font-size: 1.32rem;
+  letter-spacing: .005em;
+}
+
+/* The language sits next to the name because it is what the name is about.
+   The list covers the languages people are likely to be studying; "Other"
+   opens the box beside it so any language can still be named. */
+.language {
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  border-radius: 0;
+  padding: .1rem 1.1rem .1rem .2rem;
+  cursor: pointer;
+  /* The native arrow varies wildly between platforms, so it is replaced with
+     one drawn to match the rest of the page. */
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink-faint) 50%),
+                    linear-gradient(135deg, var(--ink-faint) 50%, transparent 50%);
+  background-position: right .45rem center, right .2rem center;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+
+.language:hover { border-bottom-color: var(--ink-faint); }
+
+.language:focus {
+  outline: none;
+  color: var(--ink);
+  border-bottom-color: var(--pen);
+}
+
+.other-language {
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--pen);
+  padding: .1rem .2rem;
+  width: 13ch;
+}
+
+.other-language:focus { outline: none; }
+.other-language[hidden] { display: none; }
+
+.status {
+  display: flex;
+  align-items: baseline;
+  gap: .9rem;
+}
+
+.tally {
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--ink-faint);
+}
+
+.clear {
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--ink-faint);
+  background: none;
+  border: 0;
+  padding: .1rem 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--rule);
+}
+
+.clear:hover { color: var(--ink-soft); }
+.clear[hidden] { display: none; }
+
+/* Asking to clear turns the button into the confirmation itself, so emptying a
+   week of notes always takes a second, deliberate click. */
+.clear.is-asking {
+  color: var(--pen);
+  text-decoration-color: var(--pen);
+}
+
+/* ---- the page ------------------------------------------------------ */
+
+.notebook {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 2rem;
+}
+
+.line {
+  display: grid;
+  grid-template-columns: minmax(0, 56fr) minmax(0, 44fr);
+  border-top: 1px solid var(--rule);
+}
+
+.line:first-child { border-top: none; }
+
+.mine,
+.gloss {
+  padding: .41rem 0 .46rem;
+  /* Low enough that it no longer sets the height of an ordinary one-line row,
+     which is what lets the padding above decide the spacing; it only keeps a
+     blank row from collapsing to nothing. */
+  min-height: 2.2rem;
+}
+
+.mine { padding-right: .95rem; }
+
+.gloss {
+  padding-left: .95rem;
+  border-left: 1.5px solid var(--pen-faint);
+  transition: border-left-color .2s ease, box-shadow .2s ease;
+}
+
+.line.is-active > .gloss,
+.line.is-pending > .gloss {
+  border-left-color: var(--pen);
+  box-shadow: inset 2px 0 0 var(--pen);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .line.is-pending > .gloss { animation: breathe 1.5s ease-in-out infinite; }
+}
+
+@keyframes breathe {
+  0%, 100% { box-shadow: inset 2px 0 0 var(--pen); }
+  50%      { box-shadow: inset 2px 0 0 var(--pen-faint); }
+}
+
+/* what I write */
+
+.mine textarea {
+  display: block;
+  width: 100%;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  resize: none;
+  overflow: hidden;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.05rem;
+  line-height: 1.62;
+}
+
+.mine textarea:focus { outline: none; }
+
+.mine textarea::placeholder {
+  color: var(--ink-faint);
+  font-family: var(--sans);
+  font-size: .82rem;
+  font-style: normal;
+}
+
+/* what comes back */
+
+@media (prefers-reduced-motion: no-preference) {
+  .gloss > .answer { animation: ink .42s cubic-bezier(.2, .7, .3, 1) both; }
+}
+
+@keyframes ink {
+  from { clip-path: inset(0 100% 0 0); }
+  to   { clip-path: inset(0 0 0 0); }
+}
+
+.italian, .english {
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+.english { font-style: italic; }
+
+.note {
+  font-family: var(--sans);
+  font-size: .8rem;
+  line-height: 1.55;
+  color: var(--ink-soft);
+  margin: .42rem 0 0;
+  max-width: 46ch;
+}
+
+/* the correction -- the one loud thing on the page */
+
+.wrong {
+  color: var(--pen);
+  text-decoration: line-through;
+  text-decoration-thickness: 1.5px;
+  text-decoration-color: var(--pen);
+}
+
+.right {
+  color: var(--pen);
+  font-weight: 500;
+}
+
+
+.verdict {
+  font-family: var(--sans);
+  font-size: .8rem;
+  font-weight: 500;
+  color: var(--pen);
+  margin: 0 0 .28rem;
+}
+
+.verdict.ok { color: var(--ok); }
+
+.thinking {
+  font-family: var(--sans);
+  font-size: .8rem;
+  color: var(--ink-faint);
+  margin: 0;
+}
+
+.failed {
+  font-family: var(--sans);
+  font-size: .8rem;
+  color: var(--pen);
+  margin: 0;
+}
+
+.retry {
+  font-family: var(--sans);
+  font-size: .78rem;
+  background: none;
+  border: 0;
+  padding: .1rem 0;
+  margin-left: .3rem;
+  color: var(--pen);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* an answer to something asked outright, so it gets room to be read */
+
+.reply {
+  font-family: var(--sans);
+  font-size: .88rem;
+  line-height: 1.6;
+  color: var(--ink);
+  margin: 0;
+  max-width: 46ch;
+}
+
+.asked {
+  color: var(--ink-soft);
+  font-style: italic;
+}
+
+:focus-visible {
+  outline: 2px solid var(--pen);
+  outline-offset: 2px;
+}
+
+/* The instruction line runs the width of the page rather than wrapping into a
+   narrow column, held off the edges by the same margin the notebook keeps. */
+.hint {
+  font-family: var(--sans);
+  font-size: .82rem;
+  color: var(--ink-faint);
+  margin: 0;
+  padding: 1.4rem 2rem 0;
+}
+
+.offline {
+  position: fixed;
+  bottom: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--page);
+  background: var(--ink);
+  padding: .45rem .8rem;
+  border-radius: 3px;
+}
+
+.offline[hidden] { display: none; }
+
+@media (max-width: 820px) {
+  .line { grid-template-columns: 1fr; }
+  .mine { padding-right: 0; padding-bottom: .3rem; }
+  .gloss { padding-left: 1rem; border-left-width: 2px; margin-bottom: .3rem; }
+}
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="title">
+    <h1>Rosette</h1>
+    <select id="language" class="language" aria-label="Language"></select>
+    <input id="other-language" class="other-language" type="text" hidden
+           autocomplete="off" spellcheck="false" aria-label="Name the language"
+           placeholder="Which language?">
+  </div>
+  <div class="status">
+    <span class="tally" id="tally"></span>
+    <button class="clear" id="clear" type="button" hidden>Clear</button>
+  </div>
+</header>
+
+<main class="notebook" id="notebook"></main>
+
+<p class="hint" id="hint" hidden></p>
+<div class="offline" id="offline" hidden>Not saving right now. Your typing is safe on screen.</div>
+
+<script>
+"use strict";
+
+// How long after the last keystroke a line is sent to the tutor. Long enough
+// that a pause mid-sentence does not fire, short enough that the answer is
+// already coming before the student looks right. Pressing Enter sends at once
+// and does not wait for this.
+const IDLE_SEND_MS = 500;
+// How long to hold off after the connection to the server drops.
+const RECONNECT_MS = 1000;
+
+const notebookElement = document.getElementById("notebook");
+const tallyElement = document.getElementById("tally");
+const hintElement = document.getElementById("hint");
+const offlineElement = document.getElementById("offline");
+const languageElement = document.getElementById("language");
+const otherLanguageElement = document.getElementById("other-language");
+const clearElement = document.getElementById("clear");
+
+// The languages offered in the list. Any other can still be named through the
+// last entry, so this is a convenience, not a limit.
+const LANGUAGE_OPTIONS = [
+  "Arabic", "Bengali", "Catalan", "Croatian", "Czech", "Danish", "Dutch",
+  "Finnish", "French", "German", "Greek", "Hebrew", "Hindi", "Hungarian",
+  "Indonesian", "Irish", "Italian", "Japanese", "Korean", "Latin",
+  "Mandarin Chinese", "Norwegian", "Persian", "Polish", "Portuguese",
+  "Romanian", "Russian", "Serbian", "Slovak", "Spanish", "Swahili", "Swedish",
+  "Thai", "Turkish", "Ukrainian", "Vietnamese", "Welsh",
+];
+// Not a language name, so it can never collide with a real entry in the list.
+const OTHER_LANGUAGE_VALUE = "__other__";
+
+// The language the notebook is being kept in. Lines already answered keep the
+// language they were answered in; this only governs what is written next.
+let language = "Italian";
+
+// row_id -> {text, status, analysis, raw_response, error} as the server has it.
+const answerByRowId = new Map();
+// The order rows appear on the page.
+let rowOrder = [];
+// Lines whose text is still settling locally, so a watch must not overwrite them.
+const inFlightByRowId = new Map();
+// The notebook state this page has already applied.
+let notebookVersion = -1;
+
+function newRowId() {
+  return "row-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+function escapeText(value) {
+  const holder = document.createElement("span");
+  holder.textContent = value;
+  return holder.innerHTML;
+}
+
+// ---- drawing one line ------------------------------------------------
+
+function renderGloss(row) {
+  if (!row) return "";
+  if (row.status === "pending") return '<p class="thinking">Reading that…</p>';
+  if (row.status === "error") {
+    return '<p class="failed">Could not reach the tutor.' +
+      '<button class="retry" type="button" data-retry="' + escapeText(row.row_id) + '">Try again</button></p>';
+  }
+  if (row.status !== "done" || !row.analysis) return "";
+
+  const analysis = row.analysis;
+  const parts = [];
+
+  if (analysis.mode === "answer" && analysis.answer) {
+    parts.push('<p class="reply">' + escapeText(analysis.answer) + "</p>");
+  } else if (analysis.mode === "translate" && analysis.italian) {
+    parts.push('<p class="italian">' + escapeText(analysis.italian) + "</p>");
+  } else if (analysis.mode === "gloss" && analysis.english) {
+    parts.push('<p class="english">' + escapeText(analysis.english) + "</p>");
+  } else if (analysis.mode === "assess") {
+    if (analysis.verdict === "correct") {
+      parts.push('<p class="verdict ok">All correct.</p>');
+    } else if (analysis.verdict === null) {
+      // The tutor had something to say but could not mark it on the line, so
+      // the note below stands on its own rather than under a wrong verdict.
+    } else {
+      const fixCount = analysis.segments.filter(s => s.kind === "right").length;
+      parts.push('<p class="verdict">' + (fixCount === 1 ? "One fix." : fixCount + " fixes.") + "</p>");
+      const runs = analysis.segments.map((segment, index) => {
+        if (segment.kind === "wrong") return '<span class="wrong">' + escapeText(segment.text) + "</span>";
+        if (segment.kind === "right") {
+          // A replacement lands straight after the text it replaces, so it
+          // needs a real space to read (and to copy) as a separate word.
+          const isAfterWrong = index > 0 && analysis.segments[index - 1].kind === "wrong";
+          return (isAfterWrong ? " " : "") + '<span class="right">' + escapeText(segment.text) + "</span>";
+        }
+        return escapeText(segment.text);
+      });
+      parts.push('<p class="italian">' + runs.join("") + "</p>");
+    }
+  }
+
+  if (analysis.note) parts.push('<p class="note">' + escapeText(analysis.note) + "</p>");
+
+  return '<div class="answer">' + parts.join("") + "</div>";
+}
+
+function paintGloss(rowId) {
+  const lineElement = notebookElement.querySelector('[data-row-id="' + rowId + '"]');
+  if (!lineElement) return;
+  const row = answerByRowId.get(rowId);
+  const glossElement = lineElement.querySelector(".gloss");
+  const nextHtml = renderGloss(row);
+  // Only touch the DOM when the content actually changed, so an open "see the
+  // full response" panel is not snapped shut by a poll that changed nothing.
+  if (glossElement.dataset.rendered !== nextHtml) {
+    glossElement.innerHTML = nextHtml;
+    glossElement.dataset.rendered = nextHtml;
+  }
+  lineElement.classList.toggle("is-pending", !!row && row.status === "pending");
+}
+
+function growTextarea(textarea) {
+  textarea.style.height = "auto";
+  textarea.style.height = textarea.scrollHeight + "px";
+}
+
+function buildLine(rowId, text) {
+  const lineElement = document.createElement("div");
+  lineElement.className = "line";
+  lineElement.dataset.rowId = rowId;
+
+  const mineElement = document.createElement("div");
+  mineElement.className = "mine";
+  const textarea = document.createElement("textarea");
+  textarea.rows = 1;
+  textarea.spellcheck = false;
+  textarea.value = text || "";
+  mineElement.appendChild(textarea);
+
+  const glossElement = document.createElement("div");
+  glossElement.className = "gloss";
+
+  lineElement.appendChild(mineElement);
+  lineElement.appendChild(glossElement);
+  return lineElement;
+}
+
+// ---- talking to the server -------------------------------------------
+
+async function sendRow(rowId, text, afterRowId) {
+  inFlightByRowId.set(rowId, text);
+  try {
+    const response = await fetch("/api/rows/" + encodeURIComponent(rowId), {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text: text, after: afterRowId || null}),
+    });
+    if (!response.ok) throw new Error("save failed: " + response.status);
+    const row = await response.json();
+    offlineElement.hidden = true;
+    // A newer keystroke may have landed while this was in the air; that later
+    // save owns the row's state, so do not paint this stale one over it.
+    if (inFlightByRowId.get(rowId) === text) {
+      answerByRowId.set(rowId, row);
+      paintGloss(rowId);
+    }
+  } catch (error) {
+    offlineElement.hidden = false;
+  } finally {
+    if (inFlightByRowId.get(rowId) === text) inFlightByRowId.delete(rowId);
+  }
+}
+
+async function deleteRow(rowId) {
+  try {
+    await fetch("/api/rows/" + encodeURIComponent(rowId), {method: "DELETE"});
+  } catch (error) {
+    offlineElement.hidden = false;
+  }
+}
+
+function applyNotebook(notebook) {
+  for (const row of notebook.rows) {
+    // A row the student is still editing keeps its local text; only the
+    // tutor's side of it is taken from the server.
+    if (inFlightByRowId.has(row.row_id)) continue;
+    answerByRowId.set(row.row_id, row);
+    paintGloss(row.row_id);
+  }
+  updateTally();
+}
+
+// One request stays open at all times, and the server answers it the instant
+// anything changes, so an answer appears as soon as it exists. On a quiet
+// notebook the server lets it return unchanged and this opens the next one.
+async function watchForAnswers() {
+  while (true) {
+    try {
+      const response = await fetch("/api/notebook?since=" + notebookVersion);
+      if (!response.ok) throw new Error("watch failed: " + response.status);
+      const notebook = await response.json();
+      notebookVersion = notebook.version;
+      offlineElement.hidden = true;
+      applyNotebook(notebook);
+    } catch (error) {
+      // The connection dropped or the server is restarting; show that nothing
+      // is being saved, then try again shortly rather than spinning.
+      offlineElement.hidden = false;
+      await new Promise(resolve => window.setTimeout(resolve, RECONNECT_MS));
+    }
+  }
+}
+
+function writtenLineCount() {
+  return rowOrder.filter(rowId => {
+    const row = answerByRowId.get(rowId);
+    return row && row.text.trim() !== "";
+  }).length;
+}
+
+function updateTally() {
+  const writtenCount = writtenLineCount();
+  tallyElement.textContent = writtenCount === 0
+    ? ""
+    : writtenCount + (writtenCount === 1 ? " line" : " lines");
+  // The explanation is for someone looking at a blank page; once there are
+  // notes on it, it has served its purpose and gets out of the way.
+  hintElement.hidden = writtenCount !== 0;
+  clearElement.hidden = writtenCount === 0;
+  if (writtenCount === 0) stopAskingToClear();
+}
+
+// ---- typing ----------------------------------------------------------
+
+const idleTimerByRowId = new Map();
+
+function queueSend(rowId) {
+  const existingTimer = idleTimerByRowId.get(rowId);
+  if (existingTimer) window.clearTimeout(existingTimer);
+  idleTimerByRowId.set(rowId, window.setTimeout(() => {
+    idleTimerByRowId.delete(rowId);
+    flushRow(rowId);
+  }, IDLE_SEND_MS));
+}
+
+function flushRow(rowId) {
+  const existingTimer = idleTimerByRowId.get(rowId);
+  if (existingTimer) {
+    window.clearTimeout(existingTimer);
+    idleTimerByRowId.delete(rowId);
+  }
+  const lineElement = notebookElement.querySelector('[data-row-id="' + rowId + '"]');
+  if (!lineElement) return;
+  const text = lineElement.querySelector("textarea").value;
+  // A send of this exact text is already in the air. Without this, typing and
+  // then pressing Enter within the idle delay asks the tutor the same question
+  // twice -- paying for it twice and waiting on the slower of the two.
+  if (inFlightByRowId.get(rowId) === text) return;
+  const stored = answerByRowId.get(rowId);
+  if (stored && stored.text === text && stored.status !== "error") return;
+  const index = rowOrder.indexOf(rowId);
+  sendRow(rowId, text, index > 0 ? rowOrder[index - 1] : null);
+}
+
+function addLine(afterRowId, initialText) {
+  const rowId = newRowId();
+  const lineElement = buildLine(rowId, initialText || "");
+  const afterElement = afterRowId
+    ? notebookElement.querySelector('[data-row-id="' + afterRowId + '"]')
+    : null;
+  if (afterElement) {
+    afterElement.insertAdjacentElement("afterend", lineElement);
+    rowOrder.splice(rowOrder.indexOf(afterRowId) + 1, 0, rowId);
+  } else {
+    notebookElement.appendChild(lineElement);
+    rowOrder.push(rowId);
+  }
+  growTextarea(lineElement.querySelector("textarea"));
+  return rowId;
+}
+
+function focusRow(rowId, caretAtEnd) {
+  const lineElement = notebookElement.querySelector('[data-row-id="' + rowId + '"]');
+  if (!lineElement) return;
+  const textarea = lineElement.querySelector("textarea");
+  textarea.focus();
+  if (caretAtEnd) textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  // Keep the line being written comfortably above the fold as the page fills.
+  lineElement.scrollIntoView({block: "nearest", behavior: "smooth"});
+}
+
+function isLastRow(rowId) {
+  return rowOrder[rowOrder.length - 1] === rowId;
+}
+
+function handleKeydown(event) {
+  const textarea = event.target;
+  if (textarea.tagName !== "TEXTAREA") return;
+  const rowId = textarea.closest(".line").dataset.rowId;
+
+  // Enter finishes this line and starts the next. Shift+Enter breaks the line
+  // without leaving it, for a paragraph that runs over.
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    flushRow(rowId);
+    const index = rowOrder.indexOf(rowId);
+    const nextRowId = rowOrder[index + 1];
+    // Reuse a blank line already sitting below rather than stacking up more.
+    const nextRow = nextRowId ? answerByRowId.get(nextRowId) : null;
+    const nextTextarea = nextRowId
+      ? notebookElement.querySelector('[data-row-id="' + nextRowId + '"] textarea')
+      : null;
+    if (nextTextarea && nextTextarea.value.trim() === "") {
+      focusRow(nextRowId, true);
+    } else {
+      focusRow(addLine(rowId, ""), true);
+    }
+    updateTally();
+    return;
+  }
+
+  // Backspace at the very start of a blank line removes it and steps back up,
+  // so a line opened by mistake does not have to be left behind.
+  if (event.key === "Backspace" && textarea.value === "" && rowOrder.length > 1) {
+    const index = rowOrder.indexOf(rowId);
+    if (index > 0) {
+      event.preventDefault();
+      const previousRowId = rowOrder[index - 1];
+      removeLine(rowId);
+      focusRow(previousRowId, true);
+      updateTally();
+    }
+  }
+}
+
+function removeLine(rowId) {
+  const lineElement = notebookElement.querySelector('[data-row-id="' + rowId + '"]');
+  if (lineElement) lineElement.remove();
+  rowOrder = rowOrder.filter(id => id !== rowId);
+  answerByRowId.delete(rowId);
+  deleteRow(rowId);
+}
+
+function handleInput(event) {
+  const textarea = event.target;
+  if (textarea.tagName !== "TEXTAREA") return;
+  growTextarea(textarea);
+  queueSend(textarea.closest(".line").dataset.rowId);
+}
+
+function handleFocusIn(event) {
+  if (event.target.tagName !== "TEXTAREA") return;
+  for (const element of notebookElement.querySelectorAll(".line.is-active")) {
+    element.classList.remove("is-active");
+  }
+  event.target.closest(".line").classList.add("is-active");
+}
+
+function handleFocusOut(event) {
+  if (event.target.tagName !== "TEXTAREA") return;
+  const lineElement = event.target.closest(".line");
+  lineElement.classList.remove("is-active");
+  flushRow(lineElement.dataset.rowId);
+}
+
+function handleClick(event) {
+  const retryRowId = event.target.dataset ? event.target.dataset.retry : null;
+  if (!retryRowId) return;
+  const lineElement = notebookElement.querySelector('[data-row-id="' + retryRowId + '"]');
+  if (!lineElement) return;
+  const text = lineElement.querySelector("textarea").value;
+  const index = rowOrder.indexOf(retryRowId);
+  sendRow(retryRowId, text, index > 0 ? rowOrder[index - 1] : null);
+}
+
+// ---- opening the notebook --------------------------------------------
+
+function buildLanguageOptions() {
+  // A language set before, or named through "Other", may not be on the list;
+  // it is added so the list can always show what the notebook is actually set
+  // to rather than silently falling back to the first entry.
+  const names = LANGUAGE_OPTIONS.includes(language)
+    ? LANGUAGE_OPTIONS
+    : [...LANGUAGE_OPTIONS, language].sort((a, b) => a.localeCompare(b));
+  const options = names.map(name => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    return option;
+  });
+  const other = document.createElement("option");
+  other.value = OTHER_LANGUAGE_VALUE;
+  other.textContent = "Other…";
+  options.push(other);
+  languageElement.replaceChildren(...options);
+}
+
+function paintLanguage() {
+  buildLanguageOptions();
+  languageElement.value = language;
+  hintElement.textContent =
+    "Type in either language. English comes back as " + language + "; " +
+    language + " gets checked. Start a line with ? to ask a question instead. " +
+    "Press Enter to start the next line.";
+}
+
+async function setLanguage(requested) {
+  if (requested === "" || requested === language) {
+    paintLanguage();
+    return;
+  }
+  try {
+    const response = await fetch("/api/settings", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({language: requested}),
+    });
+    if (!response.ok) throw new Error("save failed: " + response.status);
+    const settings = await response.json();
+    language = settings.language;
+    offlineElement.hidden = true;
+  } catch (error) {
+    offlineElement.hidden = false;
+  }
+  paintLanguage();
+}
+
+function handleLanguageChange() {
+  if (languageElement.value === OTHER_LANGUAGE_VALUE) {
+    // Show the box to name a language that is not on the list, leaving the
+    // list on what it was so nothing changes until a name is actually given.
+    otherLanguageElement.value = "";
+    otherLanguageElement.hidden = false;
+    otherLanguageElement.focus();
+    return;
+  }
+  otherLanguageElement.hidden = true;
+  setLanguage(languageElement.value);
+}
+
+function commitOtherLanguage() {
+  const requested = otherLanguageElement.value.trim();
+  otherLanguageElement.hidden = true;
+  setLanguage(requested);
+}
+
+// ---- clearing ---------------------------------------------------------
+
+// How long the button waits for the confirming click before going back to
+// being an ordinary button, so a stray click cannot be confirmed much later.
+const CLEAR_CONFIRM_MS = 6000;
+let clearConfirmTimer = null;
+
+function stopAskingToClear() {
+  if (clearConfirmTimer !== null) {
+    window.clearTimeout(clearConfirmTimer);
+    clearConfirmTimer = null;
+  }
+  clearElement.classList.remove("is-asking");
+  clearElement.textContent = "Clear";
+}
+
+function startAskingToClear() {
+  const writtenCount = writtenLineCount();
+  clearElement.classList.add("is-asking");
+  clearElement.textContent =
+    "Clear " + writtenCount + (writtenCount === 1 ? " line?" : " lines?");
+  clearConfirmTimer = window.setTimeout(stopAskingToClear, CLEAR_CONFIRM_MS);
+}
+
+async function handleClearClick() {
+  if (!clearElement.classList.contains("is-asking")) {
+    startAskingToClear();
+    return;
+  }
+  stopAskingToClear();
+  try {
+    const response = await fetch("/api/notebook", {method: "DELETE"});
+    if (!response.ok) throw new Error("clear failed: " + response.status);
+    offlineElement.hidden = true;
+  } catch (error) {
+    offlineElement.hidden = false;
+    return;
+  }
+  // Start the page over from an empty notebook, on one blank line.
+  for (const rowId of [...rowOrder]) inFlightByRowId.delete(rowId);
+  notebookElement.replaceChildren();
+  rowOrder = [];
+  answerByRowId.clear();
+  const rowId = addLine(null, "");
+  updateTally();
+  focusRow(rowId, true);
+}
+
+async function start() {
+  try {
+    const response = await fetch("/api/settings");
+    if (response.ok) language = (await response.json()).language;
+  } catch (error) {
+    offlineElement.hidden = false;
+  }
+  paintLanguage();
+
+  let notebook = {rows: [], version: -1};
+  try {
+    const response = await fetch("/api/notebook");
+    if (response.ok) {
+      notebook = await response.json();
+      notebookVersion = notebook.version;
+    }
+  } catch (error) {
+    offlineElement.hidden = false;
+  }
+
+  for (const row of notebook.rows) {
+    const lineElement = buildLine(row.row_id, row.text);
+    notebookElement.appendChild(lineElement);
+    rowOrder.push(row.row_id);
+    answerByRowId.set(row.row_id, row);
+    growTextarea(lineElement.querySelector("textarea"));
+    paintGloss(row.row_id);
+  }
+
+  // There is always one blank line at the bottom waiting to be written in.
+  const lastRowId = rowOrder[rowOrder.length - 1];
+  const lastRow = lastRowId ? answerByRowId.get(lastRowId) : null;
+  if (!lastRow || lastRow.text.trim() !== "") addLine(null, "");
+
+  const firstTextarea = notebookElement.querySelector(".line textarea");
+  if (firstTextarea) firstTextarea.placeholder = "Start typing…";
+
+  updateTally();
+  focusRow(rowOrder[rowOrder.length - 1], true);
+  watchForAnswers();
+}
+
+clearElement.addEventListener("click", handleClearClick);
+clearElement.addEventListener("blur", stopAskingToClear);
+
+languageElement.addEventListener("change", handleLanguageChange);
+
+otherLanguageElement.addEventListener("blur", commitOtherLanguage);
+otherLanguageElement.addEventListener("keydown", event => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    otherLanguageElement.blur();
+  } else if (event.key === "Escape") {
+    // Back out without changing anything.
+    otherLanguageElement.value = "";
+    otherLanguageElement.blur();
+  }
+});
+
+notebookElement.addEventListener("keydown", handleKeydown);
+notebookElement.addEventListener("input", handleInput);
+notebookElement.addEventListener("focusin", handleFocusIn);
+notebookElement.addEventListener("focusout", handleFocusOut);
+notebookElement.addEventListener("click", handleClick);
+
+start();
+
+if (window.parent !== window) {
+  window.parent.postMessage({type: "shell:location", path: location.pathname + location.search}, "*");
+}
+</script>
+</body>
+</html>
