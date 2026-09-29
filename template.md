@@ -1,8 +1,8 @@
 ---
 title: "Rosette"
-description: "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right."
+description: "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail: "template.svg"
-version: v1
+version: v2
 format: v2
 ---
 
@@ -16,7 +16,7 @@ follow "How to adapt it" below.
 
 ## What it is
 
-A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right.
+A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key.
 
 Rosette is a single page you keep open during a language lesson. It looks like a
 school exercise book split down the middle by a red margin rule: the left half
@@ -38,7 +38,15 @@ language it was answered in, so switching mid-notebook leaves earlier lines
 alone. Notes persist between sessions; a Clear control beside the line count
 empties the page behind a two-click confirm and files the cleared notebook away
 rather than destroying it. The whole thing is one app, one tab, no setup beyond
-the workspace's own Claude access.
+the workspace's own Claude access -- or, outside a Mind, your own Anthropic API
+key, which also makes each answer arrive faster inside one.
+
+A question is answered against the notebook rather than in isolation, so "the
+line above" means the line above. Tell it something lasting about yourself ("I'm
+male") and it is remembered: every later line is judged with it known, the
+earlier lines it changes are re-read, and the fact is listed under the header
+where it can be taken back. A small pair of scissors in the left margin removes a
+line and everything below it, with an undo for a few seconds afterwards.
 
 ## How it works
 
@@ -49,14 +57,15 @@ from the original mind onto a clean default-workspace-template base):
 - `system/supervisord.conf.d/rosette.conf`
 
 `system/apps/rosette` is the whole app -- a small Flask package with its own
-`pyproject.toml` (flask, flask-sock, loguru, pydantic, werkzeug), its app
-manifest (`app.toml`), its icon, its README and its ratchets file. Inside
-`src/rosette/`: `runner.py` is the server and its HTTP routes, `tutor.py` holds
-the model, the prompt and the per-language grammar checklists, `notebook.py` and
-`settings.py` are the two on-disk stores, `data_types.py` the pydantic shapes,
-`claude_p.py` a vendored copy of the workspace's headless-Claude helper, and
-`assets/index.html` the entire front end -- one self-contained page, no build
-step.
+`pyproject.toml` (flask, flask-sock, litellm, loguru, pydantic, werkzeug), its
+app manifest (`app.toml`), its icon, its README, its ratchets file and its tests
+(`runner_test.py`). Inside `src/rosette/`: `runner.py` is the server and its
+HTTP routes, `tutor.py` holds the model, the prompt, the per-language grammar
+checklists and the two routes to Claude, `notebook.py` and `settings.py` are the
+two on-disk stores, `credentials.py` looks after the optional API key,
+`data_types.py` the pydantic shapes, `claude_p.py` a vendored copy of the
+workspace's headless-Claude helper, and `assets/index.html` the entire front end
+-- one self-contained page, no build step.
 
 `system/supervisord.conf.d/rosette.conf` is the program entry that runs it. On
 start it calls `system/scripts/forward_port.py` with the app's manifest to
@@ -67,11 +76,32 @@ one while it is being edited.
 
 **The two columns.** The browser `PUT`s each line to `/api/rows/<row_id>` as it
 is typed. The server stores the line immediately with status `pending` and hands
-it to a small thread pool (four workers -- each reply is a whole subprocess, so
-an unbounded burst would starve the machine rather than answer sooner). When the
-answer lands it is written back only if the line still says what it said when
-the question was asked, so an answer to a line you have since rewritten is
-dropped rather than shown against the new text.
+it to a small thread pool (four workers -- on the keyless route each reply is a
+whole subprocess, so an unbounded burst would starve the machine rather than
+answer sooner). When the answer lands it is written back only if the line still
+says what it said when the question was asked, so an answer to a line you have
+since rewritten is dropped rather than shown against the new text. Until the new
+answer arrives, an edited line keeps showing its previous one rather than
+blanking.
+
+**Nothing is stranded or lost silently.** Any row still `pending` when the
+server starts goes straight back in the queue -- a restart mid-answer used to
+leave that row waiting forever. A worker's failure is read off the finished task
+rather than caught inside it, so an error nobody anticipated still reaches the
+row as a visible failure instead of vanishing. The red margin rule doubles as
+status: it shows red beside a line while that line is being read, and green once
+its answer is in.
+
+**Questions are answered against the notebook.** A `?` line is sent with the
+eight lines above it, each with a short recap of what the tutor said about it,
+so "the line above" and "that last sentence" resolve. The reply can also carry a
+lasting fact about the student ("the student is male") and the distances of the
+lines above whose reading that fact changes. The fact is recorded in the
+settings store and included in every later prompt, and the named lines are
+re-queued -- so a hedge like "if you are female, use *stanca*" disappears from an
+answer that was already given. The facts are listed under the header, each with
+a control to take it back, since a wrong one would quietly skew everything
+judged after it.
 
 **Answers reach the page the instant they are stored.** There is no polling: the
 notebook store keeps a version counter and a condition variable, the page holds
@@ -79,12 +109,27 @@ one `GET /api/notebook?since=<version>` open, and the server completes that
 request the moment a write bumps the counter (or after 25 seconds, so a dead
 connection gets noticed and renewed).
 
-**Where the answers come from.** `tutor.py` calls `claude -p` through the
-vendored `claude_p.py` helper -- the keyless, subscription-backed route, with no
-API key anywhere. The model is `claude-sonnet-5`, named in one constant.
+**Where the answers come from -- two routes.** With an API key, `tutor.py`
+calls the Anthropic API directly through litellm, with the tutor's instructions
+marked cacheable since they are the same on every line; this is the quicker
+route, because it skips starting a fresh process per line. Without a key it
+calls `claude -p` through the vendored `claude_p.py` helper -- the keyless,
+subscription-backed route a signed-in Mind already has. The key is read from
+`ANTHROPIC_API_KEY` first (how a standalone copy is configured), then from a
+file in the app's own data directory that the page writes when the key is
+entered under "Speed this up" in the header. That file is created readable by
+its owner only, and no route ever returns the key to the page -- only whether
+one is set, where it came from, and its last four characters. The model is
+`claude-sonnet-5`, named in one constant, on both routes.
 
-**Extended thinking is deliberately off** (`MAX_THINKING_TOKENS=0` in the child
-environment), and this is the most transferable decision in the app. Left on,
+**Extended thinking is deliberately off on both routes**
+(`MAX_THINKING_TOKENS=0` in the child environment on the keyless route,
+`thinking` disabled in the API call on the keyed one), and this is the most
+transferable decision in the app. The keyed route needs it said separately:
+there, left on, the worst line measured took 31s and 3728 output tokens against
+4.8s and 553 with it off -- and it overran the reply limit, which does not
+truncate a reply but returns an EMPTY one, so the row got nothing back at all.
+On the keyless route, left on,
 the model spent thousands of invisible tokens deliberating before each line --
 up to 4757 to gloss a single word -- which roughly doubled both the wait and the
 cost. Turning it off and spending part of the saving on a stronger model plus an
@@ -105,22 +150,40 @@ another language is one new entry in that dict and nothing else.
 **Corrections are typed, and verified before they are shown.** The model returns
 a correction as a sequence of runs (`same` / `wrong` / `right`) rather than free
 text, and the server rejects any correction whose runs do not faithfully rebuild
-the line the student actually wrote, or that changes nothing at all -- it falls
-back to showing the explanation with no verdict. This caught real failures: a
-German correction that silently dropped the subject, and a Spanish one that
-claimed a fix it had not made.
+the line the student actually wrote, or that changes nothing at all. Such a
+reply first gets one more attempt, since a fresh one often marks the same line
+cleanly and the marked-up line is most of a correction's value; only if that
+fails too does it fall back to showing the explanation with no verdict. This
+caught real failures: a German correction that silently dropped the subject, and
+a Spanish one that claimed a fix it had not made.
 
-**On disk.** `notebook.json` and `settings.json` under the app's data directory,
-each written through a temp file and renamed so a crash leaves the previous copy
-intact. Every row keeps the model's raw response even though nothing in the page
-links to it. Clearing the notebook writes the cleared copy into `cleared/` with
-a timestamped name rather than deleting it.
+**Clearing from a line down.** Hovering the left margin beside a line reveals a
+small scissors; clicking it dims that line and everything below it, then removes
+them and offers an undo for twelve seconds. The removed stretch is archived
+before it goes, and the undo appends it back with its answers intact, so nothing
+is re-asked.
 
-**Cost.** Roughly half a cent per line, a few seconds each.
+**On disk.** `notebook.json` and `settings.json` (the chosen language and the
+recorded facts) under the app's data directory, each written through a temp file
+and renamed so a crash leaves the previous copy intact. Every row keeps the
+model's raw response even though nothing in the page links to it. Clearing the
+notebook writes the cleared copy into `cleared/` with a timestamped name rather
+than deleting it, and a stretch removed with the scissors is archived there the
+same way. A key entered in the page is kept in `anthropic-api-key` beside them,
+owner-readable only; removing it from the page deletes the file.
+
+**Tests.** `runner_test.py` covers the behaviour most likely to regress
+silently: a failed answer surfacing on its row rather than vanishing, the key
+never appearing in any response, the key file's permissions, an edited line
+keeping its answer and an emptied one clearing, and scissors-then-undo.
+
+**Cost.** Roughly half a cent per line, a few seconds each -- quicker on the
+keyed route, which has no process to start.
 
 **Look.** The page is an Italian school exercise book: a red margin rule down
 the middle, corrections in red pen, the answer inking in from the left as it
-arrives. The student's writing and the target language are set in the same serif
+arrives. The page runs the full width of its window, with the line spacing kept
+tight. The student's writing and the target language are set in the same serif
 (EB Garamond) because both are *language*; the explanations are in a sans
 (Archivo) because they are *commentary about* language. Both webfonts load from
 Google Fonts at runtime and the page degrades to system serif and sans without
@@ -128,7 +191,7 @@ network.
 
 ## Recipe
 
-This template is version `v1`. It is not a fork of the
+This template is version `v2`. It is not a fork of the
 workspace it came from -- it is DERIVED from it by a recipe: include these
 paths, leave these out, apply these published-version rules. An update re-runs
 the recipe against the current workspace and publishes the result as the next
@@ -153,17 +216,22 @@ theirs. Two kinds of entry, handled at different times:
 
 ### Activation
 
-- requires_llm: calls Claude through the KEYLESS `claude -p` path (the
-  subscription route, via the `claude_p.py` copy vendored into the package);
-  no API key, no latchkey connector and no third-party account are involved,
-  so on a mind already signed in to Claude this needs nothing done to it. An
-  adopter whose mind is on the KEYED path (`ANTHROPIC_API_KEY` -> litellm) must
-  switch the call in `src/rosette/tutor.py` to that route per the
-  `use-ai-integration` skill; everything else about the app is unaffected.
+- requires_llm: runs on EITHER route and picks one per call, so there is
+  nothing to switch. It uses an Anthropic API key if it has one (KEYED, direct
+  via litellm): `ANTHROPIC_API_KEY` in the environment first, then the key file
+  the page writes into the app's own data directory when the user enters a key
+  under "Speed this up" in the header. With neither, it falls back to the
+  KEYLESS `claude -p` path (the subscription route, via the `claude_p.py` copy
+  vendored into the package). So inside a Mind already signed in to Claude, no
+  key is required and this needs nothing done to it; a key is what lets the app
+  run standalone, outside a Mind, and it also makes answers quicker inside one.
+  No latchkey connector and no third-party account are involved either way.
 
 There are no other activation requirements. This template needs **no latchkey
 permissions** and **no secrets** -- both lists are genuinely empty, so there is
-nothing for the adopting agent to request or wire up before starting it.
+nothing for the adopting agent to request or wire up before starting it. The
+API key above is optional, never required, and is the user's to enter in the
+page if they want it; it is not a secret the adopter must supply.
 
 ### Adaptation
 
@@ -187,9 +255,10 @@ whatever this publisher happened to have.
 
 Nothing extra -- runs on the stock workspace environment. The app's only
 dependencies are ordinary Python packages declared in its own `pyproject.toml`
-(flask, flask-sock, loguru, pydantic, werkzeug), which `uv sync --all-packages`
-resolves like any other package in the repo; it shells out to nothing but the
-`claude` CLI the workspace already has. The `[environment]` tables in
+(flask, flask-sock, litellm, loguru, pydantic, werkzeug), which `uv sync
+--all-packages` resolves like any other package in the repo; it shells out to
+nothing but the `claude` CLI the workspace already has, and only on the keyless
+route. The `[environment]` tables in
 `template.toml` are therefore empty by design, not by omission.
 
 One runtime note that is not an environment declaration: the page loads two
@@ -232,6 +301,28 @@ appends one entry per version (newest last); earlier entries are never rewritten
 This is distinct from "Adaptation history" below, which is the ADOPTERS' log.
 
 ### v1 (2026-09-24) -- the two-column class notebook: type a line, get back a translation, a gloss, an answer, or a red-pen correction, in any of 37 listed languages or any other you name.
+
+### v2 (2026-09-29) -- self-aware questions, your own API key, clear-from-here, and a batch of fixes
+
+- Questions are answered against the lines above them, and can record a lasting
+  fact about the student that every later line uses and that re-reads the
+  earlier lines it changes; the facts are listed under the header, each
+  removable.
+- An optional Anthropic API key ("Speed this up" in the header, or
+  `ANTHROPIC_API_KEY`) sends each line straight to the API, and lets the app run
+  outside a Mind; without one it uses `claude -p` as before. The key is stored
+  owner-readable only and never returned to the page.
+- Extended thinking is disabled on the keyed route too, where leaving it on
+  overran the reply limit and returned empty answers.
+- A scissors in the left margin removes a line and everything below it, with an
+  undo that restores them, answers intact.
+- The margin rule shows red while a line is being read and green once answered;
+  an edited line keeps its previous answer until the new one lands; the page
+  runs the full width with tighter spacing.
+- Fixes: rows left pending by a restart are re-queued; unexpected failures show
+  on their row instead of vanishing; an unmarkable correction gets one more
+  attempt before falling back to the explanation alone.
+- Tests for the above in `runner_test.py`.
 
 ## Adaptation history
 

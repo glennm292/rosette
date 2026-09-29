@@ -46,6 +46,19 @@ class Analysis(BaseModel):
     answer: str | None = Field(
         default=None, description="The reply, when the line was a question"
     )
+    # A question can tell the tutor something durable about the student ("I am
+    # male", "I only ever write about work"), which every later line is then
+    # judged against. Kept separate from the answer because it outlives the row.
+    learned: str | None = Field(
+        default=None,
+        description="A lasting fact the question taught, as the tutor would state it",
+    )
+    # Which earlier lines that fact changes the reading of, newest-first by
+    # distance: 1 is the line directly above the question.
+    revisit_distances: tuple[int, ...] = Field(
+        default=(),
+        description="How far above the question the lines it affects sit",
+    )
     verdict: Verdict | None = Field(
         default=None, description="Whether an assessed line needed changing"
     )

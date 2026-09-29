@@ -161,18 +161,203 @@ body {
   text-decoration-color: var(--pen);
 }
 
+/* Where the API key is entered. Quiet and collapsed until asked for, since
+   most of the time there is nothing to do here. */
+
+.key-panel {
+  padding: 0 2rem .8rem;
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--ink-soft);
+}
+
+.key-panel[hidden] { display: none; }
+
+.key-why {
+  margin: 0 0 .5rem;
+  max-width: 70ch;
+  color: var(--ink-soft);
+}
+
+.key-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+}
+
+.key-form input {
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  padding: .2rem .2rem;
+  width: 34ch;
+  max-width: 100%;
+}
+
+.key-form input:focus { outline: none; border-bottom-color: var(--pen); }
+
+.key-form button {
+  font-family: var(--sans);
+  font-size: .78rem;
+  background: none;
+  border: 0;
+  padding: .2rem 0;
+  cursor: pointer;
+  color: var(--ink-faint);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--rule);
+}
+
+.key-form button:hover { color: var(--ink-soft); }
+.key-form button[type="submit"] { color: var(--ok); }
+.key-form button[hidden] { display: none; }
+#key-remove { color: var(--pen); }
+
+.key-error {
+  margin: .5rem 0 0;
+  color: var(--pen);
+}
+
+.key-error[hidden] { display: none; }
+
+/* What the tutor has been told about the student. Every line is judged against
+   these, so they are visible and removable rather than hidden state. */
+
+.knows {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .4rem .5rem;
+  padding: 0 2rem .7rem;
+  font-family: var(--sans);
+  font-size: .76rem;
+  color: var(--ink-faint);
+}
+
+.knows[hidden] { display: none; }
+
+.knows-label { color: var(--ink-faint); }
+
+.fact {
+  display: inline-flex;
+  align-items: baseline;
+  gap: .35rem;
+  padding: .12rem .4rem .16rem .5rem;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  color: var(--ink-soft);
+}
+
+.fact button {
+  font-family: var(--sans);
+  font-size: .8rem;
+  line-height: 1;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--ink-faint);
+}
+
+.fact button:hover { color: var(--pen); }
+
 /* ---- the page ------------------------------------------------------ */
 
+/* The page runs the full width of the window rather than sitting in a centred
+   column, so a maximized window is actually used. Only the explanatory prose
+   keeps a measure of its own (see .note and .reply), since that is the part
+   that becomes unreadable when a line runs too long. */
 .notebook {
-  max-width: 1180px;
-  margin: 0 auto;
   padding: 0 2rem;
 }
 
 .line {
+  position: relative;
   display: grid;
   grid-template-columns: minmax(0, 56fr) minmax(0, 44fr);
   border-top: 1px solid var(--rule);
+}
+
+/* Lives entirely out in the page's left margin, and only shows itself when the
+   pointer is out there too -- not when the row is merely hovered. Clearing a
+   run of lines is an occasional thing, so it should be findable without being
+   put in front of you every time the pointer crosses a line.
+
+   The button is the full height of its row and the width of the margin, so the
+   target is easy to hit; only the glyph inside it fades in. */
+.cut {
+  position: absolute;
+  left: -2rem;
+  top: 0;
+  bottom: 0;
+  width: 2rem;
+  padding: .3rem 0 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--ink-faint);
+}
+
+.cut svg {
+  width: 13px;
+  height: 13px;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+
+.cut:hover svg,
+.cut:focus-visible svg {
+  opacity: 1;
+  color: var(--pen);
+}
+
+/* While the pointer is on the control, everything it would remove is dimmed --
+   so what is about to go is never a surprise. Dimming rather than striking
+   through, because a text box does not inherit a strike and the two columns
+   would disagree. */
+.line.will-be-cut > .mine,
+.line.will-be-cut > .gloss {
+  opacity: .4;
+  transition: opacity .12s ease;
+}
+
+.cut-undo {
+  position: fixed;
+  bottom: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: .7rem;
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--page);
+  background: var(--ink);
+  padding: .45rem .5rem .45rem .8rem;
+  border-radius: 3px;
+  z-index: 10;
+}
+
+.cut-undo[hidden] { display: none; }
+
+.cut-undo button {
+  font-family: var(--sans);
+  font-size: .78rem;
+  background: none;
+  border: 0;
+  padding: .1rem .3rem;
+  cursor: pointer;
+  color: var(--page);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .line:first-child { border-top: none; }
@@ -194,8 +379,27 @@ body {
   transition: border-left-color .2s ease, box-shadow .2s ease;
 }
 
-.line.is-active > .gloss,
+/* The margin rule doubles as the status light for its row, so these three are
+   ordered least- to most-settled and the later one wins: the line you are on,
+   then a line being read, then a line whose answer has arrived. */
+.line.is-active > .gloss {
+  border-left-color: var(--pen);
+  box-shadow: inset 2px 0 0 var(--pen);
+}
+
+.line.is-done > .gloss {
+  border-left-color: var(--ok);
+  box-shadow: inset 2px 0 0 var(--ok);
+}
+
+/* After is-done, so a line being re-checked goes back to red even though the
+   answer it is still showing arrived a moment ago. */
 .line.is-pending > .gloss {
+  border-left-color: var(--pen);
+  box-shadow: inset 2px 0 0 var(--pen);
+}
+
+.line.is-error > .gloss {
   border-left-color: var(--pen);
   box-shadow: inset 2px 0 0 var(--pen);
 }
@@ -379,13 +583,29 @@ body {
   <div class="status">
     <span class="tally" id="tally"></span>
     <button class="clear" id="clear" type="button" hidden>Clear</button>
+    <button class="clear" id="connect" type="button"></button>
   </div>
 </header>
+
+<div class="key-panel" id="key-panel" hidden>
+  <p class="key-why" id="key-why"></p>
+  <form class="key-form" id="key-form">
+    <input id="key-input" type="password" autocomplete="off" spellcheck="false"
+           placeholder="sk-ant-..." aria-label="Anthropic API key">
+    <button type="submit">Use this key</button>
+    <button type="button" id="key-cancel">Cancel</button>
+    <button type="button" id="key-remove" hidden>Remove the key</button>
+  </form>
+  <p class="key-error" id="key-error" hidden></p>
+</div>
+
+<div class="knows" id="knows" hidden></div>
 
 <main class="notebook" id="notebook"></main>
 
 <p class="hint" id="hint" hidden></p>
 <div class="offline" id="offline" hidden>Not saving right now. Your typing is safe on screen.</div>
+<div class="cut-undo" id="cut-undo" hidden><span id="cut-undo-text"></span><button type="button" id="cut-undo-button">Undo</button></div>
 
 <script>
 "use strict";
@@ -405,6 +625,25 @@ const offlineElement = document.getElementById("offline");
 const languageElement = document.getElementById("language");
 const otherLanguageElement = document.getElementById("other-language");
 const clearElement = document.getElementById("clear");
+const knowsElement = document.getElementById("knows");
+const cutUndoElement = document.getElementById("cut-undo");
+const cutUndoText = document.getElementById("cut-undo-text");
+const cutUndoButton = document.getElementById("cut-undo-button");
+const connectElement = document.getElementById("connect");
+const keyPanelElement = document.getElementById("key-panel");
+const keyWhyElement = document.getElementById("key-why");
+const keyFormElement = document.getElementById("key-form");
+const keyInputElement = document.getElementById("key-input");
+const keyCancelElement = document.getElementById("key-cancel");
+const keyRemoveElement = document.getElementById("key-remove");
+const keyErrorElement = document.getElementById("key-error");
+
+// How replies are being fetched: through the workspace's own Claude sign-in,
+// or straight to the API with a key of the user's own.
+let credentials = {route: "mind"};
+
+// What the tutor has been told about the student, as the server has it.
+let knownFacts = [];
 
 // The languages offered in the list. Any other can still be named through the
 // last entry, so this is a convenience, not a limit.
@@ -446,12 +685,19 @@ function escapeText(value) {
 
 function renderGloss(row) {
   if (!row) return "";
-  if (row.status === "pending") return '<p class="thinking">Reading that…</p>';
+  // A line being re-read keeps the answer it already had on screen; the margin
+  // mark beside it is what says a new one is coming. Only a line that has
+  // never been answered shows that it is being read.
+  if (row.status === "pending" && !row.analysis) {
+    return '<p class="thinking">Reading that…</p>';
+  }
   if (row.status === "error") {
     return '<p class="failed">Could not reach the tutor.' +
       '<button class="retry" type="button" data-retry="' + escapeText(row.row_id) + '">Try again</button></p>';
   }
-  if (row.status !== "done" || !row.analysis) return "";
+  // Reached with status "done", or "pending" while the answer above it is the
+  // previous one being kept on screen.
+  if (!row.analysis) return "";
 
   const analysis = row.analysis;
   const parts = [];
@@ -502,7 +748,12 @@ function paintGloss(rowId) {
     glossElement.innerHTML = nextHtml;
     glossElement.dataset.rendered = nextHtml;
   }
-  lineElement.classList.toggle("is-pending", !!row && row.status === "pending");
+  // Exactly one status class, so the margin rule shows one colour and never
+  // depends on which rule happens to come last in the stylesheet.
+  const status = row ? row.status : "empty";
+  lineElement.classList.toggle("is-pending", status === "pending");
+  lineElement.classList.toggle("is-done", status === "done");
+  lineElement.classList.toggle("is-error", status === "error");
 }
 
 function growTextarea(textarea) {
@@ -510,10 +761,27 @@ function growTextarea(textarea) {
   textarea.style.height = textarea.scrollHeight + "px";
 }
 
+// A small scissors, drawn to match the rest of the page rather than sitting in
+// it as a piece of emoji.
+const CUT_ICON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>' +
+  '<line x1="20" y1="4" x2="8.12" y2="15.88"/>' +
+  '<line x1="14.47" y1="14.48" x2="20" y2="20"/>' +
+  '<line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>';
+
 function buildLine(rowId, text) {
   const lineElement = document.createElement("div");
   lineElement.className = "line";
   lineElement.dataset.rowId = rowId;
+
+  const cutButton = document.createElement("button");
+  cutButton.type = "button";
+  cutButton.className = "cut";
+  cutButton.dataset.cut = rowId;
+  cutButton.innerHTML = CUT_ICON;
+  lineElement.appendChild(cutButton);
 
   const mineElement = document.createElement("div");
   mineElement.className = "mine";
@@ -565,7 +833,127 @@ async function deleteRow(rowId) {
   }
 }
 
+function paintKnownFacts() {
+  knowsElement.hidden = knownFacts.length === 0;
+  if (knownFacts.length === 0) {
+    knowsElement.replaceChildren();
+    return;
+  }
+  const label = document.createElement("span");
+  label.className = "knows-label";
+  label.textContent = "Rosette knows:";
+  const chips = knownFacts.map(fact => {
+    const chip = document.createElement("span");
+    chip.className = "fact";
+    chip.appendChild(document.createTextNode(fact));
+    const forget = document.createElement("button");
+    forget.type = "button";
+    forget.textContent = "\u00d7";
+    forget.title = "Forget this";
+    forget.dataset.forget = fact;
+    chip.appendChild(forget);
+    return chip;
+  });
+  knowsElement.replaceChildren(label, ...chips);
+}
+
+async function forgetFact(fact) {
+  try {
+    const response = await fetch("/api/settings", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({forget: fact}),
+    });
+    if (!response.ok) throw new Error("forget failed: " + response.status);
+    const settings = await response.json();
+    knownFacts = settings.known_facts || [];
+    offlineElement.hidden = true;
+  } catch (error) {
+    offlineElement.hidden = false;
+  }
+  paintKnownFacts();
+}
+
+function paintCredentials() {
+  const usingKey = credentials.route === "key";
+  connectElement.textContent = usingKey ? "Your key" : "Speed this up";
+  keyWhyElement.textContent = usingKey
+    ? "Replies go straight to Anthropic using your own key" +
+      (credentials.hint ? " (ending " + credentials.hint + ")" : "") +
+      (credentials.source === "environment"
+        ? ", which was set for this machine rather than entered here."
+        : ".") +
+      " Anthropic bills you for them directly."
+    : "Right now each reply starts a fresh Claude process, and that startup is " +
+      "most of the wait. With your own Anthropic API key the reply is fetched " +
+      "directly and arrives several seconds sooner. The key is stored on this " +
+      "machine only, and Anthropic bills you for what it uses.";
+  keyRemoveElement.hidden = !usingKey || credentials.source === "environment";
+  // A key set for the whole machine is not this page's to replace.
+  keyInputElement.disabled = credentials.source === "environment";
+  keyFormElement.querySelector('button[type="submit"]').hidden =
+    credentials.source === "environment";
+}
+
+function openKeyPanel() {
+  keyErrorElement.hidden = true;
+  keyInputElement.value = "";
+  keyPanelElement.hidden = false;
+  paintCredentials();
+  if (!keyInputElement.disabled) keyInputElement.focus();
+}
+
+async function submitKey(event) {
+  event.preventDefault();
+  const typed = keyInputElement.value.trim();
+  if (typed === "") return;
+  keyErrorElement.hidden = true;
+  try {
+    const response = await fetch("/api/credentials", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({api_key: typed}),
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      keyErrorElement.textContent = body.error || "That key was not accepted.";
+      keyErrorElement.hidden = false;
+      return;
+    }
+    credentials = body;
+    // Never leave the key sitting in the field once it is stored.
+    keyInputElement.value = "";
+    keyPanelElement.hidden = true;
+    offlineElement.hidden = true;
+  } catch (error) {
+    keyErrorElement.textContent = "Could not save the key just now.";
+    keyErrorElement.hidden = false;
+    return;
+  }
+  paintCredentials();
+}
+
+async function removeKey() {
+  try {
+    const response = await fetch("/api/credentials", {method: "DELETE"});
+    if (!response.ok) throw new Error("remove failed: " + response.status);
+    credentials = await response.json();
+    keyPanelElement.hidden = true;
+  } catch (error) {
+    offlineElement.hidden = false;
+  }
+  paintCredentials();
+}
+
 function applyNotebook(notebook) {
+  if (notebook.credentials) {
+    credentials = notebook.credentials;
+    paintCredentials();
+  }
+  if (Array.isArray(notebook.known_facts)) {
+    knownFacts = notebook.known_facts;
+    paintKnownFacts();
+  }
   for (const row of notebook.rows) {
     // A row the student is still editing keeps its local text; only the
     // tutor's side of it is taken from the server.
@@ -749,7 +1137,95 @@ function handleFocusOut(event) {
   flushRow(lineElement.dataset.rowId);
 }
 
+function linesFromHereDown(rowId) {
+  const index = rowOrder.indexOf(rowId);
+  return index === -1 ? [] : rowOrder.slice(index);
+}
+
+function previewCut(rowId, isPreviewing) {
+  for (const id of linesFromHereDown(rowId)) {
+    const lineElement = notebookElement.querySelector('[data-row-id="' + id + '"]');
+    if (lineElement) lineElement.classList.toggle("will-be-cut", isPreviewing);
+  }
+}
+
+// How long the undo stays offered. Long enough to notice the lines went and
+// change your mind, short enough that it is not still sitting there later.
+const CUT_UNDO_MS = 12000;
+let cutUndoTimer = null;
+
+function showCutUndo(removedCount, undoToken) {
+  cutUndoText.textContent =
+    "Removed " + removedCount + (removedCount === 1 ? " line" : " lines") + ".";
+  cutUndoButton.dataset.undo = undoToken;
+  cutUndoElement.hidden = false;
+  if (cutUndoTimer !== null) window.clearTimeout(cutUndoTimer);
+  cutUndoTimer = window.setTimeout(hideCutUndo, CUT_UNDO_MS);
+}
+
+function hideCutUndo() {
+  if (cutUndoTimer !== null) {
+    window.clearTimeout(cutUndoTimer);
+    cutUndoTimer = null;
+  }
+  cutUndoElement.hidden = true;
+}
+
+async function cutFromHere(rowId) {
+  const doomed = linesFromHereDown(rowId);
+  if (doomed.length === 0) return;
+  previewCut(rowId, false);
+  // Taken off the page at once, so the click feels immediate; the request
+  // below is what makes it stick.
+  for (const id of doomed) {
+    const lineElement = notebookElement.querySelector('[data-row-id="' + id + '"]');
+    if (lineElement) lineElement.remove();
+    answerByRowId.delete(id);
+    inFlightByRowId.delete(id);
+  }
+  rowOrder = rowOrder.filter(id => !doomed.includes(id));
+  try {
+    const response = await fetch(
+      "/api/rows/" + encodeURIComponent(rowId) + "/and-below", {method: "DELETE"});
+    if (!response.ok) throw new Error("cut failed: " + response.status);
+    const body = await response.json();
+    notebookVersion = body.version === undefined ? notebookVersion : body.version;
+    offlineElement.hidden = true;
+    if (body.undo) showCutUndo(doomed.length, body.undo);
+  } catch (error) {
+    offlineElement.hidden = false;
+  }
+  // There is always somewhere to carry on writing.
+  if (rowOrder.length === 0) addLine(null, "");
+  updateTally();
+  focusRow(rowOrder[rowOrder.length - 1], true);
+}
+
+async function undoCut(undoToken) {
+  hideCutUndo();
+  try {
+    const response = await fetch("/api/notebook/restore", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({undo: undoToken}),
+    });
+    if (!response.ok) throw new Error("undo failed: " + response.status);
+    offlineElement.hidden = true;
+  } catch (error) {
+    offlineElement.hidden = false;
+    return;
+  }
+  // The restored rows come back through the ordinary reload path, so they
+  // arrive with the answers they already had.
+  window.location.reload();
+}
+
 function handleClick(event) {
+  const cutButton = event.target.closest ? event.target.closest(".cut") : null;
+  if (cutButton) {
+    cutFromHere(cutButton.dataset.cut);
+    return;
+  }
   const retryRowId = event.target.dataset ? event.target.dataset.retry : null;
   if (!retryRowId) return;
   const lineElement = notebookElement.querySelector('[data-row-id="' + retryRowId + '"]');
@@ -893,6 +1369,10 @@ async function start() {
     if (response.ok) {
       notebook = await response.json();
       notebookVersion = notebook.version;
+      knownFacts = notebook.known_facts || [];
+      paintKnownFacts();
+      if (notebook.credentials) credentials = notebook.credentials;
+      paintCredentials();
     }
   } catch (error) {
     offlineElement.hidden = false;
@@ -920,6 +1400,18 @@ async function start() {
   watchForAnswers();
 }
 
+knowsElement.addEventListener("click", event => {
+  const fact = event.target.dataset ? event.target.dataset.forget : null;
+  if (fact) forgetFact(fact);
+});
+
+connectElement.addEventListener("click", () => {
+  keyPanelElement.hidden ? openKeyPanel() : (keyPanelElement.hidden = true);
+});
+keyFormElement.addEventListener("submit", submitKey);
+keyCancelElement.addEventListener("click", () => { keyPanelElement.hidden = true; });
+keyRemoveElement.addEventListener("click", removeKey);
+
 clearElement.addEventListener("click", handleClearClick);
 clearElement.addEventListener("blur", stopAskingToClear);
 
@@ -942,6 +1434,15 @@ notebookElement.addEventListener("input", handleInput);
 notebookElement.addEventListener("focusin", handleFocusIn);
 notebookElement.addEventListener("focusout", handleFocusOut);
 notebookElement.addEventListener("click", handleClick);
+notebookElement.addEventListener("mouseover", event => {
+  const cutButton = event.target.closest ? event.target.closest(".cut") : null;
+  if (cutButton) previewCut(cutButton.dataset.cut, true);
+});
+notebookElement.addEventListener("mouseout", event => {
+  const cutButton = event.target.closest ? event.target.closest(".cut") : null;
+  if (cutButton) previewCut(cutButton.dataset.cut, false);
+});
+cutUndoButton.addEventListener("click", () => undoCut(cutUndoButton.dataset.undo));
 
 start();
 

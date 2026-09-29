@@ -9,6 +9,14 @@ tutor's, filled a few seconds behind each line:
 - a single word (or a fragment too short to judge) is translated to English,
 - a line beginning with `?` is a question, and is answered.
 
+A question is answered against the notebook, not in isolation: the tutor is
+shown the lines above it, so "the line above" and "that sentence" resolve. A
+question that tells it something lasting about the student ("I'm male") is
+recorded as a fact, every later line is judged with it known, and the earlier
+lines whose reading it changes are re-read on the spot. The facts are listed
+under the header and each can be taken back, since a wrong one would quietly
+skew everything judged after it.
+
 The language is chosen from the list beside the title and defaults to Italian;
 "Other" names one that is not on the list. Each row records the language it was answered in,
 so switching does not disturb what is already on the page.

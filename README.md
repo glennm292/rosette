@@ -14,7 +14,8 @@ Didn't work? Create a Mind workspace and paste this to your agent:
 ## What it is
 
 A two-column notebook for language class: your notes and work on the left,
-automatic translations and corrections on the right.
+automatic translations and corrections on the right. Runs inside Mind, or
+standalone with your own Anthropic API key.
 
 ## How to use it
 
@@ -32,7 +33,14 @@ What comes back in the right-hand margin depends on what you wrote:
 | `? when do I use the subjunctive after penso` | a direct answer, with an example |
 
 A `?` at the start of a line is what turns it into a question; everything else
-is treated as a line of your notebook.
+is treated as a line of your notebook. A question can refer to the lines above
+it, and can tell it something lasting about you -- "I'm male, and the subject of
+the line above is me" -- which it remembers, applies to everything you write
+afterwards, and uses to re-read the earlier lines it changes.
+
+Hovering the left margin reveals a small scissors: it clears that line and
+everything below it, for when a passage is finished and the lookups and
+questions around it are clutter. There is an undo.
 
 Your notebook persists between sessions, so you can open the same one next
 week. Each line costs well under a cent and takes a few seconds.

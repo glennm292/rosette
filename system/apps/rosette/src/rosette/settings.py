@@ -25,11 +25,23 @@ DEFAULT_LANGUAGE: Final[str] = "Italian"
 MAX_LANGUAGE_LENGTH: Final[int] = 40
 
 
+# A fact is one short sentence, and there are only ever a handful; the bounds
+# keep a runaway reply from filling every later prompt with itself.
+MAX_FACT_LENGTH: Final[int] = 200
+MAX_FACT_COUNT: Final[int] = 20
+
+
 class Settings(BaseModel):
     """What the notebook is set to, across sessions."""
 
     language: str = Field(
         default=DEFAULT_LANGUAGE, description="The language being learned"
+    )
+    # What the student has told the tutor about themselves, oldest first. Every
+    # line is judged against these, so they are shown on the page and can be
+    # taken back -- a wrong one would quietly skew every answer after it.
+    known_facts: tuple[str, ...] = Field(
+        default=(), description="Lasting facts the student has taught the tutor"
     )
 
 
@@ -80,6 +92,32 @@ class SettingsStore:
 
     def set_language(self, language: str) -> Settings:
         with self._lock:
-            updated_settings = Settings(language=clean_language_name(language))
+            current = _read_settings(self._settings_path)
+            updated_settings = current.model_copy(
+                update={"language": clean_language_name(language)}
+            )
+            _write_settings(self._settings_path, updated_settings)
+            return updated_settings
+
+    def remember_fact(self, fact: str) -> Settings:
+        """Add a fact, unless it is empty or already known."""
+        cleaned = " ".join(fact.split())[:MAX_FACT_LENGTH].strip()
+        with self._lock:
+            current = _read_settings(self._settings_path)
+            if not cleaned or cleaned in current.known_facts:
+                return current
+            kept = (current.known_facts + (cleaned,))[-MAX_FACT_COUNT:]
+            updated_settings = current.model_copy(update={"known_facts": kept})
+            _write_settings(self._settings_path, updated_settings)
+            return updated_settings
+
+    def forget_fact(self, fact: str) -> Settings:
+        with self._lock:
+            current = _read_settings(self._settings_path)
+            updated_settings = current.model_copy(
+                update={
+                    "known_facts": tuple(f for f in current.known_facts if f != fact)
+                }
+            )
             _write_settings(self._settings_path, updated_settings)
             return updated_settings

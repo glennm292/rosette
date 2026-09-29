@@ -8,9 +8,9 @@ format = "v2"
 [template]
 slug = "rosette"
 title = "Rosette"
-description = "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right."
+description = "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail = "template.svg"
-version = "v1"
+version = "v2"
 
 # How this template is DERIVED from the workspace it came from. An
 # update re-runs this recipe rather than diffing two repos, which is what
@@ -41,18 +41,23 @@ modification_rules = []
 #   Prose on both sides, so it is not cross-checked.
 #
 # This app needs LLM access and nothing else: no latchkey permission, no
-# third-party account, no secret and no API key. So `permission`, `secret`
-# and `adaptation` are all genuinely empty and only `llm` is declared.
+# third-party account and no required secret. An Anthropic API key is
+# optional (it is how the app runs outside a Mind), so it is described under
+# `llm` rather than declared as a secret. `permission`, `secret` and
+# `adaptation` are all genuinely empty and only `llm` is declared.
 [requirements]
 
 [requirements.llm]
-method = "keyless"
+method = "keyed or keyless"
 note = """\
-Calls Claude through the keyless `claude -p` path (the subscription route), via \
-the `claude_p.py` copy vendored into `system/apps/rosette/src/rosette/`. Nothing \
-to set up on a mind already signed in to Claude. An adopter whose mind is on the \
-keyed path (ANTHROPIC_API_KEY -> litellm) must switch the call in \
-`src/rosette/tutor.py` to that route per the use-ai-integration skill.\
+Runs on either route and picks one per call; nothing to switch. With an \
+Anthropic API key it calls the API directly via litellm (keyed): the key is \
+read from ANTHROPIC_API_KEY first, then from the file the page writes into the \
+app's own data directory when the user enters one under "Speed this up". With \
+neither it falls back to the keyless `claude -p` subscription route, via the \
+`claude_p.py` copy vendored into `system/apps/rosette/src/rosette/`. No key is \
+required inside a Mind already signed in to Claude; a key is what lets the app \
+run standalone, outside one.\
 """
 
 # What the included code needs INSTALLED. apt takes bare names: versions
@@ -62,9 +67,10 @@ keyed path (ANTHROPIC_API_KEY -> litellm) must switch the call in \
 # recorded version IS the pin (name = version).
 #
 # Nothing to install. The app's dependencies are ordinary Python packages
-# declared in system/apps/rosette/pyproject.toml (flask, flask-sock, loguru,
-# pydantic, werkzeug), and the only binary it shells out to is the `claude`
-# CLI the workspace already ships. Empty by design, not by omission.
+# declared in system/apps/rosette/pyproject.toml (flask, flask-sock, litellm,
+# loguru, pydantic, werkzeug), and the only binary it shells out to is the
+# `claude` CLI the workspace already ships (keyless route only). Empty by
+# design, not by omission.
 #
 # (The page also pulls two webfonts from Google Fonts at runtime and falls
 # back to system serif/sans without network -- a runtime fetch, not an

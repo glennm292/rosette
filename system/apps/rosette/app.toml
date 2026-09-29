@@ -1,6 +1,5 @@
 name = "rosette"
 display_name = "Rosette"
 icon = "icon.svg"
-instances = false
 priority = "user"
 program = "rosette"

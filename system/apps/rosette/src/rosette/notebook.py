@@ -150,6 +150,53 @@ class NotebookStore:
             self._mark_changed()
             return True
 
+    def delete_row_and_below(self, row_id: str) -> tuple[Notebook, str | None]:
+        """Drop a row and everything after it, keeping what was dropped aside.
+
+        Returns the notebook and the name of the archive holding the removed
+        rows, so they can be put straight back. A stretch of lines is often a
+        whole worked-through passage, and losing it to one click would be worse
+        than the clutter it removes.
+        """
+        with self._lock:
+            notebook = _read_notebook(self._notebook_path)
+            index = next(
+                (i for i, r in enumerate(notebook.rows) if r.row_id == row_id), None
+            )
+            if index is None:
+                return notebook, None
+            removed = notebook.rows[index:]
+            if not removed:
+                return notebook, None
+            archive_name = f"from-{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}Z.json"
+            _write_notebook(self._archive_dir / archive_name, Notebook(rows=removed))
+            updated_notebook = Notebook(rows=notebook.rows[:index])
+            _write_notebook(self._notebook_path, updated_notebook)
+            self._mark_changed()
+            return updated_notebook, archive_name
+
+    def restore_archive(self, archive_name: str) -> Notebook:
+        """Append an archive's rows back onto the notebook.
+
+        Raises NotebookStorageError if that archive is not one of ours.
+        """
+        archive_path = (self._archive_dir / archive_name).resolve()
+        # Resolved and checked, so a crafted name cannot reach outside the
+        # archive directory.
+        if archive_path.parent != self._archive_dir.resolve():
+            raise NotebookStorageError(f"Not an archive of this notebook: {archive_name}")
+        with self._lock:
+            restored = _read_notebook(archive_path)
+            notebook = _read_notebook(self._notebook_path)
+            present = {r.row_id for r in notebook.rows}
+            updated_notebook = Notebook(
+                rows=notebook.rows
+                + tuple(r for r in restored.rows if r.row_id not in present)
+            )
+            _write_notebook(self._notebook_path, updated_notebook)
+            self._mark_changed()
+            return updated_notebook
+
     def delete_row(self, row_id: str) -> Notebook:
         with self._lock:
             notebook = _read_notebook(self._notebook_path)
