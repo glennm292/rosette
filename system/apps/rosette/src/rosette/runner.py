@@ -317,10 +317,8 @@ def delete_row(row_id: str) -> Response:
 @app.route("/api/rows/<row_id>/and-below", methods=["DELETE"])
 def delete_row_and_below(row_id: str) -> Response:
     """Drop a line and everything under it, with a way to put them back."""
-    notebook, archive_name = _notebook_store.delete_row_and_below(row_id)
-    return jsonify(
-        {"undo": archive_name, **notebook.model_dump(mode="json")}
-    )
+    notebook, clearing = _notebook_store.delete_row_and_below(row_id)
+    return jsonify({"undo": clearing, **notebook.model_dump(mode="json")})
 
 
 @app.route("/api/notebook/restore", methods=["POST"])
@@ -329,7 +327,7 @@ def restore_notebook() -> Response:
     if not isinstance(body, dict) or not isinstance(body.get("undo"), str):
         return Response('{"error": "expected a JSON body with an undo string"}', 400)
     try:
-        notebook = _notebook_store.restore_archive(body["undo"])
+        notebook = _notebook_store.restore_clearing(body["undo"])
     except NotebookStorageError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify(notebook.model_dump(mode="json"))
@@ -337,7 +335,7 @@ def restore_notebook() -> Response:
 
 @app.route("/api/notebook", methods=["DELETE"])
 def clear_notebook() -> Response:
-    """Empty the notebook. The cleared one is kept in the archive."""
+    """Empty the notebook. Its lines are kept in the cleared log."""
     return jsonify(_notebook_store.clear().model_dump(mode="json"))
 
 

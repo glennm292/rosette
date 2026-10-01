@@ -108,3 +108,29 @@ class Notebook(BaseModel):
     """Every line of the notebook, in the order they appear on the page."""
 
     rows: tuple[Row, ...] = Field(default=(), description="The lines, top to bottom")
+
+
+# How a line left the notebook.
+#   LINE_AND_BELOW -- the margin control that drops a line and everything under it.
+#   WHOLE_NOTEBOOK -- Clear, which empties the notebook.
+HowCleared = Literal["line and below", "whole notebook"]
+
+
+class ClearedRow(Row):
+    """A line that was cleared, with when and how, so it can be found and put back."""
+
+    clearing: str = Field(
+        description="Which clearing removed it; every line removed by one click shares it"
+    )
+    cleared_at: str = Field(description="When it was cleared, UTC ISO 8601")
+    how_cleared: HowCleared = Field(description="Which control removed it")
+    position: int = Field(description="Where it sat among the lines that click removed, from 1")
+    restored_at: str | None = Field(
+        default=None, description="When it was put back into the notebook, if it was"
+    )
+
+
+class ClearedLog(BaseModel):
+    """Every line ever cleared from the notebook, oldest clearing first."""
+
+    rows: tuple[ClearedRow, ...] = Field(default=(), description="The cleared lines")

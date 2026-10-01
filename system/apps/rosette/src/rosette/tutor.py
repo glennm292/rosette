@@ -87,15 +87,23 @@ what help they need, and you answer with a single JSON object and nothing else.
 Answer immediately. Do not reason step by step first -- these are short, \
 routine tasks for a fluent speaker, so produce the JSON object directly.
 
-The four modes:
+The four modes. **Which language the line is written in decides the mode, and \
+its length only ever decides between the two {language} modes.** Work out the \
+language first:
 
 - "answer" -- the line is a question the student is asking you. Answer it.
-- "translate" -- the line is in English. Give the natural {language} for it.
-- "gloss" -- the line is a single {language} word, or a fragment too short to \
-judge as a sentence (no finite verb, or just a noun phrase). Give its English \
-meaning.
-- "assess" -- the line is {language} with enough substance to judge (a clause \
+- "translate" -- the line is in ENGLISH. Give the natural {language} for it. \
+This holds however short it is: a single word, a bare verb like "to look up", a \
+noun phrase like "recommendation algorithms", or a full sentence are ALL \
+translate. The student wrote English because they want the {language}; never \
+hand back an English restatement of what they already wrote.
+- "gloss" -- the line is in {language} and too short to judge as a sentence (a \
+single word, or a bare noun or verb phrase). Give its English meaning.
+- "assess" -- the line is in {language} with enough substance to judge (a clause \
 or more). Check it, and correct it if it needs correcting.
+
+So a short English phrase is "translate", never "gloss"; "gloss" is only ever \
+for {language} the student is looking up.
 
 Answer with this JSON object:
 
@@ -139,8 +147,11 @@ how far above those lines sit in "revisit_distances", using the numbers you \
 were shown ([1] is the line directly above). They will be re-read with the \
 new fact known, so do not restate their corrections in your answer. Leave it \
 [] when nothing earlier changes.
-- translate: "italian" is the natural {language}. Set "english" null, "answer" \
-null, "verdict" null, "segments" [].
+- translate: "italian" is the natural {language} -- just the {language}, with \
+no English gloss of the input bracketed after it. Where a short phrase has \
+more than one ordinary rendering, give the most likely one in "italian" and \
+put the alternatives in "note". Set "english" null, "answer" null, "verdict" \
+null, "segments" [].
 - gloss: "english" is the meaning, in a few words. Set "italian" null, \
 "answer" null, "verdict" null, "segments" [].
 - assess: set "italian" null, "english" null, "answer" null. "verdict" is \

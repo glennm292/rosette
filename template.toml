@@ -10,7 +10,7 @@ slug = "rosette"
 title = "Rosette"
 description = "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail = "template.svg"
-version = "v2"
+version = "v3"
 
 # How this template is DERIVED from the workspace it came from. An
 # update re-runs this recipe rather than diffing two repos, which is what
@@ -18,8 +18,8 @@ version = "v2"
 [recipe]
 include = ["system/apps/rosette", "system/supervisord.conf.d/rosette.conf"]
 data_include = []
-# The publishing user's own class notes, and the archived copies of the
-# notebooks they cleared. Personal content; never ships. The app writes a
+# The publishing user's own class notes, and the lines they cleared.
+# Personal content; never ships. The app writes a
 # fresh, empty notebook on first run.
 exclude = ["data/.apps/rosette"]
 # The app code carries nothing personal -- no names, accounts, notes or

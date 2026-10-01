@@ -2,7 +2,7 @@
 title: "Rosette"
 description: "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail: "template.svg"
-version: v2
+version: v3
 format: v2
 ---
 
@@ -159,23 +159,26 @@ a Spanish one that claimed a fix it had not made.
 
 **Clearing from a line down.** Hovering the left margin beside a line reveals a
 small scissors; clicking it dims that line and everything below it, then removes
-them and offers an undo for twelve seconds. The removed stretch is archived
-before it goes, and the undo appends it back with its answers intact, so nothing
-is re-asked.
+them and offers an undo for twelve seconds. The removed stretch is kept in the
+cleared list before it goes, and the undo appends it back with its answers
+intact, so nothing is re-asked.
 
 **On disk.** `notebook.json` and `settings.json` (the chosen language and the
 recorded facts) under the app's data directory, each written through a temp file
 and renamed so a crash leaves the previous copy intact. Every row keeps the
-model's raw response even though nothing in the page links to it. Clearing the
-notebook writes the cleared copy into `cleared/` with a timestamped name rather
-than deleting it, and a stretch removed with the scissors is archived there the
-same way. A key entered in the page is kept in `anthropic-api-key` beside them,
+model's raw response even though nothing in the page links to it. Every cleared
+line, from Clear or the scissors, goes into `cleared.json` rather than being
+deleted, labelled with which clearing removed it, when, how, and whether it was
+put back. A key entered in the page is kept in `anthropic-api-key` beside them,
 owner-readable only; removing it from the page deletes the file.
 
 **Tests.** `runner_test.py` covers the behaviour most likely to regress
 silently: a failed answer surfacing on its row rather than vanishing, the key
 never appearing in any response, the key file's permissions, an edited line
 keeping its answer and an emptied one clearing, and scissors-then-undo.
+`notebook_test.py` covers the cleared list: its labels, an undo marking a
+clearing restored, old per-clearing files folded in exactly once, and an
+unreadable cleared file never blocking startup.
 
 **Cost.** Roughly half a cent per line, a few seconds each -- quicker on the
 keyed route, which has no process to start.
@@ -191,7 +194,7 @@ network.
 
 ## Recipe
 
-This template is version `v2`. It is not a fork of the
+This template is version `v3`. It is not a fork of the
 workspace it came from -- it is DERIVED from it by a recipe: include these
 paths, leave these out, apply these published-version rules. An update re-runs
 the recipe against the current workspace and publishes the result as the next
@@ -323,6 +326,18 @@ This is distinct from "Adaptation history" below, which is the ADOPTERS' log.
   on their row instead of vanishing; an unmarkable correction gets one more
   attempt before falling back to the explanation alone.
 - Tests for the above in `runner_test.py`.
+
+### v3 (2026-10-01) -- cleared lines kept as one labelled list, and short English phrases translated
+
+- Every cleared line -- from Clear, or from the scissors in the margin -- is now
+  kept in one list, `cleared.json`, each line labelled with the clearing that
+  removed it, when, how ("line and below" or "whole notebook"), its place in
+  that clearing, and when it was put back if it was undone. A notebook cleared
+  under an earlier version has its old per-clearing files folded into the list
+  on first start.
+- A damaged cleared-lines file no longer stops the app from starting.
+- Short English phrases ("to hit") are now translated, rather than explained
+  back in English; glossing is only for the language being learned.
 
 ## Adaptation history
 

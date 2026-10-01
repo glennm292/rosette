@@ -23,9 +23,12 @@ so switching does not disturb what is already on the page.
 
 Lines are saved as they are typed, and the page holds one request open so an
 answer appears the moment it is stored. Clear (beside the line count) empties
-the notebook, and takes a second confirming click; the cleared notebook is
-written to `cleared/` under the data directory rather than destroyed, so it can
-be put back by copying it over `notebook.json`. Every row keeps the model's raw
+the notebook, and takes a second confirming click. Every cleared line, from
+Clear or from the margin control that drops a line and everything below it, is
+kept in `cleared.json` under the data directory rather than destroyed, labelled
+with the clearing that removed it (`clearing`, `cleared_at`, `how_cleared`,
+`position`, and `restored_at` once undone), so the history reads as one table
+and any clearing can be put back. Every row keeps the model's raw
 response on disk even though nothing links to it.
 
 Answers come from `claude -p` (see `tutor.py` for the model, the prompt, and the

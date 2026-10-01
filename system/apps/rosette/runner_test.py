@@ -218,7 +218,7 @@ def test_an_undone_cut_puts_the_lines_back_with_their_answers(
     assert rows[1]["analysis"]["english"] == "strike", "the answer was lost on the way back"
 
 
-def test_an_undo_token_cannot_reach_outside_the_notebook_archive(
+def test_an_unknown_undo_token_is_refused(
     runner_module,
 ) -> None:
     client = runner_module.app.test_client()
