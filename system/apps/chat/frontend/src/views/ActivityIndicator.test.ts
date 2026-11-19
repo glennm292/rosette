@@ -1,22 +1,48 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import m from "mithril";
-import type { TranscriptEvent } from "../models/Response";
+import type { BackgroundTask, QueuedMessage } from "../models/Chats";
+import type { CompactionCause, TranscriptEvent } from "../models/Response";
 import {
   ActivityIndicator,
-  isWorkingActivityState,
+  ELAPSED_SHOWN_AFTER_MS,
   labelForActivityState,
+  resetSettledTurnsForTesting,
+  SENDING_LABEL_AFTER_MS,
+  turnStatusPlacement,
   wakeUpSpinnerDeadline,
 } from "./ActivityIndicator";
+import { addOutgoing, clearOutgoing, getOutgoingMessages, noteBackendArrivals } from "../models/OutgoingMessages";
+import { BackgroundTasksLine } from "./BackgroundTasksLine";
 import { notePermissionResolutions, resetShellPermissionResolutionsForTesting } from "./permission-card";
-import { handoffStateFixture } from "../models/chatSnapshotFixture";
+import { handoffStateFixture, rebindStateFixture } from "../models/chatSnapshotFixture";
 
 // The component reads the agent's server-derived state through the chats model; the
 // mock factory is hoisted, so the state it serves lives in a mutable holder.
-const agentState: { activity_state: string | null; harness: string } = { activity_state: null, harness: "claude" };
+const agentState: {
+  activity_state: string | null;
+  compaction_cause: CompactionCause | null;
+  harness: string;
+  queued_messages: QueuedMessage[];
+  background_tasks: BackgroundTask[];
+} = {
+  activity_state: null,
+  compaction_cause: null,
+  harness: "claude",
+  queued_messages: [],
+  background_tasks: [],
+};
 const handoffState: { handoff: unknown } = { handoff: null };
+// The chat's status, as the snapshot reports it (``working`` while a turn is in flight or closing).
+const chatState: { status: string } = { status: "idle" };
 vi.mock("../models/Chats", () => ({
-  getChatById: () => ({ active_agent: agentState, handoff: handoffState.handoff }),
+  getChatById: () => ({ active_agent: agentState, handoff: handoffState.handoff, status: chatState.status }),
+  getQueuedMessagesForChat: () => agentState.queued_messages,
+}));
+// How many of the switching chat's delivered held sends already show in their real form.
+const landedHeldSends = vi.hoisted(() => ({ count: 0 }));
+vi.mock("./HeldSendView", () => ({
+  heldSendsShownElsewhere: () => landedHeldSends.count,
 }));
 vi.mock("../models/HarnessCatalog", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../models/HarnessCatalog")>()),
@@ -74,7 +100,7 @@ function permissionRequestResult(ts: string, requestId: string): TranscriptEvent
   };
 }
 
-/** The resolution notice minds injects once the agent is actually told. */
+/** The resolution notice Imbue Studio injects once the agent is actually told. */
 function resolutionNotice(ts: string, requestId: string): TranscriptEvent {
   return {
     timestamp: ts,
@@ -108,6 +134,29 @@ describe("labelForActivityState — fixed-label states", () => {
 
   it("returns 'Thinking…' for THINKING", () => {
     expect(labelForActivityState("THINKING", [userMsg("2026-04-28T01:00:00Z")])).toBe("Thinking…");
+  });
+
+  it("names a compaction, and the reply a queued message waits on behind it", () => {
+    expect(labelForActivityState("COMPACTING", [])).toBe("Compacting…");
+    expect(labelForActivityState("COMPACTING", [], false)).toBe("Compacting…");
+    expect(labelForActivityState("COMPACTING", [], true)).toBe("Compacting, then replying…");
+  });
+});
+
+describe("labelForActivityState — COMPACTING by cause", () => {
+  it.each([
+    ["manual", "Compacting as requested…", "Compacting as requested, then replying…"],
+    ["idle", "Compacting while idle…", "Compacting while idle, then replying…"],
+    ["native", "Compacting to free up context…", "Compacting to free up context, then replying…"],
+    [null, "Compacting…", "Compacting, then replying…"],
+  ] as const)("names cause %s, with and without a queued message", (cause, alone, queued) => {
+    expect(labelForActivityState("COMPACTING", [], false, cause)).toBe(alone);
+    expect(labelForActivityState("COMPACTING", [], true, cause)).toBe(queued);
+  });
+
+  it("ignores a cause outside COMPACTING", () => {
+    expect(labelForActivityState("THINKING", [], true, "idle")).toBe("Thinking…");
+    expect(labelForActivityState("IDLE", [], false, "manual")).toBe(null);
   });
 });
 
@@ -250,6 +299,9 @@ describe("ActivityIndicator — what the strip actually renders", () => {
   beforeEach(() => {
     resetShellPermissionResolutionsForTesting();
     agentState.activity_state = null;
+    agentState.background_tasks = [];
+    agentState.compaction_cause = null;
+    agentState.queued_messages = [];
     vi.spyOn(m, "redraw").mockImplementation(() => undefined);
     vi.spyOn(Date, "now").mockReturnValue(NOW);
   });
@@ -308,6 +360,52 @@ describe("ActivityIndicator — what the strip actually renders", () => {
     expect(labelTextOf(strip)).toBe("Confirming permission changes…");
   });
 
+  it("puts the wait line over the activity line while tasks are pending, whatever the activity", () => {
+    agentState.background_tasks = [
+      {
+        id: "task-1",
+        source: "run_in_background",
+        harness: "",
+        kind: "",
+        description: "Rebuild the worker image",
+        started_at: "2027-01-15T08:00:00Z",
+      },
+    ];
+
+    agentState.activity_state = "THINKING";
+    const working = render();
+    const [waitLine, activityLine] = (working?.children ?? []) as (m.Vnode | null)[];
+    expect((activityLine?.attrs as Record<string, unknown>)["data-state"]).toBe("THINKING");
+    expect(waitLine?.tag).toBe(BackgroundTasksLine);
+    expect((waitLine?.attrs as { tasks: BackgroundTask[] }).tasks).toEqual(agentState.background_tasks);
+
+    // Between turns the activity line has nothing to say; the wait line stands alone.
+    agentState.activity_state = "IDLE";
+    const waiting = render();
+    expect(((waiting?.children ?? []) as (m.Vnode | null)[]).map((child) => child?.tag ?? null)).toEqual([
+      BackgroundTasksLine,
+      null,
+    ]);
+  });
+
+  it("shows a compaction on the strip, ahead of the wake-up caption", () => {
+    agentState.activity_state = "COMPACTING";
+    resolveReq1();
+    const strip = render();
+    expect((strip?.attrs as Record<string, unknown>)["data-state"]).toBe("COMPACTING");
+    expect(labelTextOf(strip)).toBe("Compacting…");
+    agentState.queued_messages = [{ queued_id: "q1", content: "next", timestamp: "2026-04-28T01:00:05Z" }];
+    expect(labelTextOf(render())).toBe("Compacting, then replying…");
+  });
+
+  it("names the active agent's compaction cause on the strip", () => {
+    agentState.activity_state = "COMPACTING";
+    agentState.compaction_cause = "idle";
+    expect(labelTextOf(render())).toBe("Compacting while idle…");
+    agentState.queued_messages = [{ queued_id: "q1", content: "next", timestamp: "2026-04-28T01:00:05Z" }];
+    expect(labelTextOf(render())).toBe("Compacting while idle, then replying…");
+  });
+
   it("lets a real turn outrank the wake-up caption", () => {
     // The verdict landed AND the agent is already working: the honest caption
     // wins, so the dot never competes with real activity.
@@ -318,22 +416,225 @@ describe("ActivityIndicator — what the strip actually renders", () => {
   });
 });
 
-describe("isWorkingActivityState — stop-button visibility gate", () => {
-  it("treats THINKING / TOOL_RUNNING as an interruptible turn", () => {
-    expect(isWorkingActivityState("THINKING")).toBe(true);
-    expect(isWorkingActivityState("TOOL_RUNNING")).toBe(true);
+describe("ActivityIndicator — the row before, during and after a turn", () => {
+  const NOW = 1_800_000_000_000;
+  const CHAT_ID = "agent-1";
+  let now = NOW;
+
+  beforeEach(() => {
+    resetShellPermissionResolutionsForTesting();
+    agentState.activity_state = "IDLE";
+    agentState.background_tasks = [];
+    agentState.queued_messages = [];
+    handoffState.handoff = null;
+    landedHeldSends.count = 0;
+    chatState.status = "idle";
+    now = NOW;
+    resetSettledTurnsForTesting();
+    vi.spyOn(m, "redraw").mockImplementation(() => undefined);
+    vi.spyOn(Date, "now").mockImplementation(() => now);
   });
 
-  it("treats IDLE as not working (nothing to interrupt)", () => {
-    expect(isWorkingActivityState("IDLE")).toBe(false);
+  afterEach(() => {
+    clearOutgoing(
+      CHAT_ID,
+      getOutgoingMessages(CHAT_ID).map((message) => message.id),
+    );
+    resetShellPermissionResolutionsForTesting();
+    chatState.status = "idle";
+    vi.restoreAllMocks();
   });
 
-  it("treats null / undefined (no activity tracking) as not working", () => {
-    expect(isWorkingActivityState(null)).toBe(false);
-    expect(isWorkingActivityState(undefined)).toBe(false);
+  const render = (events: TranscriptEvent[]): m.Vnode | null => {
+    const component = ActivityIndicator();
+    return component.view({ attrs: { chatId: CHAT_ID, events } } as unknown as Parameters<
+      typeof component.view
+    >[0]) as m.Vnode | null;
+  };
+
+  /** The text of the row's caption or its elapsed count, or null when the row has none. The row is
+   *  dot, caption, elapsed count, with a hole where a part is absent. */
+  const partOf = (strip: m.Vnode | null, part: "label" | "elapsed"): string | null => {
+    const children = (strip?.children ?? []) as (m.Vnode | null)[];
+    const span = children[part === "label" ? 1 : 2];
+    const content = ((span?.children ?? []) as m.Vnode[])[0]?.children;
+    return typeof content === "string" ? content : null;
+  };
+  const stateOf = (strip: m.Vnode | null): unknown =>
+    (strip?.attrs as Record<string, unknown> | undefined)?.["data-state"];
+  const isoAt = (epochMs: number): string => new Date(epochMs).toISOString();
+
+  it("shows a send on its way as the dot at once, names it if it is still going, then counts it", () => {
+    addOutgoing(CHAT_ID, "hello");
+
+    const atOnce = render([]);
+    expect(stateOf(atOnce)).toBe("SENDING");
+    expect(partOf(atOnce, "label")).toBeNull();
+    expect(partOf(atOnce, "elapsed")).toBeNull();
+
+    now = NOW + SENDING_LABEL_AFTER_MS;
+    expect(partOf(render([]), "label")).toBe("Sending to Claude Code…");
+    expect(partOf(render([]), "elapsed")).toBeNull();
+
+    now = NOW + 7_400;
+    expect(partOf(render([]), "elapsed")).toBe("7s");
   });
 
-  it("treats an unknown / future state value as not working", () => {
-    expect(isWorkingActivityState("SOMETHING_NEW")).toBe(false);
+  it("gives the send's row to the turn as soon as the agent works on it", () => {
+    addOutgoing(CHAT_ID, "hello");
+    agentState.activity_state = "THINKING";
+
+    const strip = render([userMsg(isoAt(NOW))]);
+
+    expect(stateOf(strip)).toBe("THINKING");
+    expect(partOf(strip, "label")).toBe("Thinking…");
+  });
+
+  it("leaves a running call its stretch shows as a chip to the chip, and holds no caption once the call ends", () => {
+    const events = [userMsg(isoAt(NOW - 1_000)), toolUse(isoAt(NOW - 500), "Read", "c1", "{}", "Reading app.py")];
+    const viewOf = (component: ReturnType<typeof ActivityIndicator>, isRunningCallInline: boolean): m.Vnode | null =>
+      component.view({
+        attrs: { chatId: CHAT_ID, events, isInStretch: true, isRunningCallInline },
+      } as unknown as Parameters<typeof component.view>[0]) as m.Vnode | null;
+
+    const shownInline = ActivityIndicator();
+    agentState.activity_state = "TOOL_RUNNING";
+    expect(viewOf(shownInline, true)).toBeNull();
+    agentState.activity_state = "THINKING";
+    expect(partOf(viewOf(shownInline, true), "label")).toBe("Thinking…");
+
+    // With no chip to show it, a call that ends at once keeps its caption up for a beat rather than flashing past.
+    const shownOnRow = ActivityIndicator();
+    agentState.activity_state = "TOOL_RUNNING";
+    expect(partOf(viewOf(shownOnRow, false), "label")).toBe("Reading app.py");
+    agentState.activity_state = "THINKING";
+    expect(partOf(viewOf(shownOnRow, false), "label")).toBe("Reading app.py");
+  });
+
+  it("counts a turn's running time from the message that opened it, once it has run a while", () => {
+    agentState.activity_state = "THINKING";
+
+    expect(partOf(render([userMsg(isoAt(NOW - ELAPSED_SHOWN_AFTER_MS + 500))]), "elapsed")).toBeNull();
+    expect(partOf(render([userMsg(isoAt(NOW - 12_000))]), "elapsed")).toBe("12s");
+
+    agentState.activity_state = "TOOL_RUNNING";
+    const tool = render([
+      userMsg(isoAt(NOW - 125_000)),
+      toolUse(isoAt(NOW - 1_000), "Read", "c1", "{}", "Reading app.py"),
+    ]);
+    expect(partOf(tool, "label")).toBe("Reading app.py");
+    expect(partOf(tool, "elapsed")).toBe("2m 05s");
+  });
+
+  it("does not count from a finished turn while the next turn's own message is still on its way", () => {
+    const finished = [userMsg(isoAt(NOW - 3_600_000)), toolResult(isoAt(NOW - 3_590_000), "c0")];
+    render(finished);
+
+    // The backend reports the next turn a beat before its message reaches the transcript.
+    agentState.activity_state = "THINKING";
+    expect(partOf(render(finished), "label")).toBe("Thinking…");
+    expect(partOf(render(finished), "elapsed")).toBeNull();
+
+    // Once it lands, the count runs from it.
+    expect(partOf(render([...finished, userMsg(isoAt(NOW - 5_000))]), "elapsed")).toBe("5s");
+  });
+
+  it("shows nothing while the harness closes a turn whose reply is in", () => {
+    chatState.status = "working";
+    const events = [userMsg(isoAt(NOW - 10_000)), toolResult(isoAt(NOW - 200), "c1")];
+
+    expect(render(events)).toBeNull();
+    now = NOW + 10_000;
+    expect(render(events)).toBeNull();
+  });
+
+  it("keeps the dot, counting from the send, for a turn whose message landed before the agent works on it", () => {
+    addOutgoing(CHAT_ID, "hello");
+    const opening = userMsg(isoAt(NOW + 2_000));
+    noteBackendArrivals(CHAT_ID, [opening.event_id]);
+    chatState.status = "working";
+
+    const starting = render([opening]);
+    expect(stateOf(starting)).toBe("STARTING");
+    expect(partOf(starting, "label")).toBeNull();
+
+    now = NOW + 5_400;
+    expect(partOf(render([opening]), "elapsed")).toBe("5s");
+  });
+
+  it("counts a turn this page sent from the send, so the count runs on unbroken", () => {
+    addOutgoing(CHAT_ID, "hello");
+    now = NOW + 8_000;
+    const opening = userMsg(isoAt(NOW + 6_500));
+    noteBackendArrivals(CHAT_ID, [opening.event_id]);
+    agentState.activity_state = "THINKING";
+
+    expect(partOf(render([opening]), "elapsed")).toBe("8s");
+  });
+
+  it("keeps the row under a send that opened the turn until the send reaches the transcript", () => {
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-turn");
+
+    addOutgoing(CHAT_ID, "hello");
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-sends");
+
+    // The agent reports the turn before its message has reached the transcript.
+    agentState.activity_state = "THINKING";
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-sends");
+
+    noteBackendArrivals(CHAT_ID, ["u-hello"]);
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-turn");
+  });
+
+  it("keeps the row under every send until the one that opened the turn lands, then above the send behind it", () => {
+    addOutgoing(CHAT_ID, "hello");
+    addOutgoing(CHAT_ID, "and another thing");
+    agentState.activity_state = "THINKING";
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-sends");
+
+    noteBackendArrivals(CHAT_ID, ["u-hello-ahead"]);
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-turn");
+  });
+
+  it("puts a send made while the agent works on an earlier turn below that turn's row", () => {
+    agentState.activity_state = "THINKING";
+    addOutgoing(CHAT_ID, "and another thing");
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-turn");
+  });
+
+  it("puts the row of a switch that hands its held sends over as the next turn under them", () => {
+    handoffState.handoff = handoffStateFixture({
+      phase: "switching",
+      is_fresh_start: true,
+      held_sends: [{ message_id: "m-1", text: "Find what's using disk space" }],
+    });
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-sends");
+
+    // Once the first held send has landed and opened the turn, the others wait behind it.
+    handoffState.handoff = handoffStateFixture({
+      phase: "switching",
+      is_fresh_start: true,
+      held_sends: [
+        { message_id: "m-1", text: "Find what's using disk space" },
+        { message_id: "m-2", text: "and this" },
+      ],
+    });
+    landedHeldSends.count = 1;
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-turn");
+
+    // A rebind hands its confirming message to the same agent as the next turn's own message.
+    handoffState.handoff = rebindStateFixture();
+    landedHeldSends.count = 0;
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-sends");
+    landedHeldSends.count = 1;
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-turn");
+
+    // A handoff that carries the conversation over opens the successor's turn with its prompt, which the
+    // held sends wait behind.
+    handoffState.handoff = handoffStateFixture({
+      phase: "switching",
+      held_sends: [{ message_id: "m-2", text: "and this" }],
+    });
+    expect(turnStatusPlacement(CHAT_ID)).toBe("after-turn");
   });
 });

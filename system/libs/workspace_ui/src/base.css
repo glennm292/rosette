@@ -8,7 +8,7 @@
  *     via the type-* roles, shared recipes via the component builders in
  *     this library's components/.
  *   - Hand-written CSS here is only for what utilities cannot reach: vendor
- *     DOM (dockview/xterm), markdown-rendered content, keyframes and
+ *     DOM (xterm), markdown-rendered content, keyframes and
  *     pseudo-element machines (the spinner), contextual rules over
  *     shared markup, and cascade-critical overrides. In those, `@apply` the
  *     semantic utilities where they cover the declarations; reference the
@@ -45,7 +45,14 @@
      Warmth comes from the surface underneath, not the tint. */
   --c-fill-hover: rgb(0 0 0 / 0.07);
   --c-fill-active: rgb(0 0 0 / 0.11);
-  --c-bg-user-bubble: #ededed;
+  /* One step fainter than hover, for a hover that has to read lighter than a selection drawn with
+     --c-bubble-other (the chat list's rows). */
+  --c-fill-faint: rgb(0 0 0 / 0.03);
+  /* The viewer's own chat bubble: a green tint, so your own words read apart from everyone else's. */
+  --c-bg-user-bubble: rgb(20 174 92 / 0.11);
+  /* A bubble that is not yours (another person's or the agent's), and the chat list's selected row:
+     one grey for everything said by someone else and for where you are. */
+  --c-bubble-other: rgb(0 0 0 / 0.05);
   --c-bg-composer: #ffffff;
   --c-bg-chat: #ffffff;
   --c-bg-code: #f0f0f0;
@@ -54,6 +61,9 @@
   --c-text-faint: #8c8c8c;
   --c-border: #e4e3df;
   --c-border-faint: #efeeeb;
+  /* A step up from the default edge, for a control that has to read as one you type into rather than
+     as a panel seam: still lighter than the faintest text, so it draws a box without drawing a rule. */
+  --c-border-strong: #cfcdc7;
   --c-border-code: #e0e0e0;
   --c-accent: #2f6b4f;
   --c-accent-hover: #24573f;
@@ -72,6 +82,13 @@
   --c-success: #22a06b;
   --c-success-bg: #e0f2ea;
   --c-success-border: #b2decb;
+  /* Progress-timeline bullets. A finished step's check reads green without
+     shouting -- the accent pulled most of the way toward the faint grey, so it
+     carries the same weight as the greyed-out title beside it. A step not
+     started yet sits a shade lighter still, below faint, so the not-yet reads
+     as absence rather than as text. */
+  --c-step-done: color-mix(in srgb, var(--c-accent) 55%, var(--c-text-faint));
+  --c-step-pending: #c2bfb6;
   /* Foreground on accent/coloured surfaces (e.g. white button text). */
   --c-text-on-accent: #ffffff;
   /* Inverse surface — dark ("black") bg with on-accent text. */
@@ -86,6 +103,8 @@
   /* Row text: the dense-chrome step between body and helper. */
   --font-size-row: 13px;
   --font-size-helper: 12px;
+  /* A word badge set beside other text ("Read-only"): the smallest step. */
+  --font-size-tag: 10px;
   /* (No --weight-medium: 500 in markup is Tailwind's font-medium, and no type
      role uses it -- see the type-roles note below.) */
   --weight-regular: 400;
@@ -97,14 +116,20 @@
   --dur-base: 120ms;
   --dur-slow: 200ms;
   /* Z-index scale — names the workspace's stacking layers.
-     Modal backdrops + the image lightbox sit at --z-overlay; the JS hover-tooltip
-     clears them at --z-tooltip. */
+     Modal backdrops + the image lightbox sit at --z-overlay. Menus and dropdowns
+     (components/menu.ts, components/dropdown.ts) sit at --z-popover, ABOVE the
+     overlays: a popover is always the most recently opened thing on screen, and
+     one opened from inside a modal has to paint over that modal. The JS
+     hover-tooltip clears them all at --z-tooltip. */
   --z-content: 1;
   --z-sticky: 100;
-  --z-dropdown: 1000;
   --z-overlay: 10000;
-  --z-tooltip: 10001;
-  --width-message-column: 740px;
+  --z-popover: 10001;
+  --z-tooltip: 10002;
+  --width-message-column: 672px;
+  /* Elevation values, behind --shadow-raised / --shadow-overlay (see @theme below). */
+  --c-shadow-raised: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px -1px rgba(0, 0, 0, 0.1);
+  --c-shadow-overlay: 0 0 2px 0 rgba(0, 0, 0, 0.08), 0 3px 8px 2px rgba(0, 0, 0, 0.08);
 }
 
 /* The colour-utility layer: clean semantic names over the --c-* values,
@@ -116,9 +141,10 @@
   --color-secondary: var(--c-text-secondary);
   --color-faint: var(--c-text-faint);
   --color-on-accent: var(--c-text-on-accent);
-  /* borders: border-default / border-subtle */
+  /* borders: border-default / border-subtle / border-strong */
   --color-default: var(--c-border);
   --color-subtle: var(--c-border-faint);
+  --color-strong: var(--c-border-strong);
   /* surfaces: bg-page / -sidebar / -chat / -composer / -code / -user-bubble /
      -surface / -surface-secondary / -inverse / -inverse-hover */
   --color-page: var(--c-bg);
@@ -127,13 +153,18 @@
   --color-composer: var(--c-bg-composer);
   --color-code: var(--c-bg-code);
   --color-user-bubble: var(--c-bg-user-bubble);
+  --color-bubble-other: var(--c-bubble-other);
   --color-surface: var(--c-surface);
   --color-surface-secondary: var(--c-surface-secondary);
   --color-inverse: var(--c-inverse-surface);
   --color-inverse-hover: var(--c-inverse-surface-hover);
-  /* fills: bg-fill-hover / bg-fill-active (control state tints) */
+  /* fills: bg-fill-hover / bg-fill-active / bg-fill-faint (control state tints) */
   --color-fill-hover: var(--c-fill-hover);
   --color-fill-active: var(--c-fill-active);
+  --color-fill-faint: var(--c-fill-faint);
+  /* progress-timeline bullets: text-step-done / text-step-pending */
+  --color-step-done: var(--c-step-done);
+  --color-step-pending: var(--c-step-pending);
   /* accent / interactive */
   --color-accent: var(--c-accent);
   --color-accent-hover: var(--c-accent-hover);
@@ -158,6 +189,9 @@
      --font-mono re-bases the font-mono utility onto the workspace's mono stack. */
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   --font-mono: "SF Mono", "Cascadia Code", ui-monospace, monospace;
+  /* The display face: headings, section labels, and the type a theme gives its titles, buttons, and
+     menus (a theme's token, docs/system/blueprint/workspace-themes/). The standard look sets it in the body face. */
+  --font-display: var(--font-sans);
   /* Spacing — one knob: Tailwind's stock 0.25rem `--spacing` base. The
      `p-N`/`m-N`/`gap-N`/`w-N` utilities generate from it, and hand-written CSS
      references the same scale via the `--spacing(N)` function (e.g.
@@ -168,8 +202,9 @@
   /* Radius scale. sm/md/lg equal Tailwind's own defaults, so overriding them
      leaves the rounded-* utilities in the views at their stock values (only xl
      differs from Tailwind's). md is the default control radius; lg carries
-     inputs, cards and modals; xl is reserved for the largest surfaces; pills
-     and circles are Tailwind's stock rounded-full. The 12px pane/chrome frame
+     inputs, cards and modals; xl is for the largest surfaces and for the
+     floating menus (components/menu.ts); pills and circles are Tailwind's
+     stock rounded-full. The 12px pane/chrome frame
      keeps its own --si-pane-radius (defined in the shell's stylesheet). */
   --radius-sm: 4px;
   --radius-md: 6px;
@@ -178,9 +213,11 @@
   /* Elevation -- two box-shadow steps. --shadow-raised is the subtle resting
      lift on interactive cards; --shadow-overlay is the one soft floating
      shadow shared by everything above the page -- menus, pickers, modals,
-     tooltips, the lightbox. */
-  --shadow-raised: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px -1px rgba(0, 0, 0, 0.1);
-  --shadow-overlay: 0 1px 1px 0 rgba(0, 0, 0, 0.08), 0 3px 12px 0 rgba(0, 0, 0, 0.08);
+     tooltips, the lightbox. Tailwind copies a shadow token's value into its
+     utility, so the values live in --c-shadow-* (the value layer) and these
+     point at them, which lets a workspace theme (docs/system/blueprint/workspace-themes/) redeclare them at runtime. */
+  --shadow-raised: var(--c-shadow-raised);
+  --shadow-overlay: var(--c-shadow-overlay);
 }
 
 /* Font family comes from the preflight default (re-based onto --font-sans above). */
@@ -204,11 +241,13 @@ body {
  * used on interactive controls (buttons/tabs) — that treatment comes with the
  * Button/Tab primitive. */
 @utility type-heading-lg {
+  font-family: var(--font-display);
   font-size: var(--font-size-heading-lg);
   font-weight: var(--weight-bold);
   line-height: 1.25;
 }
 @utility type-heading {
+  font-family: var(--font-display);
   font-size: var(--font-size-heading);
   font-weight: var(--weight-semibold);
   line-height: 1.3;
@@ -228,7 +267,13 @@ body {
   font-weight: var(--weight-regular);
   line-height: 1.4;
 }
+@utility type-tag {
+  font-size: var(--font-size-tag);
+  font-weight: var(--weight-regular);
+  line-height: 1;
+}
 @utility type-section {
+  font-family: var(--font-display);
   font-size: var(--font-size-helper);
   font-weight: var(--weight-semibold);
   line-height: 1.3;
@@ -253,12 +298,13 @@ body {
 /* Spinner primitive.
  * One CSS ring spinner (+ one @keyframes spin).
  * Size via --spinner-size (or .spinner--sm; add a size
- * step when a use exists); the two-tone track/arc default to --c-border /
- * --c-accent, overridable via --spinner-track / --spinner-arc.
+ * step when a use exists) and ring weight via --spinner-width; the two-tone
+ * track/arc default to --c-border / --c-accent, overridable via
+ * --spinner-track / --spinner-arc.
  * .spinner--current makes it monochrome (currentColor ring with a transparent
- * gap) for use on coloured contexts. (The login screen's fancier SVG arc is
- * its own svg drawing -- see loginSpinnerIcon in components/icons.ts -- but shares
- * this @keyframes.) */
+ * gap) for use on coloured contexts. (The fancier SVG arc that sign-in and an
+ * attachment's upload show is its own svg drawing -- see spinnerIcon in
+ * components/icons.ts -- but shares this @keyframes.) */
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -268,7 +314,7 @@ body {
   display: block;
   width: var(--spinner-size, 16px);
   height: var(--spinner-size, 16px);
-  border: 2px solid var(--spinner-track, var(--c-border));
+  border: var(--spinner-width, 2px) solid var(--spinner-track, var(--c-border));
   border-top-color: var(--spinner-arc, var(--c-accent));
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
@@ -306,6 +352,14 @@ body {
   }
 }
 
+/* A toast rises into place (components/toasts.ts). */
+@keyframes toast-rise {
+  from {
+    transform: translateY(24px);
+    opacity: 0.6;
+  }
+}
+
 /* The activity dot's pulse (components/activityDot.ts); like the modal's, only the
  * @keyframes live here, the utility references them by name. */
 @keyframes agent-activity-pulse {
@@ -318,4 +372,13 @@ body {
     opacity: 1;
     transform: scale(1.15);
   }
+}
+
+/* While a keystroke edits text, the pointer is hidden until it moves, so it never sits over what
+ * is being typed (hideCursorWhileTyping.ts toggles the class). ``*`` with ``!important`` because
+ * fields, links, buttons, and the window drag handle set their own cursors, which would otherwise
+ * win over the hidden one. */
+html.typing-hides-cursor,
+html.typing-hides-cursor * {
+  cursor: none !important;
 }

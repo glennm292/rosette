@@ -2,44 +2,12 @@ class ShellError(Exception):
     """Base error for everything in the shell subpackage."""
 
 
-class InvalidAddressError(ShellError, ValueError):
-    """A string is not an address of contracts.md section 1."""
-
-
 class InvalidShellValueError(ShellError, ValueError):
     """A shell identifier or value does not satisfy its rule."""
 
 
 class ShellStateError(ShellError, OSError):
     """A shell state file cannot be read or written."""
-
-
-class ProjectNotFoundError(ShellError, LookupError):
-    """No project has the given id."""
-
-    def __init__(self, project_id: str) -> None:
-        self.project_id = project_id
-        super().__init__(f"Project '{project_id}' not found")
-
-
-class ProjectConflictError(ShellError, ValueError):
-    """A new project's id collides with an existing project."""
-
-
-class ProjectValueError(ShellError, ValueError):
-    """A project's name, color, glyph, or shortcut is not usable."""
-
-
-class EverythingIsNotAProjectError(ShellError, ValueError):
-    """A project route was called with the Everything view id."""
-
-
-class LayoutNotFoundError(ShellError, LookupError):
-    """No client layout holds the given tab."""
-
-
-class StaleLayoutSaveError(ShellError, ValueError):
-    """A browser's save is based on an older arrangement than the one stored (answered 409)."""
 
 
 class ClientNotFoundError(ShellError, LookupError):
@@ -50,29 +18,20 @@ class NoTargetClientError(ShellError, ValueError):
     """An op could not be settled on exactly one client (answered 412)."""
 
 
-class InstanceNotListedError(ShellError, LookupError):
-    """No app lists an instance at the given address."""
-
-
-class PanelNotFoundError(ShellError, LookupError):
-    """The client's arrangement of the view holds no panel for the address."""
-
-
 class LayoutOpError(ShellError, ValueError):
     """An op's arguments cannot be applied to the arrangement."""
 
 
-class InstanceCreateRefusedError(ShellError):
-    """An app (or the relay in front of it) refused the create an op asked for; carries the app's status and detail."""
-
-    def __init__(self, status_code: int, detail: str) -> None:
-        self.status_code = status_code
-        self.detail = detail
-        super().__init__(detail)
+class NoRequesterWindowError(LayoutOpError):
+    """``self`` or ``pinned`` names a window of the requester's, and the op carries no requester that has one."""
 
 
 class UnknownAppError(ShellError, LookupError):
     """No registered app has the given name."""
+
+
+class NoMessageHandlerError(ShellError, LookupError):
+    """No registered app handles the relayed message's type (answered 404)."""
 
 
 class AppLifecycleRefusedError(ShellError, ValueError):
@@ -81,3 +40,90 @@ class AppLifecycleRefusedError(ShellError, ValueError):
 
 class SupervisorProgramActionError(ShellError, RuntimeError):
     """Supervisord refused, or could not be reached for, a stop or start."""
+
+
+class DesktopNotFoundError(ShellError, LookupError):
+    """No desktop has the given id (or name)."""
+
+    def __init__(self, desktop: str) -> None:
+        self.desktop = desktop
+        super().__init__(f"Desktop '{desktop}' not found")
+
+
+class DesktopConflictError(ShellError, ValueError):
+    """A new desktop's id collides with an existing desktop."""
+
+
+class LastDesktopError(ShellError, ValueError):
+    """The last remaining desktop cannot be deleted (answered 409)."""
+
+
+class DesktopValueError(ShellError, ValueError):
+    """A desktop's name, colour, glyph, shortcut, wallpaper, or a window's app or path is not usable."""
+
+
+class LaunchRefusedError(ShellError, ValueError):
+    """The app refused a POST launch (a 4xx with its own detail), or the launch's params are not what the path
+    declares (answered 400)."""
+
+
+class LaunchUnavailableError(ShellError, RuntimeError):
+    """A POST launch could not be completed: the app could not be reached, timed out, or answered something other
+    than a page path (answered 502)."""
+
+
+class WindowNotFoundError(ShellError, LookupError):
+    """No window on the desktop has the given id."""
+
+    def __init__(self, window: str) -> None:
+        self.window = window
+        super().__init__(f"Window '{window}' not found")
+
+
+class WindowPoppedOutError(ShellError, ValueError):
+    """An op would change where a window the target client has popped out into its own window sits, and the op did
+    not carry ``force`` (answered 423): the pop-out is the user's arrangement."""
+
+    def __init__(self, op: str, window: str) -> None:
+        self.op = op
+        self.window = window
+        super().__init__(
+            f"Window {window} is popped out into its own window, so {op!r} would bring it back onto the desktop; "
+            "pass force to do so anyway"
+        )
+
+
+class PinnedWindowError(ShellError, ValueError):
+    """A pinned window cannot be closed (answered 409); minimizing is how it leaves the screen."""
+
+
+class StalePlacementsSaveError(ShellError, ValueError):
+    """A browser's placements save is based on an older layout than the one stored (answered 409)."""
+
+
+class WallpaperNotFoundError(ShellError, LookupError):
+    """No bundled or file wallpaper has the given kind and name."""
+
+
+class GridSearchExhaustedError(ShellError, AssertionError):
+    """The unbounded nearest-free-cell search ran out of rings without finding a free cell, which cannot happen."""
+
+
+class UpdateNoticeRecordError(ShellError, ValueError):
+    """The kept rollback point's file does not hold a record."""
+
+
+class UpdateNoticeRefusedError(ShellError, ValueError):
+    """The update notice is not in a state the verb applies to: nothing kept, a rollback already running, or one done."""
+
+
+class UpdateNoticeCommandError(ShellError, RuntimeError):
+    """The update-self script behind a notice verb could not be run, or failed."""
+
+
+class PortParkingError(ShellError, OSError):
+    """A stopped app's port could not be parked."""
+
+
+class PortInUseError(PortParkingError):
+    """Something already listens on the port the shell meant to park (the app itself, most likely)."""

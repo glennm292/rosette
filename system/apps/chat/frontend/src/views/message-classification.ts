@@ -8,10 +8,14 @@
  * fields (and a tool call's `display`). This module only MAPS those fields onto
  * the frontend's `UserMessageKind` catalogue (see message-kinds.ts for how each
  * kind renders) -- it never sniffs message text or tool input, and adding a new
- * specially-rendered message is a backend rule, not a frontend regex.
+ * specially-rendered message is a backend rule, not a frontend regex. The one
+ * exception is the slash commands sent to an agent (`/handoff-summary`, `/compact`),
+ * recognised by their text: what each means depends on where it sits in the
+ * transcript, which only the transcript walk can see.
  */
 
-import type { ToolCall, UserMessageEvent } from "../models/Response";
+import type { DisplayDecision } from "../models/Chats";
+import type { CompactionCause, ToolCall, TranscriptEvent, UserMessageEvent } from "../models/Response";
 import { KIND_SPEC, Rail, UserMessageKind } from "./message-kinds";
 
 /** The slice of a user_message the classification reads. */
@@ -34,10 +38,11 @@ export interface UserMessageClass {
  * Map a user_message's backend render decision onto a `UserMessageKind`.
  * Grouping and rendering both call this and act on the kind alone.
  *
- * A `permission_resolution` deliberately maps to `UserPrompt` here: the verdict
- * only suppresses the bubble when the timeline walk correlates it to an earlier,
- * still-pending permission card (see `resolutionOf` + turn-grouping); an
- * uncorrelated one renders as an ordinary message.
+ * A `permission_resolution` (and a `secret_resolution`) deliberately maps to
+ * `UserPrompt` here: the verdict only suppresses the bubble when the timeline walk
+ * correlates it to an earlier, still-pending card (see `resolutionOf`,
+ * `secretResolutionOf` + turn-grouping); an uncorrelated one renders as an
+ * ordinary message.
  */
 export function classifyUserMessage(event: ClassifiableUserMessage): UserMessageClass {
   const content = event.content || "";
@@ -45,6 +50,7 @@ export function classifyUserMessage(event: ClassifiableUserMessage): UserMessage
     case "hidden":
       return { kind: UserMessageKind.Hidden, label: null, body: content };
     case "chip":
+    case "person_chip":
       return {
         kind: UserMessageKind.SystemChip,
         label: event.display_label ?? null,
@@ -52,10 +58,20 @@ export function classifyUserMessage(event: ClassifiableUserMessage): UserMessage
       };
     case "skill_expansion":
       return { kind: UserMessageKind.SkillExpansion, label: event.display_label ?? null, body: content };
+    // The user's own turn, shown as one: the machine context sent with their words (a seeded
+    // chat's context block, or background-task reports flushed into the turn) is kept out of the bubble.
+    case "prompt_with_context":
+      return { kind: UserMessageKind.UserPrompt, label: null, body: event.display_body ?? content };
     case "status":
       return {
         kind: UserMessageKind.StatusMessage,
         label: event.display_label ?? (event.display_body !== undefined ? content : null),
+        body: event.display_body ?? content,
+      };
+    case "notice":
+      return {
+        kind: UserMessageKind.Notice,
+        label: event.display_label ?? null,
         body: event.display_body ?? content,
       };
     default:
@@ -63,14 +79,25 @@ export function classifyUserMessage(event: ClassifiableUserMessage): UserMessage
   }
 }
 
-// --- Thin semantic helpers over classifyUserMessage -------------------------
+/** Classify a message that is not on the transcript yet from the decision the backend made for
+ *  its text (``decision`` is undefined for a plain one). */
+export function classifyDecidedMessage(content: string, decision: DisplayDecision | undefined): UserMessageClass {
+  return classifyUserMessage({
+    content,
+    display: decision?.display ?? undefined,
+    display_label: decision?.display_label ?? undefined,
+    display_body: decision?.display_body ?? undefined,
+  });
+}
+
+// Thin semantic helpers over classifyUserMessage
 // Kept as named predicates because callers ask a specific structural question;
 // all derive from the single classification above.
 
 /**
- * True for a user_message that is NOT a genuine human turn and so must not be
- * treated as a turn boundary -- folding one of these into the running turn keeps
- * a single logical turn from being split into several visible ones.
+ * True for a user_message that does NOT open a new section of the progress
+ * timeline: a skill expansion or a hidden framework injection, which renders no
+ * row of its own there.
  */
 export function isNonBoundaryUserMessage(event: ClassifiableUserMessage): boolean {
   // Derived from the KIND_SPEC registry (its `boundary` column) so the boundary
@@ -78,13 +105,37 @@ export function isNonBoundaryUserMessage(event: ClassifiableUserMessage): boolea
   return !KIND_SPEC[classifyUserMessage(event).kind].boundary;
 }
 
-/** True when the message folds into the current turn as a collapsed chip (rather
- *  than being dropped): the SystemChip kinds. */
+/** True for a user_message that is a turn of the conversation (the registry's `isTurn`
+ *  column). */
+export function isTurnUserMessage(event: ClassifiableUserMessage): boolean {
+  return KIND_SPEC[classifyUserMessage(event).kind].isTurn;
+}
+
+/** True when the message shows as a collapsed chip (rather than being dropped):
+ *  the SystemChip kinds. */
 export function isSystemChipUserMessage(event: ClassifiableUserMessage): boolean {
   return classifyUserMessage(event).kind === UserMessageKind.SystemChip;
 }
 
-/** True when the message is a subtle inline status message. */
+/** True when the message is a chip of the person's own doing (a bash-mode command or its output): it stands on
+ *  their side of the transcript rather than in the agent's turn. */
+export function isPersonsChipMessage(event: Pick<UserMessageEvent, "display">): boolean {
+  return event.display === "person_chip";
+}
+
+/** True when the message is a one-line notice on the agent's rail. */
+export function isNoticeUserMessage(event: ClassifiableUserMessage): boolean {
+  return classifyUserMessage(event).kind === UserMessageKind.Notice;
+}
+
+/** True for the user's own words sent with machine context for the agent -- a seeded chat's context
+ *  block, or background-task reports flushed into the turn (the backend's `prompt_with_context`).
+ *  A genuine human turn. */
+export function isPromptWithContext(event: ClassifiableUserMessage): boolean {
+  return event.display === "prompt_with_context";
+}
+
+/** True when the message is a compaction's status event ("Context was compacted"). */
 export function isStatusUserMessage(event: ClassifiableUserMessage): boolean {
   return classifyUserMessage(event).kind === UserMessageKind.StatusMessage;
 }
@@ -95,24 +146,108 @@ export function isSkillExpansionUserMessage(event: ClassifiableUserMessage): boo
   return classifyUserMessage(event).kind === UserMessageKind.SkillExpansion;
 }
 
-/** True when the message produces NO row on the user rail -- either fully hidden
- *  (`/welcome`, an is_meta injection) or relocated into an assistant-side block
- *  (skill expansion). The rendering/rows layers use this to skip emitting a row. */
+/** True when the message produces NO row of its own -- either fully hidden (`/welcome`, an
+ *  is_meta injection) or relocated into an assistant-side block (a skill expansion). The
+ *  rendering/rows layers use this to skip emitting a row.
+ *
+ *  Not "off the user rail": a notice draws in the stretch of the agent's output it lands in. */
 export function isHiddenUserMessage(event: ClassifiableUserMessage): boolean {
-  return KIND_SPEC[classifyUserMessage(event).kind].rail !== Rail.User;
+  const kind = classifyUserMessage(event).kind;
+  return KIND_SPEC[kind].rail === Rail.None || kind === UserMessageKind.SkillExpansion;
 }
 
 /** The slash command the chat app sends a retiring agent for its handoff summary (the backend's
  *  ``HANDOFF_SUMMARY_COMMAND``); the transcript walk opens the handoff node on it. */
 const HANDOFF_SUMMARY_COMMAND = "/handoff-summary";
 
-/** True for the chat app's own summary request: the user message that starts a handoff's summary turn. */
-export function isHandoffSummaryRequest(event: ClassifiableUserMessage): boolean {
+/** True when the message invokes `command`, with or without arguments. */
+function isSlashCommand(event: ClassifiableUserMessage, command: string): boolean {
   const content = event.content.trim();
-  return content === HANDOFF_SUMMARY_COMMAND || content.startsWith(`${HANDOFF_SUMMARY_COMMAND} `);
+  return content === command || content.startsWith(`${command} `);
 }
 
-// --- Permission REQUEST (a tool call) ---------------------------------------
+/** True for the chat app's own summary request: the user message that starts a handoff's summary turn. */
+export function isHandoffSummaryRequest(event: ClassifiableUserMessage): boolean {
+  return isSlashCommand(event, HANDOFF_SUMMARY_COMMAND);
+}
+
+/** The slash command that compacts a Claude agent's context, typed by the user or sent by the idle sweep. */
+const COMPACT_COMMAND = "/compact";
+
+/** True for either record Claude Code makes of a `/compact`: the one submitted and its expansion. */
+function isCompactCommand(event: ClassifiableUserMessage): boolean {
+  return isSlashCommand(event, COMPACT_COMMAND);
+}
+
+/** The `/compact`s the idle sweep sent a Claude agent, each paired with the compaction it started. */
+export interface SweepCompactCommands {
+  /** By the landed compaction's event id. */
+  byCompactionId: Map<string, UserMessageEvent>;
+  /** The one that started the compaction running now, if any. */
+  running: UserMessageEvent | null;
+}
+
+/** The `/compact` at `index` when it is one the timeline shows (not its hidden expansion), else null. */
+function shownCompactCommandAt(events: readonly TranscriptEvent[], index: number): UserMessageEvent | null {
+  const e = events[index];
+  return e.type === "user_message" && !isNonBoundaryUserMessage(e) && isCompactCommand(e) ? e : null;
+}
+
+/** The compaction the message at `index` directly precedes, past only messages that render nowhere:
+ *  its status event, null when anything else comes first, or undefined when nothing has followed yet. */
+function compactionAfter(events: readonly TranscriptEvent[], index: number): UserMessageEvent | null | undefined {
+  for (let i = index + 1; i < events.length; i++) {
+    const e = events[i];
+    if (e.type !== "user_message") return null;
+    if (isStatusUserMessage(e)) return e;
+    if (!isNonBoundaryUserMessage(e)) return null;
+  }
+  return undefined;
+}
+
+/** Find the idle sweep's `/compact`s: Claude Code records one as a user message the user never typed,
+ *  so it is no turn of the conversation. A `/compact` is the sweep's when the compaction it directly
+ *  precedes is idle; one the user typed stays theirs. `liveCause` is the cause of the compaction
+ *  running now, or null when none is running or its cause is unknown. */
+export function sweepCompactCommands(
+  events: readonly TranscriptEvent[],
+  liveCause: CompactionCause | null,
+): SweepCompactCommands {
+  const byCompactionId = new Map<string, UserMessageEvent>();
+  let running: UserMessageEvent | null = null;
+  for (let i = 0; i < events.length; i++) {
+    const command = shownCompactCommandAt(events, i);
+    if (command === null) continue;
+    const compaction = compactionAfter(events, i);
+    if (compaction === undefined) {
+      if (liveCause === "idle") running = command;
+    } else if (compaction?.compaction_cause === "idle") {
+      byCompactionId.set(compaction.event_id, command);
+    }
+  }
+  return { byCompactionId, running };
+}
+
+/** True when the message at `index` is the idle sweep's `/compact` for a compaction that has landed
+ *  (see `sweepCompactCommands`), read forward from that message alone. */
+export function isLandedSweepCompactCommand(events: readonly TranscriptEvent[], index: number): boolean {
+  return shownCompactCommandAt(events, index) !== null && compactionAfter(events, index)?.compaction_cause === "idle";
+}
+
+/** True when the message at `index` is a `/compact` nothing has followed yet, so it is not known
+ *  whether the idle sweep sent it. */
+export function isUnresolvedCompactCommand(events: readonly TranscriptEvent[], index: number): boolean {
+  return shownCompactCommandAt(events, index) !== null && compactionAfter(events, index) === undefined;
+}
+
+/** The event ids of the idle sweep's `/compact`s (see `sweepCompactCommands`). */
+export function sweepCompactCommandIds(commands: SweepCompactCommands): Set<string> {
+  const ids = new Set([...commands.byCompactionId.values()].map((command) => command.event_id));
+  if (commands.running !== null) ids.add(commands.running.event_id);
+  return ids;
+}
+
+// Permission REQUEST (a tool call)
 
 /** True when a tool call is an agent permission request (a POST to the reserved
  *  latchkey host). The backend recognises it from the UNTRUNCATED input the
@@ -122,7 +257,7 @@ export function isPermissionRequestCall(tc: ToolCall): boolean {
   return tc.display === "permission_request";
 }
 
-// --- Permission RESOLUTION (a user_message verdict) -------------------------
+// Permission RESOLUTION (a user_message verdict)
 
 /** The outcome of a permission request, once it has been resolved:
  *   - "granted"/"denied": the user made a decision.
@@ -151,4 +286,58 @@ export function resolutionRequestIdOf(event: Pick<UserMessageEvent, "display" | 
     return null;
   }
   return event.request_id ?? null;
+}
+
+// Secret REQUEST (a tool call)
+
+/** True when a tool call is a secret request (the connect-external-service skill's
+ *  `request_secret.py`). Recognised by the backend from the untruncated input, so
+ *  the card shows while the request is still pending. */
+export function isSecretRequestCall(tc: ToolCall): boolean {
+  return tc.display === "secret_request";
+}
+
+// Secret RESOLUTION (a user_message notice)
+
+/** The outcome of a secret request: the user stored the values, declined (with an
+ *  optional note), or a newer request for the same file replaced it. */
+export type SecretResolution = "stored" | "declined" | "superseded";
+
+/** Any card verdict the walk keys by request id. */
+export type RequestResolution = PermissionResolution | SecretResolution;
+
+/** The verdict a secret notice carries, or null when the message is not one. The
+ *  backend stamps `display: "secret_resolution"` + `resolution` off the notice's
+ *  machine tag; the walk writes the verdict onto the earlier secret card. */
+export function secretResolutionOf(event: Pick<UserMessageEvent, "display" | "resolution">): SecretResolution | null {
+  if (event.display !== "secret_resolution") {
+    return null;
+  }
+  const verdict = event.resolution;
+  return verdict === "stored" || verdict === "declined" || verdict === "superseded" ? verdict : null;
+}
+
+/** The id of the request a secret notice resolves; a secret notice always carries one. */
+export function secretResolutionRequestIdOf(event: Pick<UserMessageEvent, "display" | "request_id">): string | null {
+  if (event.display !== "secret_resolution") {
+    return null;
+  }
+  return event.request_id ?? null;
+}
+
+const SECRET_TAG_RE = /\(secret:\s*(?:stored|declined|superseded),\s*request_id:\s*[^)\s]+\)\s*/;
+
+/** The user's note on a declined secret request: whatever follows the machine tag. Read from the
+ *  notice the backend supplies without any background-task reports a harness flushed with it. */
+export function secretResolutionNoteOf(
+  event: Pick<UserMessageEvent, "display" | "content" | "display_body">,
+): string | null {
+  if (event.display !== "secret_resolution") {
+    return null;
+  }
+  const notice = event.display_body ?? event.content;
+  const match = SECRET_TAG_RE.exec(notice);
+  if (match === null) return null;
+  const note = notice.slice(match.index + match[0].length).trim();
+  return note === "" ? null : note;
 }

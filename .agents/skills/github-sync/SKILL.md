@@ -1,7 +1,7 @@
 ---
 name: github-sync
 description: Enable, check, or disable GitHub sync for this workspace. Enabling creates a dedicated PRIVATE GitHub repo via latchkey, points origin at it, and auto-pushes every commit from every checkout. Workspace data under data/ is NOT synced to GitHub (the restic host backup covers it). Use when the user asks to back up / sync the workspace to GitHub, enable auto-push, or asks about GitHub sync status.
-compatibility: Requires latchkey (see the latchkey skill) and the user approving GitHub permissions in the Mind app.
+compatibility: Requires latchkey (see the connect-external-service skill) and the user approving GitHub permissions in the Imbue Studio app.
 metadata:
   author: imbue
 ---
@@ -37,13 +37,14 @@ NOT shipped to GitHub -- the restic `host-backup` service covers it.
 
 ## Enable
 
-1. **Check current state**: `uv run github-sync status`. If `is_configured`
+1. **Check current state**: `uv run --no-sync github-sync status`. If `is_configured`
    is already true, jump to "Status" (or "Repair" if the service is
    unhealthy). Also run `supervisorctl status github-sync` (it errors when no
    such program exists -- expected before enable).
 
-2. **Request GitHub permissions** through latchkey (see the latchkey skill
-   for the permission-request mechanics). GitHub exposes two latchkey scopes
+2. **Request GitHub permissions** through latchkey (see
+   `.agents/skills/connect-external-service/references/latchkey.md` for the
+   permission-request mechanics). GitHub exposes two latchkey scopes
    and a permission request carries exactly one scope, so this is two
    requests. A request must be the **only** command in its tool call, so these
    are two calls -- send them back to back; you do not have to wait for the
@@ -116,7 +117,7 @@ NOT shipped to GitHub -- the restic `host-backup` service covers it.
    ```bash
    latchkey curl -s -X POST https://api.github.com/user/repos \
      -H 'Content-Type: application/json' \
-     -d '{"name": "<repo-name>", "private": true, "description": "Private sync repo for the <workspace> minds workspace"}'
+     -d '{"name": "<repo-name>", "private": true, "description": "Private sync repo for the <workspace> Imbue Studio workspace"}'
    ```
 
    (For an org: `POST https://api.github.com/orgs/<org>/repos`.) On a 422
@@ -138,15 +139,15 @@ NOT shipped to GitHub -- the restic `host-backup` service covers it.
 
    ```toml
    # Written by the github-sync skill. Presence of this file enables GitHub
-   # sync; `uv run github-sync status` reports on it.
+   # sync; `uv run --no-sync github-sync status` reports on it.
    repo_url = "https://github.com/<owner>/<repo>"
    ```
 
-6. **Wire git through the gateway**: `uv run github-sync wire-git`. From now
+6. **Wire git through the gateway**: `uv run --no-sync github-sync wire-git`. From now
    on plain `git push`/`git fetch` against github.com works in every
    checkout, and the post-commit auto-push hook is active.
 
-7. **Verify private before any push**: `uv run github-sync check-visibility`
+7. **Verify private before any push**: `uv run --no-sync github-sync check-visibility`
    must print `private` (exit 0). If not, stop and surface the problem.
 
 8. **Initial sync**: push the current branch and any existing worker
@@ -170,7 +171,7 @@ NOT shipped to GitHub -- the restic `host-backup` service covers it.
     # The oom_tag_service.py prefix sets its OOM shed-priority band (see
     # system/services/oom_priority).
     [program:github-sync]
-    command=python3 system/services/oom_priority/bin/oom_tag_service.py github-sync uv run github-sync run
+    command=python3 system/services/oom_priority/bin/oom_tag_service.py github-sync bash -c "uv sync --all-packages --frozen && exec .venv/bin/github-sync run"
     directory=/home/user/workspace
     autostart=true
     autorestart=true
@@ -199,7 +200,7 @@ NOT shipped to GitHub -- the restic `host-backup` service covers it.
 
 ## Status
 
-`uv run github-sync status` prints config + the service's latest status
+`uv run --no-sync github-sync status` prints config + the service's latest status
 (visibility, errors); `supervisorctl status github-sync` shows the
 process; logs are at `/var/log/supervisor/github-sync-*.log` and
 `/tmp/github-sync.log`, hook output at `/tmp/post-commit-push.log`. Explain
@@ -214,7 +215,7 @@ service block, but not the gitignored `data/system/github_sync.toml`, the
 latchkey permissions, or the container-local wiring. To repair: re-write the
 config file (step 5), then run step 2 (permission requests); the service
 self-heals within a tick (re-wires git). Verify with "Status", or accelerate
-with `uv run github-sync wire-git`. Workspace data under `data/` comes back
+with `uv run --no-sync github-sync wire-git`. Workspace data under `data/` comes back
 via a restic backup restore, not via GitHub.
 
 ## Disable
@@ -225,7 +226,7 @@ repo (recommend keeping it -- it costs nothing and preserves history).
 1. `supervisorctl stop github-sync`, delete
    `system/supervisord.conf.d/github-sync.conf`, then
    `supervisorctl reread && supervisorctl update`.
-2. `uv run github-sync unwire-git` (removes the gateway git config and the
+2. `uv run --no-sync github-sync unwire-git` (removes the gateway git config and the
    hooks path -- auto-push stops).
 3. Delete `data/system/github_sync.toml`.
 4. If the user chose to delete the remote repo:

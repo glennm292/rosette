@@ -1,0 +1,123 @@
+"""Tests for the routes: the page (built or not), the assets, the health probe, the catalog, and the contract module."""
+
+from pathlib import Path
+
+import pytest
+from flask.testing import FlaskClient
+
+from app_manifest.testing import assert_document_policy_admits_page
+from app_schema.testing import assert_api_schema_describes_app
+from app_schema.testing import assert_request_guard_refuses_unknown_provenance
+from getting_started.pages import build_pages_app
+from getting_started.template_catalog import TemplateCatalogStore
+from getting_started.testing import FakeTemplateCatalogFetcher
+from getting_started.testing import catalog_document
+from getting_started.testing import catalog_template_document
+
+_CATALOG_URL = "https://example.test/catalog/new-tab-templates.json"
+_MANIFEST_PATH = Path(__file__).resolve().parents[2] / "app.toml"
+
+
+def _client(
+    tmp_path: Path, catalog_url: str = _CATALOG_URL, fetcher: FakeTemplateCatalogFetcher | None = None
+) -> FlaskClient:
+    static_directory = tmp_path / "static"
+    contract_path = tmp_path / "app_contract.js"
+    store = TemplateCatalogStore(
+        catalog_url=catalog_url,
+        cache_path=tmp_path / "template_catalog.json",
+        fetcher=fetcher if fetcher is not None else FakeTemplateCatalogFetcher(),
+    )
+    return build_pages_app(static_directory, store, contract_path).test_client()
+
+
+def test_the_page_says_it_is_not_built_until_the_bundle_exists_and_then_serves_it(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    response = client.get("/")
+    assert response.status_code == 200
+    assert b"not been built" in response.data
+    assert_document_policy_admits_page(response)
+    assert client.get("/api/health").get_json() == {"status": "ok", "is_frontend_built": False}
+
+    (tmp_path / "static" / "assets").mkdir(parents=True)
+    # The build puts the theme boot inline in the head (workspace_ui's themeBoot), so the policy must admit it.
+    built_page = "<!doctype html><title>Getting Started</title><script>wearRememberedTheme()</script>"
+    (tmp_path / "static" / "index.html").write_text(built_page)
+    (tmp_path / "static" / "assets" / "index.js").write_text("console.log(1)")
+    built = client.get("/")
+    assert built.get_data(as_text=True) == built_page
+    assert built.headers["Cache-Control"] == "no-store"
+    assert_document_policy_admits_page(built)
+    assert client.get("/api/health").get_json() == {"status": "ok", "is_frontend_built": True}
+    assert client.get("/assets/index.js").data == b"console.log(1)"
+    assert client.get("/assets/missing.js").status_code == 404
+    assert client.get("/assets/../index.html").status_code == 404
+
+
+def test_the_page_admits_images_from_the_catalogs_origin_and_only_its_own_without_a_catalog(tmp_path: Path) -> None:
+    """A template's drawing is fetched from where the catalog is, so the page's policy names that origin; an
+    app with no catalog configured names only itself."""
+    policy = _client(tmp_path).get("/").headers["Content-Security-Policy"]
+    assert "img-src 'self' data: blob: https://example.test;" in policy
+
+    policy_without_catalog = (
+        _client(tmp_path / "no-catalog", catalog_url="").get("/").headers["Content-Security-Policy"]
+    )
+    assert "img-src 'self' data: blob:;" in policy_without_catalog
+
+
+def test_the_catalog_route_answers_the_catalog_with_resolved_thumbnails(tmp_path: Path) -> None:
+    fetcher = FakeTemplateCatalogFetcher(
+        body_by_url={
+            _CATALOG_URL: catalog_document(
+                catalog_template_document("inbox"),
+                shelves=[{"key": "popular", "title": "Most popular", "slugs": ["inbox"]}],
+            )
+        }
+    )
+    response = _client(tmp_path, fetcher=fetcher).get("/api/templates-catalog")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["is_stale"] is False
+    assert body["catalog"]["shelves"][0]["slugs"] == ["inbox"]
+    (template,) = body["catalog"]["templates"]
+    assert template["thumbnail_url"] == "https://example.test/catalog/thumbnails/someone--inbox.svg"
+    assert "thumbnail" not in template
+
+
+def test_the_catalog_route_says_when_nothing_could_be_loaded_and_answers_null_when_disabled(tmp_path: Path) -> None:
+    unavailable = _client(tmp_path).get("/api/templates-catalog")
+    assert unavailable.status_code == 503
+    assert unavailable.get_json() == {"detail": "failed to load templates"}
+
+    disabled = _client(tmp_path / "disabled", catalog_url="").get("/api/templates-catalog")
+    assert disabled.status_code == 200
+    assert disabled.get_json() == {"catalog": None, "is_stale": False}
+
+
+@pytest.mark.parametrize("is_built", [False, True])
+def test_the_contract_module_is_served_from_this_origin_once_the_shell_has_built_it(
+    tmp_path: Path, is_built: bool
+) -> None:
+    client = _client(tmp_path)
+    if is_built:
+        (tmp_path / "app_contract.js").write_text("export function connectToShell() {}\n")
+    response = client.get("/_static/app_contract.js")
+    if is_built:
+        assert response.status_code == 200
+        assert response.mimetype == "text/javascript"
+        assert b"connectToShell" in response.data
+    else:
+        assert response.status_code == 404
+
+
+def test_the_app_describes_its_api_the_way_its_manifest_says(tmp_path: Path) -> None:
+    assert_api_schema_describes_app(_client(tmp_path), _MANIFEST_PATH)
+
+
+def test_a_page_of_another_origin_and_a_header_less_request_off_loopback_are_refused(tmp_path: Path) -> None:
+    """The workspace's own browser is on loopback too, so the app reads a header-less request as the owner's only
+    from loopback under a loopback Host, and never one its browser marks as another origin's (the request guard,
+    app_schema.request_guard)."""
+    assert_request_guard_refuses_unknown_provenance(_client(tmp_path), "GET", "/api/health")

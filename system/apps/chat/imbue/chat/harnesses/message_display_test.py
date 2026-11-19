@@ -5,14 +5,31 @@ backend-side, and these cases pin the exact same precedence (explicit detectors 
 ``is_meta``; the compaction chip is keyed off its flag, not its text).
 """
 
-import importlib.util
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
+
+import pytest
+from update_self_skill import update_resume_note
+from workspace_bare_scripts import message_chat
+from workspace_bare_scripts import run_in_background
 
 from imbue.chat.harnesses.events import DisplayKind
+from imbue.chat.harnesses.message_display import BACKGROUND_TASK_REPORT_TAG
 from imbue.chat.harnesses.message_display import BROWSER_FLEET_TAG
 from imbue.chat.harnesses.message_display import HANDOFF_SUMMARY_COMMAND
+from imbue.chat.harnesses.message_display import SEED_CONTEXT_TAG
+from imbue.chat.harnesses.message_display import SecretResolutionVerdict
+from imbue.chat.harnesses.message_display import WORKSPACE_UPDATE_NOTE_TAG
+from imbue.chat.harnesses.message_display import WORKSPACE_UPDATE_OUTCOME_LANDED
+from imbue.chat.harnesses.message_display import WORKSPACE_UPDATE_OUTCOME_NOT_LANDED
 from imbue.chat.harnesses.message_display import classify_user_message
+from imbue.chat.harnesses.message_display import format_secret_resolution_notice
 from imbue.chat.harnesses.message_display import is_non_turn_tail
+from imbue.chat.harnesses.message_display import split_background_task_reports
+from imbue.chat.harnesses.message_display import stamp_user_message_display
+
+_SEED_BLOCK = f"<{SEED_CONTEXT_TAG}>\nthe conversation so far\n</{SEED_CONTEXT_TAG}>"
 
 
 def test_ordinary_human_prompt_gets_no_decision() -> None:
@@ -35,20 +52,84 @@ def test_browser_fleet_nudge_is_a_chip_with_the_sentinel_stripped() -> None:
     assert decision.display_body == inner
 
 
-def test_bare_task_notification_is_a_chip() -> None:
-    decision = classify_user_message("<task-notification>\n<status>completed</status>\n</task-notification>")
+def test_a_seeded_chats_first_send_shows_the_words_and_hides_the_context_it_carries() -> None:
+    """The agent reads the conversation the chat opened on; the page shows what the user typed."""
+    decision = classify_user_message(f"{_SEED_BLOCK}\n1")
     assert decision is not None
-    assert decision.display is DisplayKind.CHIP
-    assert decision.display_label == "Background task"
+    assert decision.display is DisplayKind.PROMPT_WITH_CONTEXT
+    assert decision.display_body == "1"
 
 
-def test_task_notification_behind_a_system_preamble_is_a_chip() -> None:
+def test_a_seeded_chats_first_send_keeps_the_attachment_block_its_bubble_renders() -> None:
+    """The block the composer appends renders in the bubble (an inline image, a file link),
+    so stripping the context block in front of the message must not take it off the end."""
+    decision = classify_user_message(f"{_SEED_BLOCK}\nhere you go\n\nSee attachment here: ![a](/uploads/1/a.png)")
+    assert decision is not None
+    assert decision.display is DisplayKind.PROMPT_WITH_CONTEXT
+    assert decision.display_body == "here you go\n\nSee attachment here: ![a](/uploads/1/a.png)"
+
+
+def test_a_context_block_with_nothing_after_it_is_left_to_render_whole() -> None:
+    """Never a bubble with nothing in it: the block is only ever a prefix to the user's words,
+    so one standing alone is not this app's message and is shown as it arrived."""
+    assert classify_user_message(_SEED_BLOCK) is None
+    assert classify_user_message(f"{_SEED_BLOCK}\n   ") is None
+
+
+def test_a_first_send_that_is_only_an_attachment_still_shows_the_attachment() -> None:
+    """The user's words can be whitespace and the message still theirs: the attachment block is
+    stripped before the detectors run, so judging "nothing after the block" on what they see
+    would leave the whole machine block rendering as the user's bubble."""
+    attachment = "See attachment here: ![a](/uploads/1/a.png)"
+    decision = classify_user_message(f"{_SEED_BLOCK}\n  \n\n{attachment}")
+    assert decision is not None
+    assert decision.display is DisplayKind.PROMPT_WITH_CONTEXT
+    assert decision.display_body is not None and decision.display_body.endswith(attachment)
+    assert SEED_CONTEXT_TAG not in decision.display_body
+
+
+def test_bare_task_notification_is_a_notice_carrying_its_summary() -> None:
+    decision = classify_user_message(
+        "<task-notification>\n<status>completed</status>\n"
+        '<summary>Agent "Crispy comments" finished</summary>\n</task-notification>'
+    )
+    assert decision is not None
+    assert decision.display is DisplayKind.NOTICE
+    assert decision.display_label == "Background task completed"
+    assert decision.display_body == 'Agent "Crispy comments" finished'
+
+
+def test_task_notification_behind_a_system_preamble_is_a_notice() -> None:
     decision = classify_user_message(
         "[SYSTEM NOTIFICATION - NOT USER INPUT]\nblah\n<task-notification>x</task-notification>"
     )
     assert decision is not None
-    assert decision.display is DisplayKind.CHIP
-    assert decision.display_label == "Background task"
+    assert decision.display is DisplayKind.NOTICE
+    assert decision.display_label == "Background task completed"
+
+
+def test_a_task_notification_summary_drops_a_zero_exit_code_and_keeps_any_other() -> None:
+    """Every ordinary completion carries "(exit code 0)", so it says nothing "completed" has
+    not; a non-zero one is the whole news."""
+    zero = classify_user_message(
+        '<task-notification>\n<summary>Background command "build" completed (exit code 0)</summary>\n'
+        "</task-notification>"
+    )
+    assert zero is not None
+    assert zero.display_body == 'Background command "build" completed'
+
+    failed = classify_user_message(
+        '<task-notification>\n<summary>Background command "build" completed (exit code 2)</summary>\n'
+        "</task-notification>"
+    )
+    assert failed is not None
+    assert failed.display_body == 'Background command "build" completed (exit code 2)'
+
+
+def test_a_task_notification_with_no_summary_shows_what_it_does_carry() -> None:
+    decision = classify_user_message("<task-notification>\n<status>completed</status>\n</task-notification>")
+    assert decision is not None
+    assert decision.display_body == "<task-notification>\n<status>completed</status>\n</task-notification>"
 
 
 def test_skill_expansion_lifts_the_skill_name_as_the_label() -> None:
@@ -167,17 +248,18 @@ def test_any_local_command_output_is_hidden_not_just_the_model_bars() -> None:
 def test_bash_blocks_become_chips_rather_than_bubbles() -> None:
     # Bash mode is NOT flagged isMeta, so without a detector these render as a user
     # bubble full of raw XML. They stay visible -- the user asked for that output -- but
-    # as a chip, whose body renders in a <pre><code> so it reads as terminal output.
+    # as a chip, whose body renders in a <pre><code> so it reads as terminal output. The
+    # person ran it, so it is their chip, not one in the agent's turn.
     command = classify_user_message("<bash-input>ls -la</bash-input>")
     assert command is not None
-    assert command.display is DisplayKind.CHIP
+    assert command.display is DisplayKind.PERSON_CHIP
     assert command.display_label == "Bash"
     assert command.display_body == "ls -la"
 
     # stdout and stderr arrive together in ONE message, the stderr half usually empty.
     output = classify_user_message("<bash-stdout>test</bash-stdout><bash-stderr></bash-stderr>")
     assert output is not None
-    assert output.display is DisplayKind.CHIP
+    assert output.display is DisplayKind.PERSON_CHIP
     assert output.display_label == "Output"
     assert output.display_body == "test"
 
@@ -189,7 +271,7 @@ def test_bash_blocks_become_chips_rather_than_bubbles() -> None:
     # An empty result still chips rather than falling through to a raw-XML bubble.
     empty = classify_user_message("<bash-stdout></bash-stdout><bash-stderr></bash-stderr>")
     assert empty is not None
-    assert empty.display is DisplayKind.CHIP
+    assert empty.display is DisplayKind.PERSON_CHIP
     assert empty.display_body == ""
 
 
@@ -255,23 +337,272 @@ def test_is_non_turn_tail_matches_model_bar_traffic_and_is_meta() -> None:
 
 def test_permission_resolution_reads_the_machine_tag_first() -> None:
     """The tagged form needs no phrasing recognition -- any prose works."""
-    display = classify_user_message("Whatever minds chose to say. (resolution: denied, request_id: evt-9)")
+    display = classify_user_message("Whatever Imbue Studio chose to say. (resolution: denied, request_id: evt-9)")
     assert display is not None
     assert display.display == DisplayKind.PERMISSION_RESOLUTION
     assert display.resolution == "denied"
     assert display.request_id == "evt-9"
 
 
-def test_the_messaging_scripts_system_tag_is_the_one_this_classifier_strips() -> None:
-    """``system/scripts/message_chat.py --system`` wraps a nudge in the tag this module recognises; the script
+def test_the_messaging_scripts_browser_fleet_tag_is_the_one_this_classifier_strips() -> None:
+    """``system/scripts/message_chat.py --browser-fleet`` wraps a nudge in the tag this module recognises; the script
     is standard-library only and cannot import this package, so its copy of the tag is pinned here."""
-    script = Path(__file__).resolve().parents[5] / "scripts" / "message_chat.py"
-    spec = importlib.util.spec_from_file_location("message_chat_for_tag_pin", script)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    assert module.SYSTEM_MESSAGE_TAG == BROWSER_FLEET_TAG
-    decision = classify_user_message(module.wrap_system_message("Browser b1 was handed back to you."))
+    assert message_chat.BROWSER_FLEET_TAG == BROWSER_FLEET_TAG
+    decision = classify_user_message(message_chat.wrap_browser_fleet_nudge("Browser b1 was handed back to you."))
     assert decision is not None
     assert decision.display is DisplayKind.CHIP
+
+
+def test_a_background_task_report_is_a_notice_showing_only_its_summary() -> None:
+    """``system/scripts/workspace_bare_scripts/run_in_background.py`` is standard-library only and cannot import this package,
+    so its copy of the tag is pinned here by classifying a report it composed."""
+    report = run_in_background.compose_report(
+        description="Wait for the background agent",
+        command=["uv", "run", "create_worker.py", "await", "--name", "fix-login"],
+        returncode=0,
+        output="---\ntype: status\nname: done\n---\nThe login flow is rebuilt.\n",
+        output_path=Path("data/.tasks/run-in-background/x/output.log"),
+    )
+
+    assert run_in_background.BACKGROUND_TASK_REPORT_TAG == BACKGROUND_TASK_REPORT_TAG
+    decision = classify_user_message(report)
+    assert decision is not None
+    assert decision.display is DisplayKind.NOTICE
+    assert decision.display_label == "Background task"
+    assert decision.display_body == "Wait for the background agent (finished)"
+    assert is_non_turn_tail(report) is False
+
+
+@pytest.mark.parametrize(
+    ("landed_ref", "label", "summary"),
+    [
+        (
+            "minds-v0.9.0",
+            "Workspace updated",
+            "This chat was paused while the workspace updated to v0.9.0, and is carrying on now.",
+        ),
+        (
+            None,
+            "Workspace update not applied",
+            "This chat was paused for a workspace update that did not go through, and is carrying on now.",
+        ),
+    ],
+)
+def test_a_resumed_chats_workspace_update_note_is_a_notice_showing_only_its_summary(
+    landed_ref: str | None, label: str, summary: str
+) -> None:
+    """``run-status resume-chats`` sends a paused chat a note composed by the update-self skill, which is
+    standard-library only and cannot import this package, so its copy of the tag is pinned here by classifying
+    a note it composed."""
+    note = update_resume_note.compose_resume_note(
+        landed_ref=landed_ref,
+        is_chat_paused=True,
+        wip_commit="0123abc",
+        interrupted_tasks=["Run the test suite"],
+        restarted_workers=["fix-login"],
+    )
+
+    assert update_resume_note.WORKSPACE_UPDATE_NOTE_TAG == WORKSPACE_UPDATE_NOTE_TAG
+    assert (update_resume_note.OUTCOME_LANDED, update_resume_note.OUTCOME_NOT_LANDED) == (
+        WORKSPACE_UPDATE_OUTCOME_LANDED,
+        WORKSPACE_UPDATE_OUTCOME_NOT_LANDED,
+    )
+    decision = classify_user_message(note)
+    assert decision is not None
+    assert decision.display is DisplayKind.NOTICE
+    assert decision.display_label == label
+    assert decision.display_body == summary
+    assert is_non_turn_tail(note) is False
+
+
+def test_text_that_merely_quotes_the_workspace_update_note_is_a_human_turn() -> None:
+    quoting = f'why did the <{WORKSPACE_UPDATE_NOTE_TAG} outcome="landed"><summary>x</summary> note show up?'
+    assert classify_user_message(quoting) is None
+
+
+def _compose_report(description: str, command: Sequence[str] = ("make",), output: str = "built\n") -> str:
+    """A report composed by the real ``run_in_background.py``, for a command that finished."""
+    return run_in_background.compose_report(
+        description=description,
+        command=command,
+        returncode=0,
+        output=output,
+        output_path=Path("data/.tasks/run-in-background/x/output.log"),
+    )
+
+
+def test_text_that_merely_mentions_the_background_task_tag_is_a_human_turn() -> None:
+    assert classify_user_message(f"why did the <{BACKGROUND_TASK_REPORT_TAG}> message show up twice?") is None
+
+
+def test_a_stopped_queue_keeps_the_users_text_and_gives_up_its_reports() -> None:
+    """Reports composed by the real script, joined with the user's queued text the way a Stop hands a queue back."""
+    reports = [_compose_report(description, output="<output> of its own\n") for description in ("Build", "Test")]
+    block = "\n".join(["fix the header too", reports[0], "and the footer", reports[1]])
+
+    assert split_background_task_reports(block) == ("fix the header too\nand the footer", tuple(reports))
+    assert split_background_task_reports(reports[0]) == ("", (reports[0],))
+    assert split_background_task_reports("only my words") == ("only my words", ())
+
+
+def test_a_stopped_queue_splits_only_whole_line_reports() -> None:
+    """A report's output is the command's raw text, so a search over this code can print the closing
+    tag mid-line; only a tag on a line of its own ends the report. A report the user quotes mid-line
+    is the user's text."""
+    tag = BACKGROUND_TASK_REPORT_TAG
+    report = _compose_report(
+        "Search the chat app",
+        command=["rg", tag],
+        output=f'QueuedMessageView.test.ts:106:  "<{tag}>\\n<summary>Wait</summary>\\n</{tag}>";\n',
+    )
+    quoting = f"why is <{tag}><summary>Build</summary>it failed</{tag}> shown twice?"
+
+    assert split_background_task_reports("\n".join([quoting, report])) == (quoting, (report,))
+
+
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+@pytest.mark.parametrize("words_between_reports", [False, True])
+def test_a_report_flushed_into_the_users_turn_shows_only_the_users_words(
+    separator: str, words_between_reports: bool
+) -> None:
+    """codex's tap resend, pi's flush, and antigravity's queue each send the queue as one message."""
+    build, test = _compose_report("Build"), _compose_report("Test")
+    pieces = (
+        [build, "fix the header too", test]
+        if words_between_reports
+        else ["fix the header too", build, "and the footer"]
+    )
+    words = "fix the header too" if words_between_reports else "fix the header too\nand the footer"
+
+    decision = classify_user_message(separator.join(pieces))
+
+    assert decision is not None
+    assert decision.display is DisplayKind.PROMPT_WITH_CONTEXT
+    assert decision.display_body == words
+
+
+@pytest.mark.parametrize("separator", ["\n", "\n\n"])
+def test_reports_flushed_together_show_one_notice_naming_each(separator: str) -> None:
+    decision = classify_user_message(separator.join([_compose_report("Build"), _compose_report("Test")]))
+
+    assert decision is not None
+    assert decision.display is DisplayKind.NOTICE
+    assert decision.display_body == "Build (finished); Test (finished)"
+
+
+def test_secret_resolution_notices_classify_by_their_own_tag_and_carry_the_verdict_and_id() -> None:
+    request_id = "secret-0123456789abcdef0123456789abcdef"
+    env_path = "data/.secrets/svc.env"
+    stored = format_secret_resolution_notice(SecretResolutionVerdict.STORED, request_id, env_path, ("A", "B"), None)
+    declined = format_secret_resolution_notice(
+        SecretResolutionVerdict.DECLINED, request_id, env_path, ("A",), "not now"
+    )
+    superseded = format_secret_resolution_notice(
+        SecretResolutionVerdict.SUPERSEDED, request_id, env_path, ("A",), None
+    )
+    for notice, verdict in (
+        (stored, SecretResolutionVerdict.STORED),
+        (declined, SecretResolutionVerdict.DECLINED),
+        (superseded, SecretResolutionVerdict.SUPERSEDED),
+    ):
+        decision = classify_user_message(notice)
+        assert decision is not None, notice
+        assert decision.display is DisplayKind.SECRET_RESOLUTION
+        assert decision.resolution == verdict
+        assert decision.request_id == request_id
+    # The notice names the file and the variables and ends with the note; the latchkey
+    # detector does not claim it.
+    assert stored.startswith("Secret stored: data/.secrets/svc.env (A, B)")
+    assert declined.endswith("not now")
+    latchkey = classify_user_message("Your request was granted (resolution: granted, request_id: r1)")
+    assert latchkey is not None and latchkey.display is DisplayKind.PERMISSION_RESOLUTION
+
+
+def test_a_human_message_mentioning_a_secret_file_is_not_a_resolution() -> None:
+    assert classify_user_message("please put it in data/.secrets/svc.env (secret: stored)") is None
+
+
+@pytest.mark.parametrize(
+    "printed_tag",
+    ["(secret: stored, request_id: secret-x)", "(resolution: granted, request_id: r1)"],
+    ids=["secret", "permission"],
+)
+def test_a_resolution_tag_in_a_flushed_reports_output_does_not_claim_the_users_turn(printed_tag: str) -> None:
+    """A report's body is the command's raw output, which can print either tag (a test run of this code)."""
+    report = _compose_report("Run the tests", output=f"E   assert {printed_tag!r} == ...\n")
+
+    decision = classify_user_message("\n".join(["fix the header too", report]))
+
+    assert decision is not None
+    assert decision.display is DisplayKind.PROMPT_WITH_CONTEXT
+    assert decision.display_body == "fix the header too"
+
+
+def _flush_with_reports(notice: str, is_between_reports: bool) -> str:
+    """``notice`` flushed into one message with reports: ahead of one, or between two (where the report detector's
+    anchored match spans the whole message)."""
+    if is_between_reports:
+        return "\n".join([_compose_report("Build"), notice, _compose_report("Test")])
+    return "\n".join([notice, _compose_report("Build")])
+
+
+_NOTICE_PLACEMENTS = pytest.mark.parametrize("is_between_reports", [False, True], ids=["before", "between"])
+
+
+@_NOTICE_PLACEMENTS
+def test_a_secret_notice_flushed_with_reports_carries_the_notice_without_them(is_between_reports: bool) -> None:
+    notice = format_secret_resolution_notice(
+        SecretResolutionVerdict.DECLINED, "secret-1", "data/.secrets/svc.env", ("A",), "not now"
+    )
+
+    decision = classify_user_message(_flush_with_reports(notice, is_between_reports))
+
+    assert decision is not None
+    assert decision.display is DisplayKind.SECRET_RESOLUTION
+    assert decision.resolution == SecretResolutionVerdict.DECLINED
+    assert decision.request_id == "secret-1"
+    assert decision.display_body == notice
+
+
+@_NOTICE_PLACEMENTS
+def test_a_permission_notice_flushed_with_reports_still_resolves_its_card(is_between_reports: bool) -> None:
+    notice = "Your request was denied (resolution: denied, request_id: r1)"
+
+    decision = classify_user_message(_flush_with_reports(notice, is_between_reports))
+
+    assert decision is not None
+    assert decision.display is DisplayKind.PERMISSION_RESOLUTION
+    assert decision.resolution == "denied"
+    assert decision.request_id == "r1"
+
+
+def test_an_author_prefix_names_the_author_and_the_page_is_handed_the_words_behind_it() -> None:
+    event: dict[str, Any] = {}
+    stamp_user_message_display(event, "[from: Bob] please rebase onto main")
+    assert event["author_name"] == "Bob"
+    assert event["display"] == DisplayKind.PROMPT_WITH_CONTEXT.value
+    assert event["display_body"] == "please rebase onto main"
+    assert "non_turn_tail" not in event
+
+
+def test_an_author_prefix_on_a_merged_turn_strips_the_prefixed_line_alone() -> None:
+    event: dict[str, Any] = {}
+    stamp_user_message_display(event, "first\n[from: Bob] second")
+    assert event["author_name"] == "Bob"
+    assert event["display_body"] == "first\nsecond"
+
+
+def test_the_detectors_run_on_the_words_behind_an_author_prefix() -> None:
+    event: dict[str, Any] = {}
+    stamp_user_message_display(event, f"[from: Bob] <{BROWSER_FLEET_TAG}>your browser is free</{BROWSER_FLEET_TAG}>")
+    assert event["author_name"] == "Bob"
+    assert event["display"] == DisplayKind.CHIP.value
+    assert event["display_body"] == "your browser is free"
+
+
+def test_a_message_without_a_prefix_is_stamped_as_before() -> None:
+    event: dict[str, Any] = {}
+    stamp_user_message_display(event, "/model opus")
+    assert "author_name" not in event
+    assert event["display"] == DisplayKind.HIDDEN.value
+    assert event["non_turn_tail"] is True

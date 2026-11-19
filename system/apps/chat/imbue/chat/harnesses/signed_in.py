@@ -20,9 +20,9 @@ from typing import Final
 
 from loguru import logger as _loguru_logger
 
-from imbue.chat.harnesses.account_scope import account_env
 from imbue.chat.harnesses.claude.auth import MANAGED_AUTH_ENV_KEYS
 from imbue.chat.harnesses.harness_type import HarnessType
+from imbue.chat.harnesses.registry import build_account_binding
 from imbue.concurrency_group.errors import ProcessError
 from imbue.concurrency_group.subprocess_utils import run_local_command_modern_version
 
@@ -50,7 +50,7 @@ _PROBES: Final[dict[HarnessType, tuple[tuple[str, ...], str | None]]] = {
     # pi's lanes are file writes, so this is not asking "did a browser flow finish" -- it is
     # asking whether pi actually ACCEPTED the file we just wrote.
     #
-    # The string matters: measured against 0.83.0 and 0.84.1, an empty dir, an unknown
+    # The string matters: measured against 0.83.0, 0.84.1 and 0.87.1, an empty dir, an unknown
     # provider id and a malformed auth.json all print "No models available. Use /login ..."
     # and exit 0. Matching anything else -- "No usable API key is configured", which pi
     # prints when asked to take a TURN, not when asked to list -- makes NO unreachable and
@@ -84,7 +84,7 @@ def is_signed_in(
     # folder would commit as signed in, become the most-recently-used, and launch every later
     # chat with no credential. The question is whether THIS FOLDER is authenticated.
     env = {k: v for k, v in os.environ.items() if k not in MANAGED_AUTH_ENV_KEYS}
-    env.update(account_env(harness, account_dir))
+    env.update(build_account_binding(harness).cli_env(account_dir))
     try:
         finished = runner(
             command=list(command),

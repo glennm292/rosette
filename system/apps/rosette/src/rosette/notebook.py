@@ -1,19 +1,13 @@
 import os
 import tempfile
 import threading
-from datetime import datetime
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from loguru import logger
-from pydantic import BaseModel
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from rosette.data_types import ClearedLog
-from rosette.data_types import ClearedRow
-from rosette.data_types import HowCleared
-from rosette.data_types import Notebook
-from rosette.data_types import Row
+from rosette.data_types import ClearedLog, ClearedRow, HowCleared, Notebook, Row
 from rosette.tutor import RosetteError
 
 
@@ -212,6 +206,16 @@ class NotebookStore:
     def load_version(self) -> tuple[int, Notebook]:
         with self._lock:
             return self._version, _read_notebook(self._notebook_path)
+
+    def load_cleared(self) -> ClearedLog:
+        """Every line ever cleared, still carrying when and how it went.
+
+        What the student wrote in an earlier sitting is almost always here
+        rather than in the notebook: the margin scissors is how a finished
+        passage is put away, so looking back over past work reads this.
+        """
+        with self._lock:
+            return _read_cleared_log(self._cleared_path)
 
     def load_changes_since(
         self, seen_version: int, timeout_seconds: float

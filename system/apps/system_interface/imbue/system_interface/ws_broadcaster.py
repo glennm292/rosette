@@ -1,13 +1,19 @@
 import json
 import queue
 import threading
+from collections.abc import Collection
 from collections.abc import Mapping
 from collections.abc import Sequence
 from typing import Any
 
 from loguru import logger as _loguru_logger
+from pydantic import Field
 from pydantic import PrivateAttr
+from workspace_layout.answers import InventoryApp
+from workspace_layout.answers import LayoutOpMessage
+from workspace_layout.records import DesktopView
 
+from imbue.imbue_common.frozen_model import FrozenModel
 from imbue.imbue_common.mutable_model import MutableModel
 
 # Per-client buffer depth. Holds at most this many state-change broadcasts before
@@ -34,6 +40,28 @@ def _drain_queue(client_queue: queue.Queue[str | None]) -> None:
             is_drained = True
 
 
+def _active_desktop_changed(client_id: str, desktop_id: str, revision: int, report_id: str | None) -> dict[str, Any]:
+    return {
+        "type": "active_desktop_changed",
+        "client_id": client_id,
+        "desktop_id": desktop_id,
+        "revision": revision,
+        "report_id": report_id,
+    }
+
+
+class ConnectionRegistration(FrozenModel):
+    """What one open WebSocket said about itself in its ``client_state`` report (desktop contracts.md section 6)."""
+
+    client_id: str = Field(description="The client the connection's window belongs to")
+    active_desktop: str = Field(
+        description="The desktop the window last reported being on; empty for a pop-out's, which never reports one"
+    )
+    is_pop_out: bool = Field(
+        description="Whether the window is a pulled-out window's own desktop window rather than a desktop's"
+    )
+
+
 class WebSocketBroadcaster(MutableModel):
     """Manages WebSocket clients and broadcasts state updates.
 
@@ -54,13 +82,12 @@ class WebSocketBroadcaster(MutableModel):
     # successful enqueue. A client is only disconnected once its counter reaches
     # ``_MAX_CONSECUTIVE_QUEUE_FULL`` -- a brief stall is tolerated.
     _consecutive_queue_full_by_id: dict[int, int] = PrivateAttr(default_factory=dict)
-    # Self-reported identity of each connected client (client_id, active view,
-    # device kind), keyed by ``id(queue)``. Populated when the client sends its
-    # ``client_state`` registration over the WebSocket; absent for clients that
-    # have not registered (yet). Entries die with the connection, so "connected
-    # client on view X" means exactly "an open, registered WebSocket whose latest
-    # report named X".
-    _client_info_by_queue_id: dict[int, dict[str, str]] = PrivateAttr(default_factory=dict)
+    # Self-reported identity of each connected window, keyed by ``id(queue)``. Populated when the window
+    # sends its ``client_state`` registration over the WebSocket; absent for windows that have not registered
+    # (yet). Entries die with the connection, so "connected client on desktop X" means exactly "an open,
+    # registered WebSocket whose latest report named X". A pop-out's registration names its client (so ops
+    # targeting the client reach it) and no desktop.
+    _client_info_by_queue_id: dict[int, ConnectionRegistration] = PrivateAttr(default_factory=dict)
 
     def register(self) -> queue.Queue[str | None]:
         """Register a new WebSocket client. Returns a queue to drain for messages."""
@@ -80,42 +107,48 @@ class WebSocketBroadcaster(MutableModel):
             except ValueError:
                 pass
 
-    def set_client_info(
-        self,
-        client_queue: queue.Queue[str | None],
-        client_id: str,
-        active_view: str,
-        device_kind: str,
-    ) -> None:
-        """Record (or update) the self-reported identity of one connected client."""
+    def set_client_info(self, client_queue: queue.Queue[str | None], client_id: str, active_desktop: str) -> None:
+        """Record (or update) the self-reported identity of one connected desktop window: its client and the
+        desktop it is on."""
+        self._register(
+            client_queue, ConnectionRegistration(client_id=client_id, active_desktop=active_desktop, is_pop_out=False)
+        )
+
+    def set_pop_out_info(self, client_queue: queue.Queue[str | None], client_id: str) -> None:
+        """Record one connected pop-out window under its client: ops targeting the client reach it, and it counts
+        toward the client being connected, but it names no desktop."""
+        self._register(client_queue, ConnectionRegistration(client_id=client_id, active_desktop="", is_pop_out=True))
+
+    def _register(self, client_queue: queue.Queue[str | None], registration: ConnectionRegistration) -> None:
         with self._lock:
             if client_queue not in self._client_queues:
                 return
-            self._client_info_by_queue_id[id(client_queue)] = {
-                "client_id": client_id,
-                "active_view": active_view,
-                "device_kind": device_kind,
-            }
+            self._client_info_by_queue_id[id(client_queue)] = registration
 
-    def get_connected_client_infos(self) -> list[dict[str, str]]:
-        """A snapshot of every registered client's self-reported identity."""
+    def get_connected_client_infos(self) -> list[ConnectionRegistration]:
+        """A snapshot of every registered window's self-reported identity."""
         with self._lock:
-            return [dict(info) for info in self._client_info_by_queue_id.values()]
+            return list(self._client_info_by_queue_id.values())
 
-    def get_client_info(self, client_queue: queue.Queue[str | None]) -> dict[str, str] | None:
-        """The self-reported identity of one connected client, or None if unregistered."""
+    def get_client_info(self, client_queue: queue.Queue[str | None]) -> ConnectionRegistration | None:
+        """The self-reported identity of one connected window, or None if unregistered."""
         with self._lock:
-            info = self._client_info_by_queue_id.get(id(client_queue))
-            return dict(info) if info is not None else None
+            return self._client_info_by_queue_id.get(id(client_queue))
 
     def connected_client_ids(self) -> set[str]:
-        """The ids of every registered client with at least one open window."""
+        """The ids of every registered client with at least one open window, a pop-out included."""
         with self._lock:
-            return {info["client_id"] for info in self._client_info_by_queue_id.values()}
+            return {info.client_id for info in self._client_info_by_queue_id.values()}
+
+    def desktop_connected_client_ids(self) -> set[str]:
+        """The ids of every registered client with a desktop window open: a client whose only open windows are
+        pop-outs is connected, but has nowhere to show a desktop window."""
+        with self._lock:
+            return {info.client_id for info in self._client_info_by_queue_id.values() if not info.is_pop_out}
 
     def broadcast(self, message: dict[str, Any]) -> None:
         """Serialize and send a message to all connected clients. Thread-safe."""
-        self._broadcast_to_matching(message, target_client_id=None)
+        self._broadcast_to_matching(message, target_client_id=None, excluded_client_ids=())
 
     def broadcast_to_client(self, message: dict[str, Any], client_id: str) -> None:
         """Send a message only to the windows of one client (every registered connection carrying its id).
@@ -123,35 +156,50 @@ class WebSocketBroadcaster(MutableModel):
         Connections that have not (yet) sent their ``client_state`` registration never match:
         without a report there is no client id to compare against.
         """
-        self._broadcast_to_matching(message, target_client_id=client_id)
+        self._broadcast_to_matching(message, target_client_id=client_id, excluded_client_ids=())
 
-    def _broadcast_to_matching(self, message: dict[str, Any], target_client_id: str | None) -> None:
+    def broadcast_except_clients(self, message: dict[str, Any], excluded_client_ids: Collection[str]) -> None:
+        """Send a message to every window but those of ``excluded_client_ids``; a connection that has not registered
+        yet carries no client id, so it is sent to."""
+        self._broadcast_to_matching(message, target_client_id=None, excluded_client_ids=excluded_client_ids)
+
+    def _broadcast_to_matching(
+        self, message: dict[str, Any], target_client_id: str | None, excluded_client_ids: Collection[str]
+    ) -> None:
         text = json.dumps(message)
         with self._lock:
-            dead_queues: list[queue.Queue[str | None]] = []
+            matching: list[queue.Queue[str | None]] = []
             for client_queue in self._client_queues:
-                if target_client_id is not None:
-                    info = self._client_info_by_queue_id.get(id(client_queue))
-                    if info is None or info["client_id"] != target_client_id:
-                        continue
-                try:
-                    client_queue.put_nowait(text)
-                    self._consecutive_queue_full_by_id[id(client_queue)] = 0
-                except queue.Full:
-                    new_count = self._consecutive_queue_full_by_id.get(id(client_queue), 0) + 1
-                    self._consecutive_queue_full_by_id[id(client_queue)] = new_count
-                    if new_count >= _MAX_CONSECUTIVE_QUEUE_FULL:
-                        dead_queues.append(client_queue)
-            for dead_queue in dead_queues:
-                self._disconnect_locked(dead_queue)
+                info = self._client_info_by_queue_id.get(id(client_queue))
+                if target_client_id is not None and (info is None or info.client_id != target_client_id):
+                    continue
+                if info is not None and info.client_id in excluded_client_ids:
+                    continue
+                matching.append(client_queue)
+            self._put_locked(text, matching)
+
+    def _put_locked(self, text: str, client_queues: Sequence[queue.Queue[str | None]]) -> None:
+        """Put ``text`` on each of ``client_queues``, evicting a client whose queue has stayed full too long. Caller
+        must hold ``self._lock``."""
+        dead_queues: list[queue.Queue[str | None]] = []
+        for client_queue in client_queues:
+            try:
+                client_queue.put_nowait(text)
+                self._consecutive_queue_full_by_id[id(client_queue)] = 0
+            except queue.Full:
+                new_count = self._consecutive_queue_full_by_id.get(id(client_queue), 0) + 1
+                self._consecutive_queue_full_by_id[id(client_queue)] = new_count
+                if new_count >= _MAX_CONSECUTIVE_QUEUE_FULL:
+                    dead_queues.append(client_queue)
+        for dead_queue in dead_queues:
+            self._disconnect_locked(dead_queue)
 
     def _disconnect_locked(self, dead_queue: queue.Queue[str | None]) -> None:
         """Evict ``dead_queue`` and unblock its handler thread. Caller must hold ``self._lock``.
 
         Drains the queue and pushes the shutdown sentinel so the handler thread,
         blocked on ``client_queue.get(...)``, wakes, sees ``None``, and exits its
-        loop (closing its socket). This is the thread-based replacement for the
-        old asyncio task cancellation.
+        loop (closing its socket).
         """
         self._consecutive_queue_full_by_id.pop(id(dead_queue), None)
         self._client_info_by_queue_id.pop(id(dead_queue), None)
@@ -169,66 +217,118 @@ class WebSocketBroadcaster(MutableModel):
             _MAX_CONSECUTIVE_QUEUE_FULL,
         )
 
-    def broadcast_apps_updated(self, apps: Sequence[Mapping[str, Any]]) -> None:
-        """Broadcast the whole inventory (contracts.md section 8): every app with its instances."""
-        self.broadcast({"type": "apps_updated", "apps": apps})
+    def broadcast_apps_updated(self, apps: Sequence[InventoryApp]) -> None:
+        """Broadcast every app after a registry or liveness change (desktop contracts.md section 6)."""
+        self.broadcast({"type": "apps_updated", "apps": [app.model_dump(mode="json") for app in apps]})
 
-    def broadcast_projects_updated(self, projects: Sequence[Mapping[str, Any]]) -> None:
-        """Broadcast every project after a project write (contracts.md section 8)."""
-        self.broadcast({"type": "projects_updated", "projects": projects})
-
-    def broadcast_tab_rebound(self, client_id: str, view_id: str, tab_id: str, address: str) -> None:
-        """Tell the owning client that one of its tabs now shows another instance (the tab route)."""
+    def broadcast_desktops_updated(self, desktops: Sequence[DesktopView]) -> None:
+        """Broadcast every desktop after a write of ``desktops.json`` (desktop contracts.md section 6)."""
         self.broadcast(
-            {
-                "type": "tab_rebound",
-                "client_id": client_id,
-                "view_id": view_id,
-                "tab_id": tab_id,
-                "address": address,
-            }
+            {"type": "desktops_updated", "desktops": [desktop.model_dump(mode="json") for desktop in desktops]}
         )
 
-    def broadcast_layout_updated(self, view_id: str, client_id: str, save_id: str) -> None:
-        """A client layout was written (a browser's save or the shell's own edit); the owning windows refetch it."""
+    def broadcast_themes_changed(self, catalog: Mapping[str, Any]) -> None:
+        """The theme catalog or the workspace's default theme changed (workspace-themes plan section 5.2); every
+        window takes the catalog, and the pages it frames wear the new revision."""
+        self.broadcast({"type": "themes_changed", "catalog": dict(catalog)})
+
+    def broadcast_keybindings_changed(self) -> None:
+        """Somebody changed a keybinding (a save here, or the snapshot rewritten from outside); every
+        window and the pages it frames re-fetch their resolved chords from their own backends."""
+        self.broadcast({"type": "keybindings_changed"})
+
+    def broadcast_presence_updated(self, users: Sequence[Mapping[str, Any]]) -> None:
+        """Broadcast the connected users whenever someone joins or leaves (one entry per user)."""
+        self.broadcast({"type": "presence_updated", "users": users})
+
+    def broadcast_roster_updated(self, roster: Mapping[str, Any]) -> None:
+        """Broadcast the whole roster (the multiplayer spec, section 4.2) whenever presence or a grants file changed."""
+        self.broadcast({"type": "roster_updated", **roster})
+
+    def broadcast_bubble(self, bubble: Mapping[str, Any], excluded_client_ids: Collection[str]) -> None:
+        """Broadcast a speech bubble (the multiplayer spec, section 6.5) to every window but the speaker's own."""
+        self.broadcast_except_clients({"type": "bubble", **bubble}, excluded_client_ids)
+
+    def broadcast_clients_updated(self) -> None:
+        """Broadcast that the clients listing changed in a way no other message carries: a client's window
+        disconnected, or a client was pruned (the multiplayer spec, section 8.3). The listing itself is read back
+        from ``GET /api/clients``, so the message carries nothing."""
+        self.broadcast({"type": "clients_updated"})
+
+    def broadcast_chats_activity(self, report: Mapping[str, Any]) -> None:
+        """Broadcast what every chat is doing (the multiplayer spec, section 6.4), as the chat app last reported it."""
+        self.broadcast({"type": "chats_activity", **report})
+
+    def broadcast_placements_updated(self, desktop_id: str, client_id: str, save_id: str) -> None:
+        """A client's layout of a desktop was written (a browser's save or the shell's own edit); the owning windows refetch."""
         self.broadcast(
             {
-                "type": "layout_updated",
-                "view_id": view_id,
+                "type": "placements_updated",
+                "desktop_id": desktop_id,
                 "client_id": client_id,
                 "save_id": save_id,
             }
         )
 
-    def broadcast_active_view_changed(self, client_id: str, view_id: str) -> None:
-        """A client's stored active view moved; its other windows switch to it."""
-        self.broadcast({"type": "active_view_changed", "client_id": client_id, "view_id": view_id})
+    def broadcast_avatar_status(self, status: Mapping[str, Any]) -> None:
+        """The avatar's mood or staleness changed (pinned-taskbar-entries plan section 4.6); every window redraws it."""
+        self.broadcast({"type": "avatar_status", **status})
 
-    def broadcast_layout_op(
-        self,
-        op: str,
-        args: dict[str, Any],
-        requester: str = "",
-        target_client_id: str | None = None,
+    def broadcast_avatar_selection_changed(self, design: str) -> None:
+        """The workspace's avatar design was written; every window draws it."""
+        self.broadcast({"type": "avatar_selection_changed", "design": design})
+
+    def broadcast_client_entries_changed(self, client_id: str, entries: Mapping[str, Any]) -> None:
+        """A client's presentation of its pinned entries was written; its own windows take it."""
+        self.broadcast_to_client(
+            {"type": "client_entries_changed", "client_id": client_id, "entries": entries}, client_id
+        )
+
+    def broadcast_active_desktop_changed(
+        self, client_id: str, desktop_id: str, revision: int, report_id: str | None
     ) -> None:
-        """Send a transient ``layout_op`` (maximize, restore, refresh, the interface reload) to the browser.
+        """A client's stored active desktop moved to ``desktop_id`` at ``revision``; its windows follow it unless they
+        have heard a later revision. ``report_id`` names the window report that moved it (None for any other cause),
+        so the reporting window can tell its own echo."""
+        self.broadcast(_active_desktop_changed(client_id, desktop_id, revision, report_id))
 
-        ``requester`` is the address of the instance that invoked ``system/scripts/layout.py``
-        (its own instance); the frontend resolves the ``self`` address with it.
-        ``target_client_id`` names the client whose windows apply the op; None reaches every
-        window (``refresh`` of a whole app, ``reload_system_interface``).
+    def send_active_desktop_changed_to(
+        self, client_queue: queue.Queue[str | None], client_id: str, desktop_id: str, revision: int
+    ) -> None:
+        """Tell one connection, unless it has since gone, that its client's stored desktop is ``desktop_id`` at
+        ``revision``: the answer to a report a later move superseded, since that move may have been announced before
+        the connection was there to hear it."""
+        text = json.dumps(_active_desktop_changed(client_id, desktop_id, revision, None))
+        with self._lock:
+            if client_queue in self._client_queues:
+                self._put_locked(text, [client_queue])
+
+    def broadcast_update_notice_changed(self, notice: Mapping[str, Any] | None) -> None:
+        """The kept rollback point changed (raised, progressing, settled, or cleared); every window re-renders its notice."""
+        self.broadcast({"type": "update_notice_changed", "notice": dict(notice) if notice is not None else None})
+
+    def broadcast_resource_gauge_changed(self, view: Mapping[str, Any]) -> None:
+        """The tray's resource gauge changed what it shows (a reading moved, a warning was raised or cleared, the
+        settings were saved); also sent once a minute unchanged, so a window can tell the gauge is still updated."""
+        self.broadcast({"type": "resource_gauge_changed", "view": dict(view)})
+
+    def broadcast_layout_op(self, message: LayoutOpMessage) -> None:
+        """Send a transient ``layout_op`` to the browser (desktop contracts.md section 8): ``refresh`` and the
+        interface reload, which are the whole effect of their ops, and the ``show``, ``open`` (unless minimized),
+        and ``focus`` of a targeted op, which name the window the op put in front of the client after its edit was
+        written, for the phone layout to switch to; a ``show`` also says whether the window is pulled out, since only
+        the client's pages (the desktop's, and that window's own solo page) can bring a pulled-out window's own
+        desktop window forward, and a ``focus``, or an ``open`` that finds the window, on a window popped out travels
+        as such a ``show``.
+
+        The message reaches the windows of its ``target_client_id``, or every window when it names none (``refresh``
+        of a whole app, ``reload_system_interface``). Its ``args`` carry only what the op is about.
         """
-        message = {
-            "type": "layout_op",
-            "op": op,
-            "args": args,
-            "requester": requester,
-            "target_client_id": target_client_id,
-        }
-        if target_client_id is None:
-            self.broadcast(message)
+        wire = {**message.model_dump(mode="json"), "args": message.args.model_dump(mode="json", exclude_none=True)}
+        if message.target_client_id is None:
+            self.broadcast(wire)
         else:
-            self.broadcast_to_client(message, target_client_id)
+            self.broadcast_to_client(wire, str(message.target_client_id))
 
     def shutdown(self) -> None:
         """Signal all clients to disconnect by sending None sentinel."""

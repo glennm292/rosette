@@ -1,17 +1,62 @@
 /**
- * Record factories for the frontend tests: an app as the inventory lists it, one of its
- * instances, a project, and a published template as the catalog lists it. Each takes
- * overrides so a test spells only what it is about.
+ * Record factories for the frontend tests: an app as the shell lists it (and one shaped like the
+ * chat's manifest), a desktop, a shortcut, a window, a placement, a launch path, a client record, a layout,
+ * the avatar state, the theme metrics, a connected user, and the update notice as the shell sends it.
+ * Each takes overrides so a test spells only what it is about.
  */
 
-import type { AppRecord, InstanceRecord, ProjectInfo } from "../models/Inventory";
-import type { CatalogTemplate } from "../models/TemplateCatalog";
+import type {
+  AppRecord,
+  ClientRecord,
+  Desktop,
+  DesktopShortcut,
+  GridCell,
+  LaunchPath,
+  Layout,
+  Placement,
+  PresentUser,
+  RosterParticipant,
+  UpdateNoticeWire,
+  WindowRecord,
+} from "../model/records";
+import { cascadeFrame } from "../geometry/frames";
+import type { ThemeMetrics } from "../theme/metrics";
+import type { AvatarState } from "../reducers/desktopState";
+import { STANDARD_CHROME, type ThemeCatalog, type ThemeRecord } from "../model/themes";
 
 function capitalized(name: string): string {
   return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
-/** A running, non-critical app with instances, one ``new`` action, and no instances listed yet. */
+/** An app ranked first whose free-text rows are GET launch paths, each at ``/<id>`` taking the typed text as
+ *  ``message``: what the page-path bound applies to, unlike the chat-like app's POST rows. */
+export function getMethodFreeTextAppRecord(name: string, launchIds: readonly string[]): AppRecord {
+  return appRecord(name, {
+    launcher_rank: 1,
+    launch_paths: launchIds.map((id) =>
+      launchPathRecord({ id, path: `/${id}`, params: ["message"], text_param: "message" }),
+    ),
+  });
+}
+
+/** A GET launch path ``new`` at ``/new`` with no params and no presets. */
+export function launchPathRecord(overrides: Partial<LaunchPath> = {}): LaunchPath {
+  return {
+    id: "new",
+    label: "New",
+    path: "/new",
+    method: "GET",
+    params: [],
+    presets: {},
+    text_param: null,
+    draft_param: null,
+    mention_param: null,
+    app_params: null,
+    ...overrides,
+  };
+}
+
+/** A running, non-critical, supervised app with one ``new`` launch path at ``/new``. */
 export function appRecord(name: string, overrides: Partial<AppRecord> = {}): AppRecord {
   return {
     name,
@@ -22,63 +67,268 @@ export function appRecord(name: string, overrides: Partial<AppRecord> = {}): App
     internal: false,
     program: name,
     critical: false,
-    instances_url: "",
-    has_instances: true,
-    actions: [{ id: "new", label: `New ${name}`, params: [] }],
-    default_shortcut: null,
+    stop_when_no_windows: false,
+    uses_microphone: false,
+    launch_paths: [launchPathRecord({ label: `New ${name}` })],
+    default_shortcuts: [{ launch: "new", mode: "focus" }],
     launcher_rank: null,
+    pin: null,
+    message_handlers: [],
     is_running: true,
-    is_listed: true,
-    instances: [],
+    share_url: null,
+    theming: null,
     ...overrides,
   };
 }
 
-/** An idle, renameable, referenced instance at the app's root. */
-export function instanceRecord(overrides: Partial<InstanceRecord> = {}): InstanceRecord {
+/** An app shaped like the chat's manifest: ranked, an independent avatar pin at ``/``, a GET ``root`` launch path at
+ *  the pin's path, POST ``new`` and ``send`` launch paths at its intake route taking ``message`` as typed text, and
+ *  a POST ``draft`` launch path there taking ``message`` as drafted text. */
+export function chatLikeAppRecord(name: string, overrides: Partial<AppRecord> = {}): AppRecord {
+  const displayName = capitalized(name);
+  return appRecord(name, {
+    launcher_rank: 10,
+    pin: { path: "/", style: "avatar", scope: "independent", default_mode: "floating" },
+    launch_paths: [
+      launchPathRecord({ id: "root", label: displayName, path: "/" }),
+      launchPathRecord({
+        id: "new",
+        label: `New ${displayName}`,
+        path: "/api/chats/intake",
+        method: "POST",
+        params: ["message"],
+        presets: { target: "new_chat" },
+        text_param: "message",
+      }),
+      launchPathRecord({
+        id: "send",
+        label: `Send to ${name}...`,
+        path: "/api/chats/intake",
+        method: "POST",
+        params: ["message"],
+        presets: { target: "chat_selector" },
+        text_param: "message",
+      }),
+      launchPathRecord({
+        id: "draft",
+        label: `Draft into ${name}`,
+        path: "/api/chats/intake",
+        method: "POST",
+        params: ["message"],
+        presets: { target: "current_chat", is_draft: "true" },
+        draft_param: "message",
+      }),
+    ],
+    ...overrides,
+  });
+}
+
+/** The ``screen`` app shaped like the Screen's manifest: its page ``screen`` at ``/`` and the POST ``browser`` at
+ *  ``/launch/browser``, each a focus default shortcut. */
+export function screenAppRecord(overrides: Partial<AppRecord> = {}): AppRecord {
+  return appRecord("screen", {
+    launch_paths: [
+      launchPathRecord({ id: "screen", label: "Screen", path: "/" }),
+      launchPathRecord({ id: "browser", label: "Browser", path: "/launch/browser", method: "POST" }),
+    ],
+    default_shortcuts: [
+      { launch: "screen", mode: "focus" },
+      { launch: "browser", mode: "focus" },
+    ],
+    ...overrides,
+  });
+}
+
+/** A window of ``app`` at ``path`` with an empty title. */
+export function windowRecord(
+  id: string,
+  app: string,
+  path: string,
+  overrides: Partial<WindowRecord> = {},
+): WindowRecord {
   return {
-    key: "terminal-1",
-    url: "/",
-    title: "Terminal 1",
-    status: "idle",
-    lifetime: "referenced",
-    last_active: null,
-    renameable: true,
-    stoppable: false,
+    id,
+    app,
+    path,
+    title: "",
+    opened_at: "2026-09-19T00:00:00Z",
+    is_pinned: false,
+    scope: "linked",
     ...overrides,
   };
 }
 
-/** An empty project named after its id. */
-export function projectRecord(id: string, overrides: Partial<ProjectInfo> = {}): ProjectInfo {
+/** The workspace owner's desktop named after its id, with no wallpaper, shortcuts, or windows. */
+export function desktopRecord(id: string, overrides: Partial<Desktop> = {}): Desktop {
   return {
     id,
     name: capitalized(id),
-    color: "#123456",
+    color: "#2f6b4f",
     glyph: 0,
-    tabs: [],
+    wallpaper: null,
+    theme: null,
     shortcuts: [],
+    windows: [],
+    owner: null,
     ...overrides,
   };
 }
 
-/** A template titled after its slug, published by "someone" from a repository named after it, with a drawing and no requirements. */
-export function catalogTemplateRecord(slug: string, overrides: Partial<CatalogTemplate> = {}): CatalogTemplate {
+/** An available theme with the standard chrome and pixel icons for `files`, unless the overrides say otherwise. */
+export function themeRecord(id: string, overrides: Partial<ThemeRecord> = {}): ThemeRecord {
   return {
-    slug,
-    title: capitalized(slug),
-    description: `What ${slug} does.`,
-    what_it_is: "",
-    author: "someone",
-    repository_url: `https://github.com/someone/${slug}`,
-    thumbnail_url: `https://example.test/${slug}.svg`,
-    version: "v1",
-    updated_at: "",
-    required_accounts: [],
-    required_secrets: [],
-    needs_ai: false,
-    apt_packages: [],
-    choices: [],
+    id,
+    name: capitalized(id),
+    description: `The ${id} theme.`,
+    base: id === "standard" ? null : "standard",
+    source: "builtin",
+    available: true,
+    problems: [],
+    revision: `rev-${id}`,
+    chrome: STANDARD_CHROME,
+    icons:
+      id === "standard"
+        ? null
+        : {
+            format: "png",
+            size: 32,
+            rendering: "pixelated",
+            background: "transparent",
+            palette: [],
+            max_colors: null,
+            derive: "none",
+            fallback_url: `/api/themes/${id}/icons/app.png?v=rev-${id}`,
+            apps: { files: `/api/themes/${id}/icons/files.png?v=rev-${id}` },
+          },
+    ...overrides,
+  };
+}
+
+/** A catalog of the standard theme and the named ones, with no workspace default. */
+export function themeCatalog(...records: ThemeRecord[]): ThemeCatalog {
+  return { default: null, themes: [themeRecord("standard"), ...records] };
+}
+
+/** A focus-mode shortcut for an app's ``new`` launch path, in the cell given. */
+export function shortcutRecord(app: string, cell: GridCell, launch = "new"): DesktopShortcut {
+  return { target: { kind: "launch", app, launch }, mode: "focus", cell };
+}
+
+/** A connected client on no desktop yet, with no entry presentations. */
+export function clientRecord(id: string, overrides: Partial<ClientRecord> = {}): ClientRecord {
+  return {
+    id,
+    active_desktop: null,
+    last_seen: "2026-09-19T00:00:00Z",
+    is_connected: true,
+    entries: {},
+    shown_history: [],
+    desktop_revision: 0,
+    participant: null,
+    shown: [],
+    viewport: null,
+    ...overrides,
+  };
+}
+
+/** The default design, idle and fresh. */
+export function avatarStateRecord(overrides: Partial<AvatarState> = {}): AvatarState {
+  return {
+    design: "gummy-seal",
+    defaultDesign: "gummy-seal",
+    status: { mood: "idle", is_stale: false },
+    ...overrides,
+  };
+}
+
+/** A layout of ``placements`` with the stamp ``updatedAt`` and no stored window paths. */
+export function layoutRecord(placements: readonly Placement[], updatedAt: string | null = null): Layout {
+  return { updated_at: updatedAt, placements, window_paths: {} };
+}
+
+/** A shown, normal placement at the first cascade frame. */
+export function placementRecord(windowId: string, overrides: Partial<Placement> = {}): Placement {
+  return {
+    window_id: windowId,
+    frame: cascadeFrame(0),
+    state: "NORMAL",
+    is_minimized: false,
+    is_detached: false,
+    ...overrides,
+  };
+}
+
+/** A non-owner with one open tab, an email at example.com, and neither a display name nor a profile picture. */
+export function presentUserRecord(userId: string, overrides: Partial<PresentUser> = {}): PresentUser {
+  return {
+    user_id: userId,
+    email: `${userId}@example.com`,
+    display_name: null,
+    profile_picture_url: null,
+    owner: false,
+    first_seen: "2026-09-19T10:00:00.000000000Z",
+    last_seen: "2026-09-19T10:00:00.000000000Z",
+    ...overrides,
+  };
+}
+
+/** An open notice (no rollback started) for an apply that touched ``apps``, one program each. */
+export function noticeWire(apps: string[], overrides: Partial<UpdateNoticeWire> = {}): UpdateNoticeWire {
+  return {
+    merge_sha: "abc1234abc1234abc1234abc1234abc1234abc12",
+    applied_at: 1_780_000_000,
+    driven_by: "mngr/update-widgets",
+    apps,
+    programs: apps,
+    needs_system_services_restart: false,
+    progress: null,
+    outcome: null,
+    ...overrides,
+  };
+}
+
+/** The theme metrics at the contract's default (non-touch) values. */
+export function themeMetricsRecord(overrides: Partial<ThemeMetrics> = {}): ThemeMetrics {
+  return {
+    titleBarHeight: 36,
+    windowRadius: 12,
+    taskbarHeight: 48,
+    cellWidth: 96,
+    cellHeight: 112,
+    gridInset: 16,
+    windowMinWidth: 320,
+    windowMinHeight: 240,
+    titleMinVisible: 120,
+    snapThreshold: 16,
+    unsnapDistance: 12,
+    dragThreshold: 4,
+    touchTarget: 32,
+    floatingEntrySize: 56,
+    floatingEntryInsetX: 16,
+    floatingEntryInsetY: 12,
+    overviewGap: 28,
+    overviewTileTitle: 28,
+    overviewThumbnailWidth: 200,
+    ...overrides,
+  };
+}
+
+/** A connected person with a name made from the key, no picture, a handle of the name, and a fixed colour. */
+export function rosterParticipantRecord(key: string, overrides: Partial<RosterParticipant> = {}): RosterParticipant {
+  const name = overrides.display_name ?? capitalized(key.split(":").pop() ?? key);
+  return {
+    key,
+    kind: "person",
+    display_name: name,
+    profile_picture_url: null,
+    email: null,
+    handle: name.replace(/\s+/g, "-"),
+    color: "#3b5ba9",
+    is_owner: false,
+    is_connected: true,
+    last_seen: null,
+    last_input_at: null,
+    is_admitted_by_domain: false,
     ...overrides,
   };
 }

@@ -1,118 +1,1664 @@
-import m from "mithril";
-import {
-  DockviewWorkspace,
-  addAddressToProjects,
-  deleteAddress,
-  focusLastOfShortcut,
-  getActiveViewId,
-  getAvailableProjects,
-  getAwaitingActionKeys,
-  getSidebarRows,
-  openAddress,
-  refreshAddress,
-  refreshProjects,
-  removeAddressFromView,
-  removeShortcutFromView,
-  renameAddress,
-  runAppAction,
-  runShortcut,
-  runShortcutAsNew,
-  setShortcutInView,
-  shareApp,
-  switchToView,
-  requestAppLifecycle,
-  requestInstanceLifecycle,
-} from "./DockviewWorkspace";
-import { Sidebar } from "./Sidebar";
-import { UpdateStalenessBanner } from "./UpdateStalenessBanner";
-import type { SidebarTabRow } from "./Sidebar";
-import type { AppAction, AppRecord, ProjectShortcut, ShortcutMode } from "../models/Inventory";
+/**
+ * The desktop's root: the backdrop with its windows and live pages (or the overview over them), the taskbar,
+ * the launcher menu, the floating menus, the wallpaper chooser, the avatar chooser, and the viewing chrome,
+ * wired to one ``DesktopStore``. The App owns the transient interface state no record holds (which menu is
+ * open, the launcher's query and highlight, the selected shortcut, the chooser and the designs it lists, the
+ * desktop whose wallpaper chooser is up, and the overview's tiling as the last redraw computed it), measures the
+ * backdrop for the store, binds the gesture source to the document, and hosts the live-page layer, reconciling
+ * it after every redraw. A phone-sized viewport gets the phone layout instead (plan-phone-interface.md), over
+ * the same store and the same live-page layer.
+ */
 
-export function App(): m.Component {
+import m from "mithril";
+import { partAttrs } from "@imbue/workspace-ui/src/themes/parts";
+import { createMenu } from "@imbue/workspace-ui/src/components/menu";
+import type { MenuRow } from "@imbue/workspace-ui/src/components/menu";
+import { Toasts } from "@imbue/workspace-ui/src/components/toasts";
+import { anchorForEvent, anchorForPoint } from "@imbue/workspace-ui/src/menu-position";
+import type { MenuAlign, MenuAnchor } from "@imbue/workspace-ui/src/menu-position";
+import { installElementContextMenu } from "@imbue/workspace-ui/src/context_menu";
+import { elementReferenceRows } from "@imbue/workspace-ui/src/context_menu_rows";
+import { describeElement } from "@imbue/workspace-ui/src/element_reference";
+import type { ReferenceScope } from "@imbue/workspace-ui/src/element_reference";
+import { fetchWallpapers, wallpaperBackgroundImage } from "../model/api";
+import { appShortcutsOf, launchPathOf } from "../model/launch";
+import { SHELL_APP_NAME } from "../model/UpdateNotice";
+import {
+  SYSTEM_MONITOR_APP_NAME,
+  SYSTEM_MONITOR_PAGES,
+  currentResourceGauge,
+  isResourceGaugeStale,
+  saveSettings as saveResourceGaugeSettings,
+  startCardRefresh,
+  stopCardRefresh,
+  systemMonitorPathOf,
+  type GaugeResource,
+} from "../model/resourceGauge";
+import type {
+  AppRecord,
+  AppTheming,
+  AvatarDesign,
+  Desktop,
+  DesktopShortcut,
+  WallpaperListing,
+} from "../model/records";
+import { shortcutKey } from "../model/records";
+import { WORKSPACE_AGENT_KEY } from "../model/Bubbles";
+import { needsYou, workingOn } from "../model/ChatsActivity";
+import { leftBehindDesktops, ownerEntryOf } from "../model/Ownership";
+import { getOwnIdentity, getOwnParticipant } from "../model/Presence";
+import { getRoster, rosterEntry } from "../model/Roster";
+import type { PixelPoint } from "../geometry/frames";
+import { mostRecentlyFocusedWindowOfApp, placementOf } from "../geometry/stack";
+import {
+  activeDesktop,
+  activeFocusedWindowId,
+  activePlacements,
+  appByName,
+  avatarPinnedEntryOf,
+  barEntries,
+  desktopById,
+  draftTargetOf,
+  effectiveWindowTitle,
+  entryLook,
+  floatingEntries,
+  isEntryFloating,
+  pinnedWindowOf,
+} from "../reducers/desktopState";
+import {
+  defaultHighlightIndex,
+  isRowEnabled,
+  launcherRowsOf,
+  moveHighlight,
+  secondaryTextRow,
+} from "../reducers/launcherRows";
+import type { LauncherMenuRows, LauncherRow } from "../reducers/launcherRows";
+import { findShortcut } from "../reducers/shortcuts";
+import { PINNED_ENTRY_ATTRIBUTE, SHORTCUT_ATTRIBUTE } from "../gestures/pointerGestures";
+import type { GestureListener, GestureSource } from "../gestures/pointerGestures";
+import { LivePagesLayer, WINDOW_ID_ATTRIBUTE } from "../pages/livePages";
+import type { MountPolicy } from "../pages/livePages";
+import type { DesktopStore } from "../store/DesktopStore";
+import type { TourController } from "../model/tour";
+import { AVATAR_DESIGN_PROMPT, AvatarChooserDialog } from "./AvatarChooserDialog";
+import { Backdrop } from "./Backdrop";
+import type { BackdropLetterbox } from "./Backdrop";
+import { THEME_DESIGN_PROMPT, THEME_PREVIEW_APP, ThemeChooserDialog } from "./ThemeChooserDialog";
+import { KeyboardShortcutsDialog } from "./KeyboardShortcutsDialog";
+import { ResourceGaugeDialog } from "./ResourceGaugeDialog";
+import { ResourceCard } from "./tray/ResourceCard";
+import { LauncherMenu } from "./LauncherMenu";
+import { GRID_SHARE, gridFor, overviewPresentationOf } from "./Overview";
+import type { OverviewAttrs, OverviewGrid, OverviewTile } from "./Overview";
+import { ReplacedDesktopNotice } from "./ReplacedDesktopNotice";
+import { applyDropStyle, applyLiftStyle } from "./ShortcutIcon";
+import { applyRectStyle } from "./pixelStyle";
+import { SNAP_PREVIEW_ATTRIBUTE, applySnapPreviewStyle } from "./SnapPreview";
+import { PhoneLayout, phoneMountPolicy } from "./phone/PhoneLayout";
+import { SoloView } from "./SoloView";
+import { Taskbar } from "./Taskbar";
+import { TourCard } from "./TourCard";
+import type { WindowControl } from "./TitleBar";
+import { UpdateNoticeBanner } from "./UpdateNoticeBanner";
+import { UpdateStalenessBanner } from "./UpdateStalenessBanner";
+import { WallpaperChooserDialog, isSameWallpaper } from "./WallpaperChooserDialog";
+import {
+  MENU_MIN_WIDTH,
+  openShareSettings,
+  enableThemingPrompt,
+  taskbarEntryMenuRows,
+  windowMenuRows,
+  type WindowThemeActions,
+} from "./WindowMenu";
+import { windowSizeRow } from "./WindowSizeRow";
+import type { WindowSizeActions } from "./WindowSizeRow";
+import { AgentCard } from "./tray/AgentCard";
+import { BubbleLayer } from "./tray/BubbleLayer";
+import { PersonCard } from "./tray/PersonCard";
+import { createTrayCardHover } from "./tray/TrayCard";
+import type { OpenCard } from "./tray/TrayCard";
+import type { ViewingChipAttrs } from "./tray/ViewingChip";
+
+/** Which menu is open and what it was opened for. Where it sits, and everything about taking it
+ *  down, belongs to the menu component itself. */
+type OpenMenu =
+  | { readonly kind: "window"; readonly windowId: string }
+  | { readonly kind: "size"; readonly windowId: string }
+  | { readonly kind: "entry"; readonly windowId: string; readonly referenceRows: readonly MenuRow[] }
+  | { readonly kind: "shortcut"; readonly shortcut: DesktopShortcut; readonly referenceRows: readonly MenuRow[] }
+  | {
+      readonly kind: "app-shortcut";
+      readonly app: string;
+      readonly launch: string;
+      readonly referenceRows: readonly MenuRow[];
+    }
+  /** The bare backdrop's menu (the multiplayer spec, section 8.2). */
+  | { readonly kind: "backdrop"; readonly referenceRows: readonly MenuRow[] }
+  /** A desktop thumbnail's menu in the overview. */
+  | { readonly kind: "overview-desktop"; readonly desktopId: string; readonly referenceRows: readonly MenuRow[] }
+  | { readonly kind: "element"; readonly rows: readonly MenuRow[] };
+
+/** The scope of a reference to the shell's own chrome: this client and desktop, and the window whose chrome
+ *  holds the target, when one does. */
+function shellReferenceScope(store: DesktopStore, target: Element): ReferenceScope {
+  const state = store.getState();
   return {
-    view() {
+    app: SHELL_APP_NAME,
+    windowId: target.closest(`[${WINDOW_ID_ATTRIBUTE}]`)?.getAttribute(WINDOW_ID_ATTRIBUTE) ?? null,
+    desktopId: state.activeDesktopId,
+    clientId: state.clientId,
+  };
+}
+
+/** The reference rows a right-click menu of the shell's own ends with (element-reference-menu plan section
+ *  4.4): none for a menu opened without a right-click (a long press with nothing under it). */
+function referenceRowsFor(store: DesktopStore, target: Element | null, x: number, y: number): MenuRow[] {
+  if (target === null) return [];
+  const click = { clientX: x, clientY: y, pageX: x + window.scrollX, pageY: y + window.scrollY };
+  const reference = describeElement(target, click, shellReferenceScope(store, target));
+  return elementReferenceRows(reference, (text) => void store.draftText(text), true);
+}
+
+/** ``rows`` followed by the reference rows after a divider, or ``rows`` alone when there are none. */
+function withReferenceRows(rows: MenuRow[] | null, referenceRows: readonly MenuRow[]): MenuRow[] | null {
+  if (rows === null || referenceRows.length === 0) return rows;
+  return [...rows, { kind: "divider" }, ...referenceRows];
+}
+
+/** Set on the desktop's root while a window is being dragged by its title bar, for as long as the
+ *  pointer should hold the closed hand (style.css). Written straight onto the element: the drag
+ *  paints without redrawing, and mithril leaves an attribute no vnode carries alone. */
+const WINDOW_DRAGGING_ATTRIBUTE = "data-window-dragging";
+/** Set on the layout root while a shortcut is in the hand, so the closed hand holds for the whole gesture. */
+const SHORTCUT_DRAGGING_ATTRIBUTE = "data-shortcut-dragging";
+
+/** Set on the desktop's root for the length of a press, which is longer than the drag it may
+ *  become, so a window the pointer carries is held by it rather than trailing it (style.css). The
+ *  snap a release commits is written after the press has ended, and travels the last step. */
+const WINDOW_MOTION_ATTRIBUTE = "data-window-motion";
+
+/** Marks the backdrop, the area above the taskbar whose pixels the desktop's frames are fractions of. */
+export const BACKDROP_AREA_ATTRIBUTE = "data-backdrop-area";
+/** On the desktop layout's root while a fullscreen window is on the active desktop's screen. */
+export const FULLSCREEN_WINDOW_ATTRIBUTE = "data-fullscreen-window";
+
+/** The overview's tiles as computed for one redraw: the pages are laid over them at the grid's scale. */
+interface OverviewTiling {
+  readonly tiles: readonly OverviewTile[];
+  readonly grid: OverviewGrid;
+}
+
+interface AvatarChooserState {
+  /** The designs the chooser lists; null until the catalog answers. */
+  readonly designs: readonly AvatarDesign[] | null;
+  readonly loadError: string | null;
+}
+
+export interface AppAttrs {
+  readonly store: DesktopStore;
+  readonly gestures: GestureSource;
+  /** The show-around tour: what it shows, and the row that runs it. */
+  readonly tour: TourController;
+  /** The shell document's host and protocol, which every page URL derives from. */
+  readonly host: string;
+  readonly protocol: string;
+}
+
+/** Whether the secondary chord reads as Cmd+Enter: the browser runs on an Apple platform. */
+function isApplePlatform(): boolean {
+  return /Mac|iPhone|iPad|iPod/.test(navigator.platform) || /Mac OS/.test(navigator.userAgent);
+}
+
+export function App(): m.Component<AppAttrs> {
+  let openMenu: OpenMenu | null = null;
+  /** The desktop whose wallpaper chooser is up. */
+  let wallpaperDialogDesktopId: string | null = null;
+  /** The desktop whose theme chooser is up. */
+  let themeDialogDesktopId: string | null = null;
+  /** Whether the keyboard shortcuts dialog is up. */
+  let isKeyboardShortcutsDialogOpen = false;
+  /** Whether the resource gauge's settings dialog is up. */
+  let isResourceGaugeDialogOpen = false;
+  /** The overview's tiling as the last redraw computed it, which the pages follow; null while it is closed. */
+  let overviewTiling: OverviewTiling | null = null;
+  let avatarChooser: AvatarChooserState | null = null;
+  let wallpapers: WallpaperListing[] | null = null;
+  let launcherQuery = "";
+  // The row the arrows or a hover moved the highlight to; null follows the default rule for the rows shown.
+  let launcherHighlight: number | null = null;
+  // How far the launcher field stands above its one row, in px; the menu sits above it.
+  let launcherFieldRise = 0;
+  let selectedShortcutKey: string | null = null;
+  let pages: LivePagesLayer | null = null;
+  // The window the last redraw painted as dragged, for one more paint once the gesture is gone.
+  let draggedWindowId: string | null = null;
+  let backdropArea: HTMLElement | null = null;
+  let resizeObserver: ResizeObserver | null = null;
+  /** How many of a travelling window's properties are still in transition, by window id. A count
+   *  rather than a flag: a move runs one transition per property it changes, each ending on its own. */
+  const travellingWindows = new Map<string, number>();
+  let travelFrame: number | null = null;
+  let detachGestures: (() => void) | null = null;
+  /** The root the gesture source is bound to: the layout's root changes when the phone layout comes or goes. */
+  let gestureRoot: HTMLElement | null = null;
+  let uninstallContextMenu: (() => void) | null = null;
+  let store: DesktopStore | null = null;
+  let tour: TourController | null = null;
+  // The tray's card: which entry's, and the hover bookkeeping that opens and closes it.
+  const trayCard = createTrayCardHover((card) => {
+    // A person's card reads what they are looking at as it opens (the multiplayer spec, section 6.3).
+    if (card?.kind === "person" && store !== null) void store.refreshClients();
+    // The resource card shows exact figures, which the tray's pushes are too coarse for: it fetches while open.
+    if (card?.kind === "resources") startCardRefresh(() => m.redraw());
+    else stopCardRefresh();
+    m.redraw();
+  });
+
+  // The one menu the desktop ever has open. Which menu it is and what it was opened for is
+  // ``openMenu``; opening, placing, dismissing and closing are the component's, and its
+  // ``onClose`` is what keeps the two from drifting apart.
+  const menu = createMenu({
+    placement: "below",
+    role: "menu",
+    // A menu of verbs never goes under a card's worth of width. The size menu is not one: its
+    // content is a grid of tiles, and a floor wider than the grid would only pad it on one side.
+    get minWidth(): number | undefined {
+      return openMenu?.kind === "size" ? undefined : MENU_MIN_WIDTH;
+    },
+    // The size menu hangs off an icon a fraction of its own width, so lining their left edges up
+    // would point it at the button's corner; centred, it reads as belonging to the whole button.
+    // Every other menu is opened from a row or a press, which has a left edge worth aligning to.
+    get align(): MenuAlign | undefined {
+      return openMenu?.kind === "size" ? "center" : undefined;
+    },
+    // The marker class each menu is known by. Read off the open menu on every render, so one
+    // component can wear every kind's name.
+    get extraClass(): string | undefined {
+      return openMenu === null ? undefined : `${openMenu.kind}-menu`;
+    },
+    onClose: () => {
+      openMenu = null;
+    },
+  });
+
+  /** Whether what is open shields the windows' pages. A menu that lays a sheet does: the press
+   *  that dismisses it must not also land on the page under it. The size menu lays none, by
+   *  design, so a shield over the pages would swallow the press that its own dismissal needs. */
+  function isShieldingOverlayOpen(): boolean {
+    return (openMenu !== null && openMenu.kind !== "size") || store?.isLauncherOpen() === true;
+  }
+
+  /** Show ``next``'s menu against ``anchor``. A shortcut's menu selects the shortcut on the way:
+   *  the selection box is the only thing that says which icon the verbs are about, and a right
+   *  click (or a long press) reaches the menu without ever passing through a click that selects. */
+  function openMenuAt(next: OpenMenu, anchor: MenuAnchor): void {
+    if (next.kind === "shortcut") {
+      selectedShortcutKey = shortcutKey(next.shortcut.target.app, next.shortcut.target.launch);
+    }
+    openMenu = next;
+    menu.open(anchor);
+  }
+
+  /** Bind the gesture source to the layout's root, again whenever the root is a new element. */
+  function bindGestures(current: DesktopStore, root: HTMLElement, gestures: GestureSource): void {
+    if (root === gestureRoot) return;
+    detachGestures?.();
+    gestureRoot = root;
+    detachGestures = gestures.attach(root, gestureListener(current, root));
+  }
+
+  function closeLauncher(): void {
+    store?.closeLauncher();
+  }
+
+  const onDocumentKeyDown = (event: KeyboardEvent): void => {
+    if (event.key !== "Escape") return;
+    // A window drag in progress is cancelled first of all: the window returns to where the drag began, and a
+    // tear-out drops the desktop window the chrome was dragging.
+    const gesture = store?.getGesture() ?? null;
+    if (store !== null && gesture !== null && gesture.kind === "move") {
+      store.cancelGesture();
+      paintWindow(store, gesture.windowId);
+      m.redraw();
+      return;
+    }
+    // One layer per Escape: a dialog (the wallpaper chooser, the avatar chooser) takes it through the
+    // Modal's own listener, an open menu through the menu's own, and the layer under it stays.
+    if (document.querySelector('.modal-overlay, [data-menu-part="menu"]') !== null) return;
+    if (store?.isOverviewOpen() === true) {
+      // A rename in progress takes its own Escape (the input stops the key); the overview takes the next.
+      closeOverview();
+      m.redraw();
+    } else if (store?.isLauncherOpen() === true) {
+      closeLauncher();
+      m.redraw();
+    } else if (selectedShortcutKey !== null) {
+      selectedShortcutKey = null;
+      m.redraw();
+    }
+  };
+
+  const onDocumentPointerDown = (event: Event): void => {
+    if (store?.isLauncherOpen() !== true) return;
+    const target = event.target;
+    if (
+      target instanceof Element &&
+      target.closest("[data-launcher-overlay], [data-launcher-field], .modal-overlay") !== null
+    )
+      return;
+    closeLauncher();
+    m.redraw();
+  };
+
+  /** The chrome of one window as the backdrop holds it now, else null (its window is closed, or its desktop
+   *  is no longer the one on screen). */
+  function windowElement(windowId: string): HTMLElement | null {
+    return backdropArea?.querySelector<HTMLElement>(`[${WINDOW_ID_ATTRIBUTE}="${CSS.escape(windowId)}"]`) ?? null;
+  }
+
+  /** Paint a window as the store now has it, straight onto the DOM: its rectangle onto its element, its
+   *  page over the content box that just moved, and the snap preview shown or hidden. Per pointer move
+   *  of a drag or resize, with no redraw (one per move would re-render the whole desktop and reposition
+   *  every page), and once more when the gesture ends or is cancelled: a redraw diffs against the last
+   *  render rather than the DOM and writes nothing it finds equal, so the DOM must already be at what
+   *  the render answers, which the store's ``windowRect`` and ``snapPreviewRect`` are at every point. */
+  function paintWindow(current: DesktopStore, windowId: string): void {
+    const area = backdropArea;
+    if (area === null) return;
+    const element = windowElement(windowId);
+    if (element !== null) applyRectStyle(element, current.windowRect(windowId));
+    // A window pulled past the viewport is drawn by the chrome under the cursor: hidden here, chrome and page,
+    // until the drag comes back inside or ends.
+    const isTornOut = current.isTearingOut(windowId);
+    if (element !== null) element.style.visibility = isTornOut ? "hidden" : "";
+    pages?.setTornOutWindow(isTornOut ? windowId : null);
+    pages?.placePage(windowId);
+    const preview = area.querySelector<HTMLElement>(`[${SNAP_PREVIEW_ATTRIBUTE}]`);
+    if (preview !== null) applySnapPreviewStyle(preview, current.snapPreviewRect());
+  }
+
+  /** Feed ``element``'s size to the store as the backdrop's, now and whenever it changes: the backdrop area of a
+   *  desktop, or the pages host of a solo shell or a phone, whose one page is laid over it on every redraw. */
+  function observeBackdropSize(current: DesktopStore, element: HTMLElement): void {
+    const measure = (): void => {
+      const box = element.getBoundingClientRect();
+      current.setBackdropSize({ width: box.width, height: box.height });
+    };
+    resizeObserver?.disconnect();
+    resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(element);
+    measure();
+  }
+
+  /** Build the live-pages layer over ``host`` once the render that made the host is over (the window chrome is
+   *  in the DOM), and place the pages now: when every load had already landed no further redraw follows. */
+  function startPagesLayer(current: DesktopStore, host: HTMLElement, attrs: AppAttrs): void {
+    pages = new LivePagesLayer(host, current, { host: attrs.host, protocol: attrs.protocol });
+    // Before the first reconcile: under the desktop's policy a phone's first pass would create a page for every
+    // window its layout shows, only for the next pass to destroy them.
+    pages.setMountPolicy(mountPolicyOf(current));
+    pages.start();
+    pages.reconcile();
+  }
+
+  /** Which pages the layout mounts: the phone's shown page and the pages it keeps, else every page. */
+  function mountPolicyOf(current: DesktopStore): MountPolicy {
+    return current.isPhoneLayout() ? phoneMountPolicy(current) : { kind: "all" };
+  }
+
+  /** The window a transition belongs to, else null: the chrome's root is the only element whose
+   *  travel moves the window, so a transition on something laid out inside it (a control taking
+   *  its hover colour) must not drive the page. */
+  function travellingWindowId(event: Event): string | null {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return null;
+    return target.getAttribute(WINDOW_ID_ATTRIBUTE);
+  }
+
+  /** Lay each travelling window's page over the content box as it stands this frame.
+   *
+   *  A page is positioned by measuring the chrome it sits in rather than by being handed a
+   *  rectangle, so it cannot carry the same transition: it would have nothing to transition
+   *  towards, and would sit at the old rectangle until something measured the chrome again.
+   *  Re-measuring per frame is the placement a drag already does, driven by the transition
+   *  instead of by the pointer. */
+  function followTravellingWindows(): void {
+    let hasTravelEnded = false;
+    for (const windowId of [...travellingWindows.keys()]) {
+      // A window that leaves the desktop mid-travel (closed, or its desktop swapped for another) has its
+      // transitions cancelled on a chrome already out of the document, where the event never reaches the
+      // backdrop that listens for it: the frame that cannot find the chrome is what ends its travel.
+      if (windowElement(windowId) === null) {
+        travellingWindows.delete(windowId);
+        hasTravelEnded = true;
+      } else {
+        pages?.placePage(windowId);
+      }
+    }
+    if (hasTravelEnded && travellingWindows.size === 0) pages?.reconcile();
+    travelFrame = travellingWindows.size > 0 ? requestAnimationFrame(followTravellingWindows) : null;
+  }
+
+  function onWindowTravelStart(event: Event): void {
+    const windowId = travellingWindowId(event);
+    if (windowId === null) return;
+    travellingWindows.set(windowId, (travellingWindows.get(windowId) ?? 0) + 1);
+    if (travelFrame === null) travelFrame = requestAnimationFrame(followTravellingWindows);
+  }
+
+  function onWindowTravelEnd(event: Event): void {
+    const windowId = travellingWindowId(event);
+    if (windowId === null) return;
+    const stillRunning = (travellingWindows.get(windowId) ?? 1) - 1;
+    if (stillRunning > 0) {
+      travellingWindows.set(windowId, stillRunning);
+      return;
+    }
+    travellingWindows.delete(windowId);
+    // Where the chrome landed, not the last value a frame happened to catch on the way.
+    pages?.placePage(windowId);
+    // A window that travelled over another's page covers it only once it has landed.
+    if (travellingWindows.size === 0) pages?.reconcile();
+  }
+
+  /** Paint a floating entry as the store now has it, straight onto its box: the per-move step of its drag, and
+   *  once more when the drag ends or is cancelled, for the same reason ``paintWindow`` exists. */
+  function paintFloatingEntry(current: DesktopStore, app: string): void {
+    const element = backdropArea?.querySelector<HTMLElement>(
+      `[${PINNED_ENTRY_ATTRIBUTE}="${CSS.escape(app)}"][data-entry-mode="floating"]`,
+    );
+    if (element !== undefined && element !== null) applyRectStyle(element, current.floatingEntryRectOf(app));
+  }
+
+  /** Paint a lifted shortcut's travel straight onto its icon: the per-move step of its drag, and once more
+   *  when the drag ends or is cancelled, for the same reason ``paintWindow`` exists. With the drag over it
+   *  settles the icon into the cell it landed in instead. */
+  function paintShortcut(current: DesktopStore, app: string, launch: string): void {
+    const key = shortcutKey(app, launch);
+    const element = backdropArea?.querySelector<HTMLElement>(`[${SHORTCUT_ATTRIBUTE}="${CSS.escape(key)}"]`);
+    if (element === undefined || element === null) return;
+    const gesture = current.getGesture();
+    if (gesture !== null && gesture.kind === "shortcut") {
+      applyLiftStyle(element, gesture.lift);
+      return;
+    }
+    const rect = current.shortcutRect(app, launch);
+    if (rect !== null) applyDropStyle(element, rect);
+  }
+
+  /** The gesture source measures points against ``root`` (the whole layout, so the taskbar's long presses
+   *  count too); the store wants the backdrop's pixels, which differ by whatever sits above the backdrop. */
+  function gestureListener(current: DesktopStore, root: HTMLElement): GestureListener {
+    const backdropOrigin = (): DOMRect => (backdropArea ?? root).getBoundingClientRect();
+    const toBackdrop = (point: PixelPoint): PixelPoint => {
+      const rootBox = root.getBoundingClientRect();
+      const origin = backdropOrigin();
+      return { x: point.x - (origin.left - rootBox.left), y: point.y - (origin.top - rootBox.top) };
+    };
+    const grabOffsetInside = (element: HTMLElement, press: PixelPoint): PixelPoint => {
+      const box = element.getBoundingClientRect();
+      const origin = backdropOrigin();
+      return { x: press.x - (box.left - origin.left), y: press.y - (box.top - origin.top) };
+    };
+    /** The pinned window of ``app`` on the active desktop, whose entry a floating-entry press names. */
+    const pinnedWindowIdOf = (app: string): string | null => pinnedWindowOf(current.getState(), app)?.id ?? null;
+    return {
+      thresholdPx: () => current.getMetrics().dragThreshold,
+      isDraggable: (binding) => binding.kind !== "taskbar-entry",
+      // Inert for the whole press: the pixels before the threshold are spent beside the handle, often
+      // over a neighbouring page, and a move the root cannot see is a move the threshold never counts.
+      onPressStart: (binding) => {
+        const pressedWindowId =
+          binding.kind === "window-move" || binding.kind === "window-resize" ? binding.windowId : null;
+        // What the browser would have done with a press whose default the gesture source did not prevent.
+        pages?.takeFocusFromOtherPages(pressedWindowId);
+        pages?.setGestureActive(true);
+        root.setAttribute(WINDOW_MOTION_ATTRIBUTE, "off");
+      },
+      onPressEnd: () => {
+        pages?.setGestureActive(false);
+        root.removeAttribute(WINDOW_MOTION_ATTRIBUTE);
+      },
+      onBegin: (binding, rootPoint, rootPress) => {
+        const point = toBackdrop(rootPoint);
+        switch (binding.kind) {
+          case "window-move":
+            root.setAttribute(WINDOW_DRAGGING_ATTRIBUTE, "");
+            current.beginWindowMove(binding.windowId, point);
+            return;
+          case "window-resize":
+            current.beginWindowResize(binding.windowId, binding.edge);
+            return;
+          case "shortcut":
+            root.setAttribute(SHORTCUT_DRAGGING_ATTRIBUTE, "");
+            current.beginShortcutDrag(binding.app, binding.launch, point);
+            return;
+          case "floating-entry":
+            current.beginFloatingEntryDrag(
+              binding.app,
+              point,
+              grabOffsetInside(binding.element, toBackdrop(rootPress)),
+            );
+            return;
+          case "taskbar-entry":
+            return;
+        }
+      },
+      onMove: (binding, rootPoint, delta) => {
+        const point = toBackdrop(rootPoint);
+        switch (binding.kind) {
+          case "window-move":
+            current.updateWindowMove(point);
+            paintWindow(current, binding.windowId);
+            return;
+          case "window-resize":
+            current.updateWindowResize(delta);
+            paintWindow(current, binding.windowId);
+            return;
+          case "shortcut":
+            current.updateShortcutDrag(point, delta);
+            paintShortcut(current, binding.app, binding.launch);
+            return;
+          case "floating-entry":
+            current.updateFloatingEntryDrag(point);
+            paintFloatingEntry(current, binding.app);
+            return;
+          case "taskbar-entry":
+            return;
+        }
+      },
+      onEnd: (binding, rootPoint, delta) => {
+        const point = toBackdrop(rootPoint);
+        switch (binding.kind) {
+          case "window-move":
+            root.removeAttribute(WINDOW_DRAGGING_ATTRIBUTE);
+            current.endWindowMove(point);
+            paintWindow(current, binding.windowId);
+            break;
+          case "window-resize":
+            current.endWindowResize(delta);
+            paintWindow(current, binding.windowId);
+            break;
+          case "shortcut":
+            root.removeAttribute(SHORTCUT_DRAGGING_ATTRIBUTE);
+            current.endShortcutDrag(point, delta);
+            paintShortcut(current, binding.app, binding.launch);
+            break;
+          case "floating-entry":
+            current.endFloatingEntryDrag(point);
+            paintFloatingEntry(current, binding.app);
+            break;
+          case "taskbar-entry":
+            break;
+        }
+      },
+      onCancel: (binding) => {
+        root.removeAttribute(WINDOW_DRAGGING_ATTRIBUTE);
+        root.removeAttribute(SHORTCUT_DRAGGING_ATTRIBUTE);
+        current.cancelGesture();
+        if (binding.kind === "window-move" || binding.kind === "window-resize") paintWindow(current, binding.windowId);
+        if (binding.kind === "floating-entry") paintFloatingEntry(current, binding.app);
+        if (binding.kind === "shortcut") paintShortcut(current, binding.app, binding.launch);
+      },
+      onLongPress: (binding, client) => {
+        const anchor = anchorForPoint(client.x, client.y);
+        const referenceRows = (): MenuRow[] =>
+          referenceRowsFor(current, document.elementFromPoint(client.x, client.y), client.x, client.y);
+        switch (binding.kind) {
+          case "window-move":
+          case "window-resize":
+            openMenuAt({ kind: "window", windowId: binding.windowId }, anchor);
+            break;
+          case "shortcut": {
+            const desktop = activeDesktop(current.getState());
+            const shortcut = desktop === null ? undefined : findShortcut(desktop, binding.app, binding.launch);
+            if (shortcut !== undefined) {
+              openMenuAt({ kind: "shortcut", shortcut, referenceRows: referenceRows() }, anchor);
+            }
+            break;
+          }
+          case "taskbar-entry":
+            openMenuAt({ kind: "entry", windowId: binding.windowId, referenceRows: referenceRows() }, anchor);
+            break;
+          case "floating-entry": {
+            const windowId = pinnedWindowIdOf(binding.app);
+            if (windowId !== null) openMenuAt({ kind: "entry", windowId, referenceRows: referenceRows() }, anchor);
+            break;
+          }
+        }
+        m.redraw();
+      },
+    };
+  }
+
+  /** The zone grid's actions for a window, or null where there is nothing to choose: a window that has since
+   *  been closed -- a hover menu outlives its trigger, and placing a window that is gone writes a placement
+   *  nothing owns. */
+  function sizeActionsOf(current: DesktopStore, windowId: string): WindowSizeActions | null {
+    const state = current.getState();
+    if (!activeDesktop(state)?.windows.some((candidate) => candidate.id === windowId)) return null;
+    return {
+      setState: (state) => current.setWindowState(windowId, state),
+      setFrame: (frame) => current.setWindowFrame(windowId, frame),
+    };
+  }
+
+  /** The maximize control's own menu: the zone grid under its own heading. */
+  function rowsOfSizeMenu(current: DesktopStore, windowId: string): MenuRow[] | null {
+    const actions = sizeActionsOf(current, windowId);
+    if (actions === null) return null;
+    return [windowSizeRow(actions, () => menu.close())];
+  }
+
+  /** Spread onto a window's maximize control: resting on it opens that window's size menu. */
+  function sizeMenuTrigger(windowId: string): m.Attributes {
+    return menu.hoverTriggerAttrs(() => {
+      openMenu = { kind: "size", windowId };
+    });
+  }
+
+  function rowsOfWindowMenu(current: DesktopStore, windowId: string): MenuRow[] | null {
+    const state = current.getState();
+    const window = activeDesktop(state)?.windows.find((candidate) => candidate.id === windowId);
+    if (window === undefined) return null;
+    const app = appByName(state, window.app);
+    const isImmersive = current.getImmersive() !== null;
+    return windowMenuRows(app, {
+      size: sizeActionsOf(current, windowId),
+      onSized: () => menu.close(),
+      fullscreen: {
+        isFullscreen: placementOf(state.layout, windowId).state === "FULLSCREEN",
+        toggleFullscreen: () => current.toggleFullscreen(windowId),
+        isImmersive,
+        immersive: current.getCanImmerse()
+          ? () => (isImmersive ? current.leaveImmersive(windowId) : current.requestImmersive(windowId))
+          : null,
+      },
+      share: app === undefined || app.critical ? null : () => openShareSettings(app),
+      quit: app !== undefined && current.canStopApp(app) ? () => void current.quitApp(app.name) : null,
+      popOut: current.getCanPopOut() ? () => void current.detachWindow(windowId) : null,
+      close: () => void current.closeOrMinimizeWindow(windowId),
+      theme: app === undefined || app.theming === null ? null : windowThemeActionsOf(current, app, app.theming),
+    });
+  }
+
+  function windowThemeActionsOf(current: DesktopStore, app: AppRecord, theming: AppTheming): WindowThemeActions {
+    const canDraft = draftTargetOf(current.getState()) !== null;
+    return {
+      isThemeable: theming !== "unthemed",
+      isOn: theming === "on",
+      setOn: (isOn) => void current.setAppTheming(app.name, isOn),
+      enable: canDraft ? () => void current.draftIntoPinnedWindow(enableThemingPrompt(app.display_name), false) : null,
+    };
+  }
+
+  function rowsOfEntryMenu(current: DesktopStore, windowId: string): MenuRow[] | null {
+    const state = current.getState();
+    const window = activeDesktop(state)?.windows.find((candidate) => candidate.id === windowId);
+    if (window === undefined) return null;
+    const placement = placementOf(state.layout, windowId);
+    const look = entryLook(state, window, appByName(state, window.app));
+    return taskbarEntryMenuRows({
+      isMinimized: placement.is_minimized,
+      isMaximized: placement.state === "MAXIMIZED" || placement.state === "FULLSCREEN",
+      isDetached: placement.is_detached,
+      show: () => current.showDetachedWindow(windowId),
+      showGhost: () => current.showWindowGhost(windowId),
+      bringBack: () => void current.reattachWindow(windowId, null),
+      restore: () => current.restoreWindow(windowId),
+      minimize: () => current.minimizeWindow(windowId),
+      maximize: () => current.setWindowState(windowId, "MAXIMIZED"),
+      unmaximize: () => current.toggleMaximized(windowId),
+      close: () => void current.closeOrMinimizeWindow(windowId),
+      presentation:
+        look === null
+          ? null
+          : {
+              look,
+              setMode: (mode) => void current.setEntryMode(window.app, mode),
+              changeAvatar: () => openAvatarChooser(current),
+            },
+      desktopShortcut: desktopShortcutRow(current, window.app, null),
+    });
+  }
+
+  function rowsOfShortcutMenu(current: DesktopStore, opened: DesktopShortcut): MenuRow[] | null {
+    const state = current.getState();
+    const desktop = activeDesktop(state);
+    if (desktop === null) return null;
+    // The record as it is now (its mode may have flipped elsewhere), and nothing once it is removed.
+    const shortcut = findShortcut(desktop, opened.target.app, opened.target.launch);
+    if (shortcut === undefined) return null;
+    const app = appByName(state, shortcut.target.app);
+    const launchPath = app === undefined ? null : launchPathOf(app, shortcut.target.launch);
+    const recent = app === undefined ? null : mostRecentlyFocusedWindowOfApp(state.layout, desktop, app.name);
+    const otherMode = shortcut.mode === "focus" ? "new" : "focus";
+    const rows: MenuRow[] = [
+      { kind: "action", key: "open", label: "Open", onSelect: () => void current.runShortcut(shortcut) },
+    ];
+    if (shortcut.mode === "focus" && launchPath !== null) {
+      rows.push({
+        kind: "action",
+        key: "open-new",
+        label: launchPath.label,
+        onSelect: () => void current.runLaunch(shortcut.target.app, shortcut.target.launch, "new"),
+      });
+    } else if (shortcut.mode === "new" && app !== undefined) {
+      rows.push({
+        kind: "action",
+        key: "focus-last",
+        label: `Focus last ${app.display_name}`,
+        isDisabled: recent === null,
+        onSelect: () => {
+          if (recent !== null) current.raiseWindow(recent.id);
+        },
+      });
+    }
+    rows.push(
+      {
+        kind: "action",
+        key: "change-mode",
+        label: otherMode === "new" ? "Always open a new window" : "Focus the last window instead",
+        onSelect: () => void current.setShortcut(desktop.id, { ...shortcut, mode: otherMode }),
+      },
+      { kind: "divider" },
+      removeFromDesktopRow(current, shortcut.target.app, shortcut.target.launch),
+    );
+    return rows;
+  }
+
+  function removeFromDesktopRow(current: DesktopStore, app: string, launch: string): MenuRow {
+    return {
+      kind: "action",
+      key: "remove-from-desktop",
+      label: "Remove from desktop",
+      onSelect: () => void current.removeShortcut(app, launch),
+    };
+  }
+
+  /** Add one of the app's own shortcuts (``appShortcutsOf``) to the desktop on screen, or take it off when it is
+   *  there: the one of ``launch``, or the app's first with none named; null with no desktop, no such app, or no such
+   *  shortcut the app may have. */
+  function desktopShortcutRow(current: DesktopStore, appName: string, launch: string | null): MenuRow | null {
+    const state = current.getState();
+    const desktop = activeDesktop(state);
+    const app = appByName(state, appName);
+    const shortcuts = app === undefined ? [] : appShortcutsOf(app);
+    const own = launch === null ? shortcuts[0] : shortcuts.find((shortcut) => shortcut.launch === launch);
+    if (desktop === null || own === undefined) return null;
+    if (findShortcut(desktop, appName, own.launch) !== undefined) {
+      return removeFromDesktopRow(current, appName, own.launch);
+    }
+    return {
+      kind: "action",
+      key: "add-to-desktop",
+      label: "Add to desktop",
+      onSelect: () => void current.addShortcut(appName, own.launch, own.mode),
+    };
+  }
+
+  function rowsOfAppShortcutMenu(current: DesktopStore, appName: string, launch: string): MenuRow[] | null {
+    const row = desktopShortcutRow(current, appName, launch);
+    return row === null ? null : [row];
+  }
+
+  function closeOverview(): void {
+    store?.closeOverview();
+  }
+
+  /** The bare backdrop's menu (the multiplayer spec, section 8.2): a new desktop, the overview, the wallpaper, the
+   *  theme, and the keyboard shortcuts. While viewing somebody else's desktop (section 8.3) only the new desktop and
+   *  the shortcuts stay: the overview button is hidden too, and the wallpaper and the theme are the viewed desktop's,
+   *  not the viewer's to change, while the shortcuts are the viewer's own wherever they are. */
+  function rowsOfBackdropMenu(current: DesktopStore): MenuRow[] {
+    const active = current.getState().activeDesktopId;
+    const isViewing = current.viewedDesktop() !== null;
+    return [
+      {
+        kind: "action",
+        key: "new-desktop",
+        label: "New desktop",
+        onSelect: () => void current.createNextDesktop(),
+      },
+      {
+        kind: "action",
+        key: "show-all-desktops",
+        label: "Show all desktops",
+        isDisabled: isViewing,
+        onSelect: () => current.openOverview(),
+      },
+      { kind: "divider" },
+      {
+        kind: "action",
+        key: "change-wallpaper",
+        label: "Change wallpaper...",
+        isDisabled: active === null || isViewing,
+        onSelect: () => openWallpaperChooser(active),
+      },
+      {
+        kind: "action",
+        key: "change-theme",
+        label: "Change theme...",
+        isDisabled: active === null || isViewing,
+        onSelect: () => {
+          if (active !== null) themeDialogDesktopId = active;
+        },
+      },
+      { kind: "divider" },
+      {
+        kind: "action",
+        key: "keyboard-shortcuts",
+        label: "Keyboard shortcuts...",
+        onSelect: () => {
+          isKeyboardShortcutsDialogOpen = true;
+        },
+      },
+      ...resourceGaugeSettingsRows("resource-gauge", "Resource gauge..."),
+    ];
+  }
+
+  /** A thumbnail's menu in the overview: a rename for the viewer's own desktops, and the deletion, confirmed in
+   *  place over the thumbnail. */
+  function rowsOfOverviewDesktopMenu(current: DesktopStore, desktopId: string): MenuRow[] {
+    const isOwn = current.ownDesktops().some((desktop) => desktop.id === desktopId);
+    const rows: MenuRow[] = isOwn
+      ? [
+          {
+            kind: "action",
+            key: "rename",
+            label: "Rename",
+            onSelect: () => current.setOverviewRenamingId(desktopId),
+          },
+        ]
+      : [];
+    rows.push({
+      kind: "action",
+      key: "delete",
+      label: "Delete desktop...",
+      tone: "danger",
+      onSelect: () => current.setOverviewDeletingId(desktopId),
+    });
+    return rows;
+  }
+
+  /** The rows of whichever menu is open, or null once what it was opened for has gone. */
+  function rowsOfOpenMenu(current: DesktopStore, open: OpenMenu): MenuRow[] | null {
+    switch (open.kind) {
+      case "window":
+        return rowsOfWindowMenu(current, open.windowId);
+      case "size":
+        return rowsOfSizeMenu(current, open.windowId);
+      case "entry":
+        return withReferenceRows(rowsOfEntryMenu(current, open.windowId), open.referenceRows);
+      case "shortcut":
+        return withReferenceRows(rowsOfShortcutMenu(current, open.shortcut), open.referenceRows);
+      case "app-shortcut":
+        return withReferenceRows(rowsOfAppShortcutMenu(current, open.app, open.launch), open.referenceRows);
+      case "backdrop":
+        return withReferenceRows(rowsOfBackdropMenu(current), open.referenceRows);
+      case "overview-desktop":
+        return withReferenceRows(rowsOfOverviewDesktopMenu(current, open.desktopId), open.referenceRows);
+      case "element":
+        return [...open.rows];
+    }
+  }
+
+  function openWallpaperChooser(desktopId: string | null): void {
+    if (desktopId === null) return;
+    wallpaperDialogDesktopId = desktopId;
+    // Read on every open: a file dropped into the wallpapers directory shows up, and a read that failed
+    // last time is tried again; the last list stays on screen meanwhile.
+    void fetchWallpapers()
+      .then((listed) => {
+        wallpapers = listed;
+      })
+      .catch((error: unknown) => {
+        console.warn("[si] could not list the wallpapers", error);
+        wallpapers ??= [];
+      })
+      .finally(() => m.redraw());
+  }
+
+  /** Move the one avatar creature out of the tray: the pinned chat entry goes floating for this client. */
+  function floatAvatar(current: DesktopStore): void {
+    const entry = avatarPinnedEntryOf(current.getState());
+    if (entry === null) return;
+    void current.setEntryMode(entry.window.app, "floating");
+  }
+
+  /** The tray agent entry's right-click menu: the card's actions, the way the floating creature offers its own. */
+  function trayAgentMenuRows(current: DesktopStore): MenuRow[] {
+    return [
+      { kind: "action", key: "change-avatar", label: "Change avatar...", onSelect: () => openAvatarChooser(current) },
+      { kind: "action", key: "float", label: "Float", onSelect: () => floatAvatar(current) },
+    ];
+  }
+
+  /** The box of a speaker's tray entry, where its bubble's arrow points. */
+  function trayEntryRect(speaker: string): DOMRect | null {
+    const selector =
+      speaker === WORKSPACE_AGENT_KEY ? "[data-tray-agent]" : `[data-tray-person="${CSS.escape(speaker)}"]`;
+    return document.querySelector(selector)?.getBoundingClientRect() ?? null;
+  }
+
+  function trayCardView(current: DesktopStore, open: OpenCard, now: Date): m.Children {
+    const state = current.getState();
+    const frame = { anchor: trayCard.anchor(), onEnter: trayCard.enterCard, onLeave: trayCard.leaveCard };
+    if (open.kind === "agent") {
+      return m(AgentCard, {
+        ...frame,
+        avatar: state.avatar,
+        workspaceName: state.workspaceName,
+        workingOn: workingOn(),
+        needsYou: needsYou(),
+        onChangeAvatar: () => {
+          trayCard.close();
+          openAvatarChooser(current);
+        },
+        onFloat: () => {
+          trayCard.close();
+          floatAvatar(current);
+        },
+        onOpenChat: (chatId) => {
+          trayCard.close();
+          void current.showChat(chatId);
+        },
+      });
+    }
+    if (open.kind === "resources") {
+      const view = currentResourceGauge();
+      if (view === null) return null;
+      return m(ResourceCard, {
+        ...frame,
+        view,
+        isStale: isResourceGaugeStale(now.getTime()),
+        now,
+        canChangeSettings: isViewerOwner(),
+        onOpen: (resource) => openSystemMonitorOn(current, resource),
+        onOpenSettings: () => {
+          trayCard.close();
+          isResourceGaugeDialogOpen = true;
+        },
+      });
+    }
+    const entry = rosterEntry(open.key);
+    if (entry === null) return null;
+    return m(PersonCard, {
+      ...frame,
+      entry,
+      isOwn: entry.key === getOwnParticipant(),
+      now,
+      clients: current.getClients(),
+      desktops: state.desktops,
+      apps: state.apps,
+      activeDesktopId: state.activeDesktopId,
+      onOpenDesktop: (desktopId) => {
+        trayCard.close();
+        void current.switchDesktop(desktopId);
+      },
+      onNewDesktop: () => {
+        trayCard.close();
+        void current.createNextDesktop();
+      },
+    });
+  }
+
+  /** The overview's tiles: the active desktop's windows front-most first, at the rectangles they render at. */
+  function overviewTilingOf(current: DesktopStore): OverviewTiling {
+    const state = current.getState();
+    const desktop = activeDesktop(state);
+    const tiles: OverviewTile[] = [];
+    for (const placement of [...activePlacements(state)].reverse()) {
+      const window = desktop?.windows.find((candidate) => candidate.id === placement.window_id);
+      if (window === undefined || placement.is_detached) continue;
+      const app = appByName(state, window.app);
+      tiles.push({
+        window,
+        app,
+        title: effectiveWindowTitle(state, window, app),
+        rect: current.renderedRect(placement),
+        isMinimized: placement.is_minimized,
+      });
+    }
+    const backdrop = current.getBackdropSize();
+    const metrics = current.getMetrics();
+    const gridHeight = backdrop.height * GRID_SHARE;
+    return {
+      tiles,
+      grid: gridFor(
+        tiles.map((tile) => tile.rect),
+        backdrop.width,
+        gridHeight,
+        metrics,
+      ),
+    };
+  }
+
+  function overviewAttrs(current: DesktopStore, desktop: Desktop, tiling: OverviewTiling): OverviewAttrs {
+    const state = current.getState();
+    const ownDesktops = current.ownDesktops();
+    const leftBehind = leftBehindDesktops(state.desktops, getRoster(), getOwnIdentity());
+    current.ensureOverviewLayouts([...ownDesktops, ...leftBehind]);
+    return {
+      desktop,
+      tiles: tiling.tiles,
+      grid: tiling.grid,
+      backdrop: current.getBackdropSize(),
+      metrics: current.getMetrics(),
+      ownDesktops,
+      leftBehind,
+      apps: state.apps,
+      layoutOf: (desktopId) => current.overviewLayoutOf(desktopId),
+      confirmingDeleteId: current.getOverviewDeletingId(),
+      renamingId: current.getOverviewRenamingId(),
+      onRaiseWindow: (windowId) => current.restoreWindow(windowId),
+      onSwitchDesktop: (desktopId) => void current.switchDesktop(desktopId),
+      onBeginRename: (desktopId) => current.setOverviewRenamingId(desktopId),
+      onEndRename: () => current.setOverviewRenamingId(null),
+      onRename: (desktopId, name) => void current.renameDesktop(desktopId, name),
+      onReorder: (desktopIds) => void current.reorderDesktops(desktopIds),
+      onDesktopContextMenu: (desktopId, x, y, target) => {
+        openMenuAt(
+          { kind: "overview-desktop", desktopId, referenceRows: referenceRowsFor(current, target, x, y) },
+          anchorForPoint(x, y),
+        );
+      },
+      onConfirmDelete: (desktopId) => {
+        current.setOverviewDeletingId(null);
+        void current.deleteDesktop(desktopId);
+      },
+      onKeepDesktop: () => current.setOverviewDeletingId(null),
+      onNewDesktop: () => void current.createNextDesktop(),
+      onClose: closeOverview,
+    };
+  }
+
+  /** The viewing chrome's chip (the multiplayer spec, section 8.3), or null on one of the viewer's own desktops. */
+  function viewingChipAttrs(current: DesktopStore, viewed: Desktop | null): ViewingChipAttrs | null {
+    if (viewed === null) return null;
+    const owner = ownerEntryOf(viewed, getRoster());
+    return {
+      desktop: viewed,
+      owner,
+      color: owner?.color ?? "var(--c-text-faint)",
+      onStopViewing: () => void current.stopViewing(),
+    };
+  }
+
+  /** The letterbox a viewed desktop is drawn in (section 8.3), in the owner's colour, or null when the desktop is
+   *  the viewer's own or its owner's backdrop size is unknown. */
+  function letterboxAttrs(current: DesktopStore, viewing: ViewingChipAttrs | null): BackdropLetterbox | null {
+    const box = current.viewingLetterbox();
+    return viewing === null || box === null ? null : { box, color: viewing.color };
+  }
+
+  function openAvatarChooser(current: DesktopStore): void {
+    const opened: AvatarChooserState = { designs: null, loadError: null };
+    avatarChooser = opened;
+    // The dialog can be closed (or opened again) while the catalog loads; the answer is only this opening's.
+    void current
+      .fetchAvatarDesigns()
+      .then((designs) => {
+        if (avatarChooser === opened) avatarChooser = { designs, loadError: null };
+      })
+      .catch((error: unknown) => {
+        console.warn("[si] could not list the avatar designs", error);
+        if (avatarChooser === opened) {
+          avatarChooser = { designs: null, loadError: `Could not list the designs: ${(error as Error).message}` };
+        }
+      })
+      .finally(() => m.redraw());
+  }
+
+  function avatarChooserView(current: DesktopStore, chooser: AvatarChooserState): m.Children {
+    const state = current.getState();
+    const target = draftTargetOf(state);
+    return m(AvatarChooserDialog, {
+      designs: chooser.designs,
+      loadError: chooser.loadError,
+      selected: state.avatar.design,
+      onSelect: (design) => void current.selectAvatar(design),
+      onDesignOwn:
+        target === null
+          ? null
+          : () => {
+              avatarChooser = null;
+              void current.draftIntoPinnedWindow(AVATAR_DESIGN_PROMPT, false);
+            },
+      onClose: () => {
+        avatarChooser = null;
+      },
+      onDownloadFailed: (note) => current.toasts.show(note),
+    });
+  }
+
+  function wallpaperDialogView(current: DesktopStore, desktopId: string): m.Children {
+    const desktop = desktopById(current.getState(), desktopId);
+    if (desktop === null) return null;
+    return m(WallpaperChooserDialog, {
+      desktop,
+      wallpapers,
+      onSave: async (wallpaper) => {
+        if (!isSameWallpaper(wallpaper, desktop.wallpaper)) await current.setDesktopWallpaper(desktop.id, wallpaper);
+        wallpaperDialogDesktopId = null;
+      },
+      onCancel: () => {
+        wallpaperDialogDesktopId = null;
+      },
+    });
+  }
+
+  /** Whether the viewer is the workspace's owner, whose alone the gauge's settings are (the warnings notify them). */
+  function isViewerOwner(): boolean {
+    const identity = getOwnIdentity();
+    return identity === null || identity.owner;
+  }
+
+  /** The row that opens the gauge's settings, for the owner once the gauge has arrived; no row otherwise. */
+  function resourceGaugeSettingsRows(key: string, label: string): MenuRow[] {
+    if (!isViewerOwner() || currentResourceGauge() === null) return [];
+    return [
+      {
+        kind: "action",
+        key,
+        label,
+        onSelect: () => {
+          isResourceGaugeDialogOpen = true;
+        },
+      },
+    ];
+  }
+
+  function openSystemMonitorOn(current: DesktopStore, resource: GaugeResource): void {
+    trayCard.close();
+    void current.showAppPage(SYSTEM_MONITOR_APP_NAME, systemMonitorPathOf(resource), SYSTEM_MONITOR_PAGES);
+  }
+
+  function resourceGaugeDialogView(): m.Children {
+    const view = currentResourceGauge();
+    if (view === null) return null;
+    return m(ResourceGaugeDialog, {
+      settings: view.settings,
+      onSave: (settings) => saveResourceGaugeSettings(settings, () => m.redraw()),
+      onClose: () => {
+        isResourceGaugeDialogOpen = false;
+      },
+    });
+  }
+
+  function keyboardShortcutsDialogView(): m.Children {
+    return m(KeyboardShortcutsDialog, {
+      onClose: () => {
+        isKeyboardShortcutsDialogOpen = false;
+      },
+    });
+  }
+
+  function themeDialogView(current: DesktopStore, desktopId: string): m.Children {
+    const desktop = desktopById(current.getState(), desktopId);
+    if (desktop === null) return null;
+    return m(ThemeChooserDialog, {
+      desktop,
+      onSave: async (themeChoice) => {
+        // A theme made the workspace's default is worn by this desktop as the default, not as its own.
+        if (themeChoice.isWorkspaceDefault) await current.setDefaultTheme(themeChoice.theme);
+        const ownTheme = themeChoice.isWorkspaceDefault ? null : themeChoice.theme;
+        if (ownTheme !== desktop.theme) await current.setDesktopTheme(desktop.id, ownTheme);
+        themeDialogDesktopId = null;
+      },
+      onCancel: () => {
+        themeDialogDesktopId = null;
+      },
+      themes: current.isThemeCatalogKnown() ? current.getThemeCatalog() : null,
+      previewApp: appByName(current.getState(), THEME_PREVIEW_APP) ?? null,
+      onMakeTheme:
+        draftTargetOf(current.getState()) === null
+          ? null
+          : () => {
+              themeDialogDesktopId = null;
+              void current.draftIntoPinnedWindow(THEME_DESIGN_PROMPT);
+            },
+      onPreviewTheme: (choice) => current.previewDesktopTheme(desktop.id, choice),
+      isDesktopShown: activeDesktop(current.getState())?.id === desktop.id,
+      onClearPreview: () => current.clearThemePreview(),
+    });
+  }
+
+  function replacedDesktopNotice(current: DesktopStore): m.Children {
+    const replaced = current.getReplacedDesktop();
+    if (replaced === null) return null;
+    return m(ReplacedDesktopNotice, {
+      replacedDesktopName: replaced.replacedName,
+      seededDesktopName: replaced.seededName,
+      onDismiss: () => current.dismissReplacedDesktopNotice(),
+    });
+  }
+
+  function launcherMenu(current: DesktopStore): LauncherMenuRows {
+    return launcherRowsOf(current.getState(), launcherQuery, {
+      ownership: { roster: getRoster(), identity: getOwnIdentity() },
+      isViewing: current.viewedDesktop() !== null,
+    });
+  }
+
+  /** The row Enter runs: where the arrows or a hover left the highlight while that row is still shown and
+   *  enabled, else the default of plan section 3.5. */
+  function launcherHighlightIndex(rows: readonly LauncherRow[]): number {
+    const moved = launcherHighlight;
+    if (moved !== null && moved >= 0 && moved < rows.length && isRowEnabled(rows[moved])) return moved;
+    return defaultHighlightIndex(rows);
+  }
+
+  /** Run a row (plan section 4.3): the menu closes and the field is cleared first, whatever the row does. */
+  function runLauncherRow(current: DesktopStore, row: LauncherRow): void {
+    closeLauncher();
+    launcherQuery = "";
+    launcherHighlight = null;
+    switch (row.kind) {
+      case "launch":
+        void current.runLaunchRow(row.app.name, row.launchPath.id);
+        return;
+      case "window":
+        if (row.desktopId !== current.getState().activeDesktopId) {
+          void current.switchDesktop(row.desktopId).then(() => current.restoreWindow(row.window.id));
+        } else {
+          current.restoreWindow(row.window.id);
+        }
+        return;
+      case "text":
+        void current.runFreeText(row.app.name, row.launchPath.id, row.text);
+        return;
+      case "tour":
+        tour?.start();
+        return;
+    }
+  }
+
+  /** The tour's card or exit badge over the desktop, while one is shown. */
+  function tourCardView(current: DesktopStore, shownTour: TourController): m.Children {
+    if (shownTour.getState().phase === "idle") return null;
+    return m(TourCard, {
+      tour: shownTour,
+      avatarDesign: current.getState().avatar.design,
+      openLink: (url) => void current.openLink(url, window.location.host, SHELL_APP_NAME),
+    });
+  }
+
+  function runHighlightedRow(current: DesktopStore): void {
+    const { rows } = launcherMenu(current);
+    const index = launcherHighlightIndex(rows);
+    if (index >= 0) runLauncherRow(current, rows[index]);
+  }
+
+  function runSecondaryRow(current: DesktopStore): void {
+    const row = secondaryTextRow(launcherMenu(current).rows);
+    if (row !== null) runLauncherRow(current, row);
+  }
+
+  function onWindowControl(current: DesktopStore, windowId: string, control: WindowControl, event: MouseEvent): void {
+    switch (control) {
+      case "minimize":
+        current.minimizeWindow(windowId);
+        return;
+      case "maximize":
+        current.setWindowState(windowId, "MAXIMIZED");
+        return;
+      case "fullscreen":
+        current.toggleFullscreen(windowId);
+        return;
+      case "restore":
+        current.toggleMaximized(windowId);
+        return;
+      case "close":
+        void current.closeOrMinimizeWindow(windowId);
+        return;
+      case "refresh":
+        current.refreshWindow(windowId);
+        return;
+      case "app-chat":
+        void current.openAppChat(windowId);
+        return;
+      case "menu":
+        // A press while this menu is up lands on the menu's own sheet and closes it there, so the
+        // click that reaches the kebab is almost always the opening one; the toggle stands for the
+        // keyboard, which has no press to swallow.
+        if (openMenu?.kind === "window" && openMenu.windowId === windowId) menu.close();
+        else openMenuAt({ kind: "window", windowId }, anchorForEvent(event));
+        return;
+    }
+  }
+
+  /** The element menu over the shell's own chrome (element-reference-menu plan section 6), on the desktop layout
+   *  alone: what a right-click the views do not handle themselves opens, drawn as the desktop's one menu. The phone
+   *  has none, and an install there would still take every right-click and long-press from the browser. The shell
+   *  is no frame's page: its draft route is the store's, and a draft can always go. */
+  function syncElementContextMenu(current: DesktopStore): void {
+    if (current.isPhoneLayout()) {
+      uninstallContextMenu?.();
+      uninstallContextMenu = null;
+      return;
+    }
+    if (uninstallContextMenu !== null) return;
+    uninstallContextMenu = installElementContextMenu({
+      draft: (text) => void current.draftText(text),
+      isDraftAvailable: () => true,
+      // A link of the shell's own chrome opens where a forwarded popup would.
+      openLink: (anchor) => void current.openLink(anchor.href, window.location.host, SHELL_APP_NAME),
+      scope: (target) => shellReferenceScope(current, target.element),
+      open: (rows, point) => {
+        openMenuAt({ kind: "element", rows }, anchorForPoint(point.x, point.y));
+        m.redraw();
+      },
+    });
+  }
+
+  return {
+    oncreate(vnode) {
+      const current = vnode.attrs.store;
+      store = current;
+      document.addEventListener("keydown", onDocumentKeyDown);
+      document.addEventListener("pointerdown", onDocumentPointerDown, true);
+      bindGestures(current, vnode.dom as HTMLElement, vnode.attrs.gestures);
+      syncElementContextMenu(current);
+    },
+    onupdate(vnode) {
+      if (store !== null) bindGestures(store, vnode.dom as HTMLElement, vnode.attrs.gestures);
+      if (store !== null) syncElementContextMenu(store);
+      // The chrome's word on a tear-out arrives between pointer moves (its window has the cursor by then), so
+      // the dragged window is painted here too, hidden or shown as the store now has it. Its word can also end
+      // the gesture, with no release for the pointer source to end it by, so the window it was dragging is
+      // painted once more when the gesture is gone: shown again, its page's torn-out mark lifted.
+      const gesture = store?.getGesture() ?? null;
+      const movingWindowId = gesture !== null && gesture.kind === "move" ? gesture.windowId : null;
+      const windowToPaint = movingWindowId ?? draggedWindowId;
+      if (store !== null && windowToPaint !== null) paintWindow(store, windowToPaint);
+      draggedWindowId = movingWindowId;
+      if (store !== null) pages?.setMountPolicy(mountPolicyOf(store));
+      // The pages lie over the overview's tiles while it is up, at the scale this redraw tiled them at, and step
+      // aside while a deletion is being confirmed over the thumbnails.
+      const tiling = overviewTiling;
+      if (tiling === null) {
+        pages?.setOverview(null);
+      } else {
+        const confirmingDeleteId = store === null ? null : store.getOverviewDeletingId();
+        pages?.setOverview(overviewPresentationOf(tiling.tiles, tiling.grid, confirmingDeleteId));
+      }
+      pages?.reconcile();
+    },
+    onremove() {
+      document.removeEventListener("keydown", onDocumentKeyDown);
+      document.removeEventListener("pointerdown", onDocumentPointerDown, true);
+      // A menu still open here would keep its own window listeners for good.
+      menu.dispose();
+      uninstallContextMenu?.();
+      detachGestures?.();
+      resizeObserver?.disconnect();
+      if (travelFrame !== null) cancelAnimationFrame(travelFrame);
+      trayCard.dispose();
+      stopCardRefresh();
+    },
+    view(vnode) {
+      const current = vnode.attrs.store;
+      store = current;
+      tour = vnode.attrs.tour;
+      const state = current.getState();
+      const soloWindowId = current.getSoloWindowId();
+      if (soloWindowId !== null) {
+        // A pulled-out window's own desktop window: that one window edge to edge, and the banners above it.
+        return m("div", { class: "app-layout flex h-dvh flex-col bg-page" }, [
+          m(UpdateStalenessBanner),
+          m(UpdateNoticeBanner, { store: current }),
+          m(SoloView, {
+            store: current,
+            windowId: soloWindowId,
+            onPagesHostCreated: (host) => {
+              startPagesLayer(current, host, vnode.attrs);
+              // The host is the whole viewport here: the page is laid over it edge to edge, and follows its size.
+              observeBackdropSize(current, host);
+            },
+          }),
+          m(Toasts, { toasts: current.toasts.current(), placementClass: "fixed bottom-(--desk-toast-gap)" }),
+        ]);
+      }
+      if (current.isPhoneLayout()) {
+        return m(PhoneLayout, {
+          store: current,
+          onPagesHostCreated: (host) => {
+            startPagesLayer(current, host, vnode.attrs);
+            // The host shrinks under a soft keyboard and turns with the phone; the shown page follows it.
+            observeBackdropSize(current, host);
+          },
+        });
+      }
+      const desktop: Desktop | null = activeDesktop(state);
+      const placements = activePlacements(state);
+      const focused = activeFocusedWindowId(state);
+      const isLauncherOpen = current.isLauncherOpen();
+      const launcher = launcherMenu(current);
+      // A pinned entry answers the same way in the bar and afloat.
+      const onEntryClick = (windowId: string): void => current.toggleTaskbarEntry(windowId);
+      const onEntryContextMenu = (windowId: string, x: number, y: number, target: Element): void => {
+        openMenuAt(
+          { kind: "entry", windowId, referenceRows: referenceRowsFor(current, target, x, y) },
+          anchorForPoint(x, y),
+        );
+      };
+      const menuRows = openMenu === null ? null : rowsOfOpenMenu(current, openMenu);
+      const roster = getRoster();
+      const now = new Date();
+      const pinnedChat = avatarPinnedEntryOf(state);
+      const openCard = trayCard.current();
+      const viewed = current.viewedDesktop();
+      const viewing = viewingChipAttrs(current, viewed);
+      overviewTiling = desktop !== null && current.isOverviewOpen() ? overviewTilingOf(current) : null;
+      // The wallpaper is painted here rather than on the backdrop so it spans the whole viewport:
+      // the taskbar's translucent surface then has the desktop behind it to blur, and the backdrop
+      // stays the viewport less the taskbar height that the geometry rules measure.
+      const wallpaperStyle =
+        desktop?.wallpaper == null ? {} : { backgroundImage: wallpaperBackgroundImage(desktop.wallpaper) };
       return m(
         "div",
-        // h-screen is the full viewport: inside the minds desktop shell this app renders in a
-        // sandboxed iframe the shell already places below its title bar.
-        { class: "app-layout flex h-screen flex-col" },
+        {
+          ...partAttrs("desktop"),
+          class:
+            "app-layout relative flex h-dvh flex-col bg-(--desk-backdrop) bg-cover bg-center bg-(image:--desk-default-wallpaper)",
+          // A fullscreen window paints over the taskbar's band, which the backdrop otherwise clips (style.css).
+          [FULLSCREEN_WINDOW_ATTRIBUTE]: current.isFullscreenShown() ? "" : undefined,
+          style: wallpaperStyle,
+          "data-viewing": viewed === null ? undefined : viewed.id,
+        },
         [
           m(UpdateStalenessBanner),
-          // min-h-0: a flex item's automatic minimum size is its content's, so without this the
-          // row can grow with the viewport but never shrink back.
-          // pt/pl-1: the canvas runs edge to edge, with the padding as the outermost pane gap (the
-          // left so the rail has a few pixels of canvas to hover into).
-          m("div", { class: "app-main flex min-h-0 flex-1 min-w-80 bg-(--si-canvas) pt-1 pl-1" }, [
-            // Every attr is read straight off the workspace on each draw rather than cached: the
-            // inventory and the projects arrive over the socket as redraws.
-            m(Sidebar, {
-              projects: getAvailableProjects(),
-              activeViewId: getActiveViewId(),
-              rows: getSidebarRows(),
-              onSelectView: (viewId: string) => {
-                void switchToView(viewId);
+          m(UpdateNoticeBanner, { store: current }),
+          m(
+            "div",
+            {
+              [BACKDROP_AREA_ATTRIBUTE]: "",
+              class: "backdrop-area relative min-h-0 flex-1 overflow-hidden",
+              oncreate: (created: m.VnodeDOM) => {
+                backdropArea = created.dom as HTMLElement;
+                observeBackdropSize(current, backdropArea);
+                // The window roots are rendered and re-rendered under here, so the travel is bound
+                // once to the backdrop the events bubble to rather than per window.
+                backdropArea.addEventListener("transitionrun", onWindowTravelStart);
+                backdropArea.addEventListener("transitionend", onWindowTravelEnd);
+                backdropArea.addEventListener("transitioncancel", onWindowTravelEnd);
               },
-              onProjectsChanged: () => {
-                refreshProjects();
+            },
+            [
+              desktop === null
+                ? m(
+                    "div",
+                    { class: "flex h-full items-center justify-center text-(length:--font-size-row) text-faint" },
+                    state.isDesktopsLoaded ? "No desktop yet." : "Loading…",
+                  )
+                : m(Backdrop, {
+                    store: current,
+                    desktop,
+                    placements,
+                    focusedWindowId: focused,
+                    selectedShortcutKey,
+                    openMenuWindowId: openMenu?.kind === "window" ? openMenu.windowId : null,
+                    floatingEntries: floatingEntries(state),
+                    openEntryMenuWindowId: openMenu?.kind === "entry" ? openMenu.windowId : null,
+                    sizeMenuTrigger,
+                    onEntryClick,
+                    onEntryContextMenu,
+                    isOverlayOpen: isShieldingOverlayOpen(),
+                    onSelectShortcut: (key) => {
+                      selectedShortcutKey = key;
+                    },
+                    onRunShortcut: (shortcut) => void current.runShortcut(shortcut),
+                    onShortcutContextMenu: (shortcut, point, target) => {
+                      openMenuAt(
+                        {
+                          kind: "shortcut",
+                          shortcut,
+                          referenceRows: referenceRowsFor(current, target, point.x, point.y),
+                        },
+                        anchorForPoint(point.x, point.y),
+                      );
+                    },
+                    onBackdropContextMenu: (point, target) => {
+                      openMenuAt(
+                        { kind: "backdrop", referenceRows: referenceRowsFor(current, target, point.x, point.y) },
+                        anchorForPoint(point.x, point.y),
+                      );
+                    },
+                    overview: overviewTiling === null ? null : overviewAttrs(current, desktop, overviewTiling),
+                    letterbox: letterboxAttrs(current, viewing),
+                    onWindowControl: (windowId, control, event) => onWindowControl(current, windowId, control, event),
+                    onShowDetachedWindow: (windowId) => current.showDetachedWindow(windowId),
+                    onHideWindowGhost: (windowId) => current.minimizeWindow(windowId),
+                    onBringBackWindow: (windowId) => void current.reattachWindow(windowId, null),
+                    onPagesHostCreated: (host) => startPagesLayer(current, host, vnode.attrs),
+                  }),
+              isLauncherOpen
+                ? m(LauncherMenu, {
+                    menu: launcher,
+                    highlightIndex: launcherHighlightIndex(launcher.rows),
+                    isApplePlatform: isApplePlatform(),
+                    bottomOffsetPx: launcherFieldRise,
+                    onRun: (row) => runLauncherRow(current, row),
+                    onHighlight: (index) => {
+                      launcherHighlight = index;
+                    },
+                    onAppShortcutContextMenu: (app, launch, x, y, target) => {
+                      openMenuAt(
+                        { kind: "app-shortcut", app, launch, referenceRows: referenceRowsFor(current, target, x, y) },
+                        anchorForPoint(x, y),
+                      );
+                    },
+                  })
+                : null,
+            ],
+          ),
+          m(Taskbar, {
+            entries: barEntries(state),
+            openEntryMenuWindowId: openMenu?.kind === "entry" ? openMenu.windowId : null,
+            launcher: {
+              query: launcherQuery,
+              isOpen: isLauncherOpen,
+              onOpen: () => current.openLauncher(),
+              onClose: closeLauncher,
+              onQuery: (query) => {
+                launcherQuery = query;
+                launcherHighlight = null;
               },
-              onProjectCreated: (projectId: string) => {
-                // A new project opens on its New Tab page; what goes in it is the user's call.
-                void switchToView(projectId);
+              onMoveHighlight: (delta) => {
+                const { rows } = launcherMenu(current);
+                launcherHighlight = moveHighlight(rows, launcherHighlightIndex(rows), delta);
               },
-              onRunShortcut: (shortcut: ProjectShortcut) => {
-                runShortcut(shortcut);
+              onRunHighlight: () => runHighlightedRow(current),
+              onRunSecondary: () => runSecondaryRow(current),
+              onRise: (rise) => {
+                launcherFieldRise = rise;
+                // Told from the field's render hooks, where no redraw can run; m.redraw() would wait for the next
+                // frame and paint one with the menu where the field was. A microtask runs once the render is over,
+                // still before the browser paints, so the menu moves in the frame the field did.
+                queueMicrotask(() => m.redraw.sync());
               },
-              onRunShortcutAsNew: (shortcut: ProjectShortcut) => {
-                runShortcutAsNew(shortcut);
+            },
+            overview: {
+              isOpen: current.isOverviewOpen(),
+              onToggle: () => {
+                if (current.isOverviewOpen()) closeOverview();
+                else current.openOverview();
               },
-              onFocusLastOfShortcut: (shortcut: ProjectShortcut) => {
-                focusLastOfShortcut(shortcut);
+            },
+            viewing,
+            tray: {
+              roster,
+              viewer: getOwnParticipant(),
+              now,
+              hopping: current.getHopping(),
+              ringed: current.viewedOwnerKeys(),
+              isShareOffered: current.getIsEmbedderPresent(),
+              avatar: state.avatar,
+              workspaceName: state.workspaceName,
+              isAgentAttending: pinnedChat !== null && pinnedChat.isFocused && !pinnedChat.isMinimized,
+              isAvatarFloating: pinnedChat !== null && isEntryFloating(pinnedChat),
+              onPersonClick: (entry) => {
+                trayCard.close();
+                void current.mentionPerson(entry.handle);
               },
-              onSetShortcutMode: (shortcut: ProjectShortcut, mode: ShortcutMode) => {
-                setShortcutInView(shortcut.app, shortcut.action, mode);
+              onAgentClick: () => {
+                trayCard.close();
+                void current.openAgentChat();
               },
-              onRemoveShortcut: (shortcut: ProjectShortcut) => {
-                removeShortcutFromView(shortcut.app, shortcut.action);
+              onAgentContextMenu: (x, y) => {
+                trayCard.close();
+                openMenuAt({ kind: "element", rows: trayAgentMenuRows(current) }, anchorForPoint(x, y));
               },
-              onPinShortcut: (app: AppRecord, action: AppAction) => {
-                setShortcutInView(app.name, action.id, "focus");
+              onPersonHoverStart: (entry, element) => trayCard.enterEntry({ kind: "person", key: entry.key }, element),
+              onAgentHoverStart: (element) => trayCard.enterEntry({ kind: "agent" }, element),
+              onHoverEnd: trayCard.leaveEntry,
+              resourceGauge: {
+                view: currentResourceGauge(),
+                isStale: isResourceGaugeStale(now.getTime()),
+                onOpen: (resource) => openSystemMonitorOn(current, resource),
+                onContextMenu: (x, y) => {
+                  const rows = resourceGaugeSettingsRows("resource-gauge-settings", "Resource gauge settings...");
+                  if (rows.length === 0) return;
+                  trayCard.close();
+                  openMenuAt({ kind: "element", rows }, anchorForPoint(x, y));
+                },
+                onHoverStart: (element) => trayCard.enterEntry({ kind: "resources" }, element),
+                onHoverEnd: trayCard.leaveEntry,
               },
-              onRunAppAction: (app: AppRecord, action: AppAction) => {
-                runAppAction(app, action.id);
-              },
-              awaitingActionKeys: getAwaitingActionKeys(),
-              onOpenRow: (row: SidebarTabRow) => {
-                openAddress(row.address);
-              },
-              onRefreshRow: (row: SidebarTabRow) => {
-                refreshAddress(row.address);
-              },
-              onRenameRow: (row: SidebarTabRow, title: string) => {
-                renameAddress(row.address, title);
-              },
-              onShareApp: (appName: string) => {
-                shareApp(appName);
-              },
-              onAddRowToProjects: (row: SidebarTabRow) => {
-                addAddressToProjects(row.address);
-              },
-              onRemoveFromView: (row: SidebarTabRow) => {
-                removeAddressFromView(row.address);
-              },
-              onAppLifecycle: (appName: string, action: "stop" | "start") => {
-                requestAppLifecycle(appName, action);
-              },
-              onInstanceLifecycle: (row: SidebarTabRow, action: "stop" | "start") => {
-                requestInstanceLifecycle(row.appName, row.instanceKey, row.label, action);
-              },
-              onDeleteRow: (row: SidebarTabRow) => {
-                deleteAddress(row.address);
-              },
-            }),
-            // ``min-w-0`` so a wide tab strip scrolls inside the workspace instead of pushing
-            // this row wider than the window.
-            m("div", { class: "min-w-0 flex-1" }, m(DockviewWorkspace)),
-          ]),
+            },
+            onEntryClick,
+            onEntryContextMenu,
+          }),
+          m(BubbleLayer, {
+            bubbles: current.getBubbles(),
+            anchorOf: trayEntryRect,
+            rosterEntry,
+            onOpen: (speaker) => current.openBubble(speaker),
+            onDismiss: (speaker) => current.dismissBubble(speaker),
+          }),
+          openCard === null ? null : trayCardView(current, openCard, now),
+          m(Toasts, {
+            toasts: current.toasts.current(),
+            placementClass: "fixed bottom-[calc(var(--desk-taskbar-height)+var(--desk-toast-gap))]",
+          }),
+          menuRows === null ? null : menu.view(menuRows),
+          wallpaperDialogDesktopId === null ? null : wallpaperDialogView(current, wallpaperDialogDesktopId),
+          themeDialogDesktopId === null ? null : themeDialogView(current, themeDialogDesktopId),
+          isKeyboardShortcutsDialogOpen ? keyboardShortcutsDialogView() : null,
+          isResourceGaugeDialogOpen ? resourceGaugeDialogView() : null,
+          replacedDesktopNotice(current),
+          avatarChooser === null ? null : avatarChooserView(current, avatarChooser),
+          tourCardView(current, vnode.attrs.tour),
+          // Viewing somebody else's desktop: their colour all the way round, the taskbar included (the
+          // multiplayer spec, section 8.3); it runs into the chip at the bar's corner.
+          viewing === null || viewed === null
+            ? null
+            : m("div", {
+                "data-viewing-outline": viewed.id,
+                class: "pointer-events-none absolute inset-0 z-(--z-sticky) border-(length:--desk-viewing-outline)",
+                style: { borderColor: viewing.color },
+              }),
         ],
       );
     },

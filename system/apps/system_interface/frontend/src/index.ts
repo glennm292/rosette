@@ -1,36 +1,248 @@
-import { getBasePath } from "@imbue/workspace-ui/src/base-path";
-import { initInventory } from "./models/Inventory";
-import { initEmbedderRelay } from "./relay";
 import m from "mithril";
+import { getClientId } from "@imbue/workspace-ui/src/models/ClientIdentity";
+import { CLOSE_ACTIVE_TAB } from "@minds/embed-contract";
+import {
+  DETACHED_WINDOWS,
+  HIGHLIGHT_CHROME,
+  OPEN_EXTERNAL,
+  OPEN_LINK,
+  POP_OUT_WINDOW,
+  REATTACH_WINDOW,
+  TEAR_OUT,
+  WINDOW_DRAG_ENDED,
+  WINDOW_DRAG_STARTED,
+  announceReadyToEmbedder,
+  sendToEmbedder,
+  setEmbedderMessageHandler,
+  setEmbedderMessageObserver,
+} from "@imbue/workspace-ui/src/embed";
 import "./style.css";
-import { App } from "./views/App";
+import { installCursorHidingWhileTyping } from "@imbue/workspace-ui/src/hideCursorWhileTyping";
+import { PERMISSION_RESOLUTIONS } from "@imbue/workspace-ui/src/embed";
+import { refreshShellKeybindings } from "./model/keybindings";
+import { permissionResolutionEntries } from "./model/permissionResolutions";
+import * as api from "./model/api";
+import { isDeepLinkEmpty, parseDeepLink, stripDeepLinkParams } from "./model/deepLinks";
+import type { DeepLink } from "./model/deepLinks";
+import { connectEmbedderToStore, immersiveBridge } from "./store/embedderBridge";
+import { parseSoloMode } from "./model/soloMode";
+import { isPreviewShell } from "./model/PreviewShell";
+import type { Frame } from "./model/records";
+import { frameFromViewportFractions } from "./geometry/frames";
+import type { OutsideLinkOpener, PopOutBridge } from "./store/DesktopStore";
+import { PointerGestureSource } from "./gestures/pointerGestures";
+import { getOwnIdentity, onOwnIdentityChanged, startPresenceHeartbeat } from "./model/Presence";
+import { TOUR_API, TourController, tourStartDelayFromSearch } from "./model/tour";
+import type { TourAction } from "./model/tourCards";
+import { avatarPinnedWindow } from "./reducers/desktopState";
+import { initEmbedderRelay, setEmbedderAppMessageHandler } from "./relay";
+import { reloadInterface } from "./reload";
+import { DesktopStore } from "./store/DesktopStore";
+import { ShellSocket } from "./store/socket";
+import { wearTheme } from "@imbue/workspace-ui/src/themes/themeClient";
+import { currentRenderModes, followRenderModes, readThemeMetrics } from "./theme/metrics";
+import { afterPageLoad } from "./theme/pageLoad";
+import { App, BACKDROP_AREA_ATTRIBUTE } from "./views/App";
+import { followShownTheme } from "./views/shownTheme";
+import { setIconTheme } from "./views/themeIcons";
 
-function getEffectiveRoutePrefix(): string {
-  // When served through the desktop client proxy, the <base> tag contains
-  // the forwarding prefix (e.g., /forwarding/{agentId}/web/). Use this as
-  // the Mithril route prefix so pushState preserves the correct URL in the
-  // browser history stack (enabling back/forward navigation).
-  const baseEl = document.querySelector("base[href]");
-  if (baseEl) {
-    const href = baseEl.getAttribute("href") ?? "";
-    if (href.includes("/forwarding/")) {
-      return href.replace(/\/+$/, "");
-    }
-  }
-  return getBasePath();
+/** Rewrite the page's URL with its query string put through ``strip``, leaving the path, the hash, and the
+ *  history entry as they are: how a boot-time parameter is removed once it has been read. */
+function stripLocationSearch(strip: (search: string) => string): void {
+  const stripped = `${window.location.pathname}${strip(window.location.search)}${window.location.hash}`;
+  window.history.replaceState(window.history.state, "", stripped);
 }
 
+/** The deep link the page was opened with (contracts.md section 9), removed from the URL as it is read. */
+function takeDeepLinkFromLocation(): DeepLink {
+  const link = parseDeepLink(window.location.search);
+  if (!isDeepLinkEmpty(link)) stripLocationSearch(stripDeepLinkParams);
+  return link;
+}
+
+/** The frame a reattach message names, when it names one: four finite fractions of this page's viewport, which is
+ *  how the chrome measures a drop back onto the desktop, mapped onto the backdrop the desktop's frames are
+ *  fractions of (and clamped by the verb). */
+function frameFromMessage(value: unknown): Frame | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const numbers = ["x", "y", "width", "height"].map((key) => record[key]);
+  if (!numbers.every((number) => typeof number === "number" && Number.isFinite(number))) return null;
+  const [x, y, width, height] = numbers as number[];
+  const frame = { x, y, width, height };
+  const backdrop = document.querySelector<HTMLElement>(`[${BACKDROP_AREA_ATTRIBUTE}]`);
+  if (backdrop === null) return frame;
+  const box = backdrop.getBoundingClientRect();
+  return frameFromViewportFractions(
+    frame,
+    { width: window.innerWidth, height: window.innerHeight },
+    { x: box.x, y: box.y, width: box.width, height: box.height },
+  );
+}
+
+/** The shell's side of the pull-out conversation: every ask goes to the embedding chrome. */
+const popOutBridge: PopOutBridge = {
+  requestPopOut: (request) => sendToEmbedder(POP_OUT_WINDOW, { ...request }),
+  beginWindowDrag: (request) => sendToEmbedder(WINDOW_DRAG_STARTED, { ...request }),
+  endWindowDrag: (windowId, isDetached, isCancelled) =>
+    sendToEmbedder(WINDOW_DRAG_ENDED, { windowId, isDetached, isCancelled }),
+  reportDetachedWindows: (windows) => sendToEmbedder(DETACHED_WINDOWS, { windows: [...windows] }),
+};
+
+/** Where an external link no app takes opens: through the chrome, or in a new tab of the browser this shell is in,
+ *  or, for a custom-scheme link facing an older chrome, in its app of the user's system by navigating this page
+ *  itself, which Electron hands to the app without leaving the page (the page's own ``frame-src`` admits no custom
+ *  scheme, so a hidden frame of it could not launch one). */
+const outsideLinks: OutsideLinkOpener = {
+  openInEmbedder: (url) => sendToEmbedder(OPEN_EXTERNAL, { url }),
+  openInBrowser: (url) => void window.open(url, "_blank", "noopener,noreferrer"),
+  launchInSystemApp: (url) => window.location.assign(url),
+};
+
 function bootstrap(): void {
-  m.route.prefix = getEffectiveRoutePrefix();
-  initInventory();
+  const clientId = getClientId();
+  // Read and left in the URL, unlike the deep link: a reload of a pulled-out window's page must come back as it.
+  const solo = parseSoloMode(window.location.search);
+  const root = document.documentElement;
+  const readStyle = (element: HTMLElement): CSSStyleDeclaration => getComputedStyle(element);
+  let store: DesktopStore | null = null;
+  followRenderModes(
+    root,
+    (query) => window.matchMedia(query),
+    readStyle,
+    (modes, metrics) => {
+      if (store === null) {
+        store = new DesktopStore({
+          clientId,
+          api,
+          socket: new ShellSocket(clientId),
+          metrics,
+          modes,
+          redraw: () => m.redraw(),
+          reloadInterface,
+          popOut: popOutBridge,
+          outsideLinks,
+          immersive: immersiveBridge,
+          soloWindowId: solo?.windowId ?? null,
+          isSoloReopened: solo?.isReopened ?? false,
+        });
+      } else {
+        store.setThemeMetrics(metrics, modes);
+      }
+    },
+  );
+  if (store === null) throw new Error("the render modes never reported");
+  const desktopStore: DesktopStore = store;
+  followShownTheme(desktopStore, {
+    wear: (theme, isRemembered) => wearTheme(theme, document, { isRemembered }),
+    // A theme the boot script put on is already worn, and the page's load event is what waits for its stylesheet.
+    afterLoad: afterPageLoad,
+    takeMetrics: () => {
+      desktopStore.setThemeMetrics(readThemeMetrics(readStyle(root)), currentRenderModes(root));
+      m.redraw();
+    },
+    setIconTheme,
+  });
+  const gestures = new PointerGestureSource();
+  // Say this window is here (and learn who it is) for as long as it stays visible. Until the first answer the
+  // active desktop reads as the viewer's own, so a window that landed on somebody else's re-reads the layout as
+  // the owner's once it knows (the multiplayer spec, section 8.3).
+  onOwnIdentityChanged(() => desktopStore.takeViewerIdentityKnown());
+  startPresenceHeartbeat(clientId);
+  // The pointer hides while text is typed into the shell's own fields (the launcher, the settings);
+  // each framed page does the same for itself.
+  installCursorHidingWhileTyping(document);
   // The child-frame boundary: the minds relay for the framed pages' `minds:` messages, and the
   // shell side of the app contract.
   initEmbedderRelay();
+  setEmbedderMessageHandler(CLOSE_ACTIVE_TAB, () => void desktopStore.closeFocusedWindow());
+  // A permission verdict may answer the keybindings delivery's own request: the backend matches
+  // the entries against the request it filed and retries the unsent saves (spec section 9.3).
+  setEmbedderMessageHandler(PERMISSION_RESOLUTIONS, (message) => {
+    const entries = permissionResolutionEntries(message);
+    if (entries.length > 0) void api.deliverKeybindings(entries).catch(() => undefined);
+  });
+  void refreshShellKeybindings();
+  // A phone's page sleeps while it is out of sight; coming back, the store reads the shell's word again.
+  document.addEventListener("visibilitychange", () =>
+    desktopStore.onVisibilityChange(document.visibilityState === "visible"),
+  );
+  // Every message the chrome sends also goes to the apps registered for its type: the contract's own
+  // types through the endpoint's observer, any other (a notification's destination) through the relay.
+  setEmbedderMessageObserver((message) => void desktopStore.relayEmbedderMessage(message, null));
+  setEmbedderAppMessageHandler((message) => void desktopStore.relayEmbedderMessage(message, null));
+  // What the chrome can do, and its immersive-mode changes; then the pull-out conversation's ask to bring a
+  // window back.
+  connectEmbedderToStore(desktopStore);
+  setEmbedderMessageHandler(REATTACH_WINDOW, (message) => {
+    const windowId = message.windowId;
+    if (typeof windowId !== "string" || windowId === "") return;
+    void desktopStore.reattachWindow(windowId, frameFromMessage(message.frame));
+  });
+  // A popup (or an external page replacing a frame) a page of this workspace asked for, which Imbue Studio turned
+  // away: the store opens it where it belongs.
+  // A preview shell sees it only as the live shell's rebroadcast, and the live shell opens it.
+  setEmbedderMessageHandler(OPEN_LINK, (message) => {
+    if (isPreviewShell()) return;
+    const url = message.url;
+    if (typeof url !== "string" || url === "") return;
+    void desktopStore.openLink(url, window.location.host, null);
+  });
+  setEmbedderMessageHandler(TEAR_OUT, (message) => {
+    const windowId = message.windowId;
+    const phase = message.phase;
+    if (typeof windowId !== "string" || windowId === "") return;
+    if (phase !== "out" && phase !== "in" && phase !== "released") return;
+    desktopStore.setTearOut(windowId, phase);
+  });
+  // The show-around tour: by itself the first time the agent goes to work on a fresh workspace, for the owner
+  // looking at the whole desktop, resumed the same way after the agent's reply interrupted it; from the launcher's
+  // row any time. A card about a chrome control asks the chrome to ring it; the chat card's Next snaps the avatar's
+  // window aside.
+  const runTourAction = (action: TourAction): void => {
+    switch (action) {
+      case "snap-avatar-window-right": {
+        const window = avatarPinnedWindow(desktopStore.getState());
+        if (window !== null) desktopStore.setWindowState(window.id, "SNAPPED_RIGHT");
+        return;
+      }
+    }
+  };
+  const tour = new TourController({
+    api: TOUR_API,
+    highlightChrome: (anchor) => sendToEmbedder(HIGHLIGHT_CHROME, { anchor }),
+    isAutoStartAllowed: () =>
+      !desktopStore.isPhoneLayout() &&
+      desktopStore.getSoloWindowId() === null &&
+      !isPreviewShell() &&
+      (getOwnIdentity()?.owner ?? true),
+    performAction: runTourAction,
+    startAfterWorkingMs: tourStartDelayFromSearch(window.location.search),
+    redraw: () => m.redraw(),
+  });
+  desktopStore.subscribe(() => tour.noteAgentWorking(desktopStore.getState().avatar.status.mood === "working"));
   const rootElement = document.getElementById("app");
   if (rootElement) {
-    const appResolver: m.RouteResolver = { render: () => m(App) };
-    m.route(rootElement, "/", { "/": appResolver });
+    m.mount(rootElement, {
+      view: () =>
+        m(App, {
+          store: desktopStore,
+          gestures,
+          tour,
+          host: window.location.host,
+          protocol: window.location.protocol,
+        }),
+    });
   }
+  const started = desktopStore.start(takeDeepLinkFromLocation());
+  const loaded = Promise.all([started, desktopStore.whenAppsLoaded()]);
+  void loaded.then(() => tour.load());
+  // Announced once the page can act on what the embedder held, not merely once a handler is
+  // registered: relaying a message needs the apps (which of them take it), and the embedder sends
+  // what it held the moment this lands.
+  void loaded.then(() =>
+    announceReadyToEmbedder({ opensLinks: true, opensCustomSchemeLinks: true, reportsChatOnScreen: true }),
+  );
 }
 
 window.addEventListener("load", bootstrap);

@@ -8,7 +8,6 @@ directory, mirroring `main.build_production_state` without ever starting the she
 
 from __future__ import annotations
 
-import json
 import os
 import socket
 import socketserver
@@ -16,29 +15,42 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import xmlrpc.client
-from collections.abc import Iterator
+from collections.abc import Generator
 from collections.abc import Mapping
-from collections.abc import Sequence
 from contextlib import closing
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 from typing import Final
 from xmlrpc.server import SimpleXMLRPCDispatcher
 from xmlrpc.server import SimpleXMLRPCRequestHandler
 
 import simple_websocket
-from app_manifest.registry import registry_path
+from app_manifest.registry_location import registry_path
 from flask import Flask
 from pydantic import Field
+from share_grants.agent_grants import AGENT_LAST_SEEN_FILE
 
+from imbue.imbue_common.frozen_model import FrozenModel
+from imbue.system_interface.app_context import DEFAULT_STATIC_DIRECTORY
 from imbue.system_interface.app_context import SystemInterfaceState
 from imbue.system_interface.config import Config
+from imbue.system_interface.presence import PresenceStore
+from imbue.system_interface.presence import build_presence_sweep
+from imbue.system_interface.presence import utc_now
+from imbue.system_interface.profiles import PROFILES_DIRECTORY_NAME
+from imbue.system_interface.profiles import ProfileResolver
+from imbue.system_interface.roster import RosterSource
+from imbue.system_interface.roster import RosterWatch
+from imbue.system_interface.roster import build_roster_announcer
+from imbue.system_interface.shell.app_lifecycle import IDLE_SWEEP_INTERVAL_SECONDS
+from imbue.system_interface.shell.app_lifecycle import NO_WINDOWS_GRACE_SECONDS
 from imbue.system_interface.shell.inventory import AppInventory
+from imbue.system_interface.shell.launches import LaunchPoster
 from imbue.system_interface.shell.state import build_shell_state
-from imbue.system_interface.template_catalog import TemplateCatalogFetcherInterface
-from imbue.system_interface.template_catalog import build_template_catalog_store
+from imbue.system_interface.workspace_name import workspace_name_source
 from imbue.system_interface.ws_broadcaster import WebSocketBroadcaster
 from imbue.system_interface.wsgi import make_threaded_server
 
@@ -92,6 +104,7 @@ class FakeSupervisorServer:
     def __init__(self, socket_path: Path) -> None:
         self.socket_path = socket_path
         self.statename_by_program: dict[str, str] = {}
+        self.pid_by_program: dict[str, int] = {}
         # Lets tests assert on the sweep's RPC economy (e.g. that a registry
         # with no supervised rows makes no supervisord call at all).
         self.get_all_process_info_call_count = 0
@@ -112,9 +125,12 @@ class FakeSupervisorServer:
     # The dispatch protocol hands every RPC argument over as a marshallable
     # value, so the handlers take ``object`` and stringify -- exactly what the
     # wire delivers.
-    def _get_all_process_info(self) -> list[dict[str, str]]:
+    def _get_all_process_info(self) -> list[dict[str, str | int]]:
         self.get_all_process_info_call_count += 1
-        return [{"name": program, "statename": statename} for program, statename in self.statename_by_program.items()]
+        return [
+            {"name": program, "statename": statename, "pid": self.pid_by_program.get(program, 0)}
+            for program, statename in self.statename_by_program.items()
+        ]
 
     def _start_process(self, name: object, _wait: object) -> bool:
         program = str(name)
@@ -166,84 +182,182 @@ def _fresh_shell_state_directory() -> Path:
     return Path(directory.name)
 
 
-class FakeTemplateCatalogFetcher(TemplateCatalogFetcherInterface):
-    """Answers each catalog URL from a table (None for one not in it) and records every fetch."""
-
-    body_by_url: dict[str, bytes] = Field(default_factory=dict, description="What each URL answers")
-    fetched_urls: list[str] = Field(default_factory=list, description="Every URL fetched, in order")
-
-    def fetch(self, url: str) -> bytes | None:
-        self.fetched_urls.append(url)
-        return self.body_by_url.get(url)
-
-
-def catalog_template_document(slug: str, **overrides: Any) -> dict[str, Any]:
-    """One template as a catalog lists it: the four required fields and a relative drawing, derived
-    from the slug, with ``overrides`` laid over them."""
-    document: dict[str, Any] = {
-        "slug": slug,
-        "title": slug.title(),
-        "description": f"What {slug} does.",
-        "repository_url": f"https://github.com/someone/{slug}",
-        "thumbnail": f"thumbnails/someone--{slug}.svg",
-    }
-    document.update(overrides)
-    return document
-
-
-def catalog_document(
-    *templates: Mapping[str, Any], shelves: Sequence[Mapping[str, Any]] = (), **overrides: Any
-) -> bytes:
-    """A format-1 catalog document as a fetcher answers it, holding ``templates`` and ``shelves``."""
-    document: dict[str, Any] = {
-        "format": 1,
-        "generated_at": "2026-09-07T00:00:00Z",
-        "templates": list(templates),
-        "shelves": list(shelves),
-    }
-    document.update(overrides)
-    return json.dumps(document).encode("utf-8")
-
-
 def build_test_state(
     *,
     config: Config | None = None,
     broadcaster: WebSocketBroadcaster | None = None,
     shell_state_directory: Path | None = None,
     inventory: AppInventory | None = None,
-    template_catalog_fetcher: TemplateCatalogFetcherInterface | None = None,
+    is_preview: bool = False,
+    repo_root: Path | None = None,
+    static_directory: Path | None = None,
+    presence_directory: Path | None = None,
+    agent_events_path: Path | None = None,
+    background_tasks_root: Path | None = None,
+    profiles: ProfileResolver | None = None,
+    wallpaper_files_directory: Path | None = None,
+    launch_poster: LaunchPoster | None = None,
+    is_lifecycle_enabled: bool = False,
+    no_windows_grace_seconds: float = NO_WINDOWS_GRACE_SECONDS,
+    idle_sweep_interval_seconds: float = IDLE_SWEEP_INTERVAL_SECONDS,
+    workspace_environ: Mapping[str, str] | None = None,
 ) -> SystemInterfaceState:
     """Build a `SystemInterfaceState` for tests, injecting fakes where provided.
 
     The shell state is built but never started, so no registry watch or inventory sweep
     runs. ``shell_state_directory`` is where the shell's state files go (a fresh temp
     directory by default); ``inventory`` substitutes an inventory built over a fake fetcher,
-    and ``broadcaster`` the fan-out the inventory and the routes share. The template catalog
-    is disabled (no URL) unless a ``template_catalog_fetcher`` is given, so no test reaches
-    the network for it; with one, the store fetches the config's URL through it.
+    and ``broadcaster`` the fan-out the inventory and the routes share. ``is_preview`` builds
+    the preview shell, which refuses the verbs that would reach the live workspace. ``repo_root`` is
+    where the update notice reads its record and finds the update-self script, and where the
+    workspace's themes are read from (a fresh temp directory by default, so no test reads the
+    real workspace's). ``static_directory`` replaces the
+    package's built bundle directory (the frontend bundle and the bundled wallpapers) with one the
+    test fills itself, and ``wallpaper_files_directory`` the directory the workspace's own wallpaper
+    files are read from (one under the state directory by default). The avatar's catalog lives under
+    the state directory, and its mood is read from ``agent_events_path`` (a file under the state
+    directory by default, absent until a test writes it) and the background task markers under
+    ``background_tasks_root`` (a directory under the state directory by default, so no test reads the real chats').
+    ``presence_directory`` is where the presence files go (a fresh temp directory by default), and ``profiles``
+    the resolver that names and pictures each account (one that can reach no connector by default, so no test
+    fetches anything unless it says so). ``launch_poster`` answers the POST launches the shell would otherwise make
+    over loopback. ``is_lifecycle_enabled`` makes the lifecycle manager own the apps: its sweep runs once the shell
+    is started, and a POST launch wakes a stopped app (off by default, so no test parks a port or starts a
+    program by accident), with the grace period and idle sweep interval given. ``workspace_environ`` is the
+    environment the workspace's name is read from (none by default, so no test reads the machine's mngr records).
     """
     state_directory = shell_state_directory if shell_state_directory is not None else _fresh_shell_state_directory()
+    resolved_presence_directory = (
+        presence_directory if presence_directory is not None else _fresh_shell_state_directory() / "presence"
+    )
     resolved_config = config if config is not None else Config()
+    resolved_broadcaster = broadcaster if broadcaster is not None else WebSocketBroadcaster()
+    resolved_profiles = (
+        profiles
+        if profiles is not None
+        else ProfileResolver(
+            cache_directory=resolved_presence_directory / PROFILES_DIRECTORY_NAME,
+            share_env_path=resolved_presence_directory / "share.env",
+        )
+    )
+    presence = PresenceStore(directory=resolved_presence_directory)
+    resolved_repo_root = repo_root if repo_root is not None else _fresh_shell_state_directory()
     shell = build_shell_state(
         state_directory=state_directory,
         registry_path=registry_path(),
-        broadcaster=broadcaster if broadcaster is not None else WebSocketBroadcaster(),
+        broadcaster=resolved_broadcaster,
         inventory=inventory,
+        wallpaper_files_directory=wallpaper_files_directory
+        if wallpaper_files_directory is not None
+        else state_directory / "wallpapers",
+        avatar_catalog_directory=state_directory / "avatars",
+        agent_events_path=agent_events_path
+        if agent_events_path is not None
+        else state_directory / "agent-events.jsonl",
+        background_tasks_root=background_tasks_root
+        if background_tasks_root is not None
+        else state_directory / "background-tasks",
+        repo_root=resolved_repo_root,
+        profiles=resolved_profiles,
+        launch_poster=launch_poster,
+        is_lifecycle_enabled=is_lifecycle_enabled,
+        no_windows_grace_seconds=no_windows_grace_seconds,
+        idle_sweep_interval_seconds=idle_sweep_interval_seconds,
     )
-    template_catalog = build_template_catalog_store(
-        catalog_url=resolved_config.system_interface_template_catalog_url
-        if template_catalog_fetcher is not None
-        else "",
-        state_directory=state_directory,
-        fetcher=template_catalog_fetcher,
+    resolved_static_directory = static_directory if static_directory is not None else DEFAULT_STATIC_DIRECTORY
+    workspace_name = workspace_name_source(
+        resolved_config.system_interface_workspace_name,
+        workspace_environ if workspace_environ is not None else {},
     )
-    return SystemInterfaceState(config=resolved_config, shell=shell, template_catalog=template_catalog)
+    roster = RosterSource(
+        presence=presence,
+        profiles=resolved_profiles,
+        users=shell.users,
+        share_grants=shell.share_grants,
+        share_identities=shell.share_identities,
+        agent_grants=shell.agent_grants,
+        agent_last_seen_path=resolved_repo_root / AGENT_LAST_SEEN_FILE,
+        workspace_name=workspace_name,
+        avatar_selection=shell.avatar_selection,
+    )
+    roster_announcer = build_roster_announcer(roster, resolved_broadcaster, utc_now)
+    presence_sweep = build_presence_sweep(presence, resolved_profiles, resolved_broadcaster, roster_announcer.announce)
+    resolved_profiles.add_refresh_listener(presence_sweep.announce_connected)
+    return SystemInterfaceState(
+        config=resolved_config,
+        shell=shell,
+        is_preview=is_preview,
+        static_directory=resolved_static_directory,
+        presence=presence,
+        presence_sweep=presence_sweep,
+        profiles=resolved_profiles,
+        roster=roster,
+        roster_announcer=roster_announcer,
+        roster_watch=RosterWatch(watched_paths=(), announce=roster_announcer.announce),
+        workspace_name=workspace_name,
+    )
 
 
-def _find_free_port() -> int:
+# The agent-driven desktop pipeline (``test_layout_pipeline.py``): the two stand-in apps its registry holds
+# (one declaring launch paths), and the one connected client most of its tests target, on the default desktop.
+PIPELINE_SEEDED_APP_NAME: Final[str] = "chat"
+PIPELINE_STUB_APP_NAME: Final[str] = "docs"
+PIPELINE_CLIENT_ID: Final[str] = "client-1"
+PIPELINE_DEFAULT_DESKTOP_ID: Final[str] = "home"
+
+
+class PipelineHarness(FrozenModel):
+    """What one pipeline test gets: the shell's URL, its broadcaster, and the registry file."""
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    base_url: str = Field(description="The shell's loopback URL")
+    broadcaster: WebSocketBroadcaster = Field(description="The shell's broadcaster, for fake clients")
+    registry_path: Path = Field(description="The registry file the shell and the script read")
+
+
+def stand_in_app() -> Flask:
+    """An app that answers every path, so the liveness probe finds it running."""
+    app = Flask("stand-in")
+    app.add_url_rule("/", view_func=lambda: "ok", endpoint="root")
+    app.add_url_rule("/<path:path>", view_func=lambda path: "ok", endpoint="page")
+    return app
+
+
+def find_free_port() -> int:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
+
+
+def can_bind_loopback_port(port: int) -> bool:
+    """Whether nothing listens on the loopback port, probed by a bind rather than a connect: a connect to a port
+    the shell parks is itself the wake."""
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+        return True
+
+
+def send_raw_get_over_socket(port: int) -> bytes:
+    """One GET to the loopback port over a bare socket, read until the server closes: what a parked port answers."""
+    with socket.create_connection(("127.0.0.1", port), timeout=5.0) as connection:
+        connection.sendall(b"GET /some/page HTTP/1.1\r\nHost: docs.localhost\r\n\r\n")
+        return b"".join(iter(lambda: connection.recv(65536), b""))
+
+
+def is_server_answering(base_url: str) -> bool:
+    """Whether the shell at ``base_url`` answers HTTP at all: any response to ``/api/desktops``, an error included."""
+    try:
+        with urllib.request.urlopen(f"{base_url}/api/desktops", timeout=0.5):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except OSError:
+        return False
 
 
 def _wait_until_serving(host: str, port: int, timeout: float = 10.0) -> None:
@@ -275,7 +389,7 @@ class ServedApp:
 
 
 @contextmanager
-def serve_app(app: Flask) -> Iterator[ServedApp]:
+def serve_app(app: Flask) -> Generator[ServedApp, None, None]:
     """Serve ``app`` on an ephemeral loopback port via a real threaded Werkzeug server.
 
     Used by the WebSocket tests, which the Flask test client cannot drive
@@ -283,7 +397,7 @@ def serve_app(app: Flask) -> Iterator[ServedApp]:
     is shut down on exit.
     """
     host = "127.0.0.1"
-    port = _find_free_port()
+    port = find_free_port()
     server = make_threaded_server(host, port, app)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -295,9 +409,23 @@ def serve_app(app: Flask) -> Iterator[ServedApp]:
         thread.join(timeout=5.0)
 
 
+class HandshakeDrainingWebSocketClient(simple_websocket.Client):
+    """A ``simple_websocket`` client that also delivers frames read together with the handshake response.
+
+    ``simple_websocket.Client.handshake`` (1.1.0) stops at the first protocol event, the accept. Frames the
+    server sent right after accepting that arrive in the same socket read stay buffered in the protocol
+    state, and the reader thread only processes buffered events once more bytes arrive, so a server that
+    then goes quiet leaves them unread until ``receive`` times out.
+    """
+
+    def handshake(self) -> None:
+        super().handshake()
+        self.connected = self._handle_events()
+
+
 def open_ws(served: ServedApp, path: str, subprotocols: list[str] | None = None) -> simple_websocket.Client:
     """Open a WebSocket client against a ``ServedApp`` at ``path``."""
-    return simple_websocket.Client(f"{served.ws_url}{path}", subprotocols=subprotocols)
+    return HandshakeDrainingWebSocketClient(f"{served.ws_url}{path}", subprotocols=subprotocols)
 
 
 def close_ws(ws: simple_websocket.Client) -> None:

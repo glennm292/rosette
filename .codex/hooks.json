@@ -1,5 +1,15 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$MNGR_AGENT_WORK_DIR/system/scripts/session_start_sync.sh\""
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "hooks": [
@@ -9,11 +19,19 @@
           },
           {
             "type": "command",
+            "command": "bash \"$MNGR_AGENT_WORK_DIR/system/scripts/agent_block_foreground_sleep.sh\""
+          },
+          {
+            "type": "command",
             "command": "bash \"$MNGR_AGENT_WORK_DIR/system/scripts/agent_prevent_commit_rewrite.sh\""
           },
           {
             "type": "command",
             "command": "bash \"$MNGR_AGENT_WORK_DIR/system/scripts/agent_latchkey_request_standalone.sh\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"$MNGR_AGENT_WORK_DIR/system/scripts/agent_secrets_guard.sh\""
           },
           {
             "type": "command",
@@ -36,6 +54,10 @@
           {
             "type": "command",
             "command": "bash \"$MNGR_AGENT_WORK_DIR/system/scripts/agent_open_tickets_reminder.sh\" --codex"
+          },
+          {
+            "type": "command",
+            "command": "bash \"$MNGR_AGENT_WORK_DIR/system/scripts/agent_resource_notice.sh\" --codex"
           }
         ]
       }

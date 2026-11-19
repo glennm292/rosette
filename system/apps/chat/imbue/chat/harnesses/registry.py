@@ -17,11 +17,15 @@ would mean two places to edit for one harness, which is how the split drifts.
 
 from collections.abc import Callable
 from enum import StrEnum
+from enum import auto
 from pathlib import Path
 from typing import Final
 
 from imbue.chat.agent_discovery import AgentInfo
+from imbue.chat.harnesses.account_binding import AccountBinding
+from imbue.chat.harnesses.account_binding import BindingError
 from imbue.chat.harnesses.activity import HarnessActivityTracker
+from imbue.chat.harnesses.antigravity.account_binding import AntigravityAccountBinding
 from imbue.chat.harnesses.antigravity.activity import AntigravityActivityTracker
 from imbue.chat.harnesses.antigravity.model import ANTIGRAVITY_CATALOG
 from imbue.chat.harnesses.antigravity.model import ANTIGRAVITY_STATE_RELATIVE_PATH
@@ -30,18 +34,23 @@ from imbue.chat.harnesses.antigravity.session import AntigravityHarnessSession
 from imbue.chat.harnesses.antigravity.tap import AntigravityAtomicShoulderTap
 from imbue.chat.harnesses.antigravity.tap import AntigravityInterruptToComposer
 from imbue.chat.harnesses.antigravity.watcher import AntigravitySessionWatcher
+from imbue.chat.harnesses.claude.account_binding import ClaudeAccountBinding
+from imbue.chat.harnesses.claude.activity import CLAUDE_STARTUP_READY_MARKER
 from imbue.chat.harnesses.claude.activity import ClaudeActivityTracker
 from imbue.chat.harnesses.claude.model import CLAUDE_CATALOG
 from imbue.chat.harnesses.claude.model import CLAUDE_STATE_RELATIVE_PATH
 from imbue.chat.harnesses.claude.model import ClaudeModelResolver
+from imbue.chat.harnesses.claude.one_shot import ClaudeOneShotCompletion
 from imbue.chat.harnesses.claude.tap import ClaudeAtomicShoulderTap
 from imbue.chat.harnesses.claude.tap import ClaudeInterruptToComposer
 from imbue.chat.harnesses.claude.watcher import ClaudeSessionWatcher
 from imbue.chat.harnesses.claude.watcher import ClaudeTranscriptLoader
+from imbue.chat.harnesses.codex.account_binding import CodexAccountBinding
 from imbue.chat.harnesses.codex.activity import CodexActivityTracker
 from imbue.chat.harnesses.codex.model import CODEX_CATALOG
 from imbue.chat.harnesses.codex.model import CODEX_STATE_RELATIVE_PATH
 from imbue.chat.harnesses.codex.model import CodexModelResolver
+from imbue.chat.harnesses.codex.one_shot import CodexOneShotCompletion
 from imbue.chat.harnesses.codex.session import CodexHarnessSession
 from imbue.chat.harnesses.codex.watcher import CodexSessionWatcher
 from imbue.chat.harnesses.codex.watcher import CodexTranscriptLoader
@@ -51,8 +60,12 @@ from imbue.chat.harnesses.interrupt import InterruptToComposer
 from imbue.chat.harnesses.interrupt import RestartDrainInterruptToComposer
 from imbue.chat.harnesses.model import HarnessCatalog
 from imbue.chat.harnesses.model import HarnessModelResolver
+from imbue.chat.harnesses.model import ModelOption
 from imbue.chat.harnesses.model import model_state_path
+from imbue.chat.harnesses.one_shot import OneShotCompletion
 from imbue.chat.harnesses.opencode.placeholder import OpenCodePlaceholderActivityTracker
+from imbue.chat.harnesses.pi_coding.account_binding import PiAccountBinding
+from imbue.chat.harnesses.pi_coding.activity import PI_STARTUP_READY_MARKER
 from imbue.chat.harnesses.pi_coding.activity import PiActivityTracker
 from imbue.chat.harnesses.pi_coding.model import PI_STATE_RELATIVE_PATH
 from imbue.chat.harnesses.pi_coding.model import PiAtomicShoulderTap
@@ -64,6 +77,10 @@ from imbue.chat.harnesses.pi_coding.watcher import PiTranscriptLoader
 from imbue.chat.harnesses.placeholder import EMPTY_CATALOG
 from imbue.chat.harnesses.placeholder import PlaceholderModelResolver
 from imbue.chat.harnesses.placeholder import PlaceholderSessionWatcher
+from imbue.chat.harnesses.room.activity import RoomActivityTracker
+from imbue.chat.harnesses.room.session import RoomHarnessSession
+from imbue.chat.harnesses.room.watcher import RoomSessionWatcher
+from imbue.chat.harnesses.room.watcher import RoomTranscriptLoader
 from imbue.chat.harnesses.seed.activity import SeedActivityTracker
 from imbue.chat.harnesses.seed.loader import SeedSessionWatcher
 from imbue.chat.harnesses.session import AgentHarnessSession
@@ -72,6 +89,8 @@ from imbue.chat.harnesses.session import FileHarnessSession
 from imbue.chat.harnesses.session_watcher import AgentSessionWatcher
 from imbue.chat.harnesses.session_watcher import OnEventsCallback
 from imbue.chat.harnesses.session_watcher import TranscriptLoader
+from imbue.chat.harnesses.startup_readiness import StartupReadyMarker
+from imbue.imbue_common.enums import UpperCaseStrEnum
 from imbue.imbue_common.frozen_model import FrozenModel
 
 
@@ -97,6 +116,18 @@ class PopupAction(StrEnum):
     FAST_MODE_LIMIT = "fast_mode_limit"
 
 
+class ComposerCompactHandling(UpperCaseStrEnum):
+    """What the chat does with a ``/compact`` sent from the composer. Backend-only."""
+
+    # Sent as typed, like any other message.
+    SENT_AS_TEXT = auto()
+    # Sent as typed, and the harness runs it as its own compact command (Claude).
+    FORWARDED_TO_HARNESS = auto()
+    # Never sent: the chat asks mngr to compact the agent instead, as the idle sweep does. For a
+    # harness that would otherwise hand the text to the model as prose (Codex, Pi).
+    REQUESTED_FROM_MNGR = auto()
+
+
 class HarnessPopup(FrozenModel):
     """One popup a harness declares for the chat UI.
 
@@ -108,9 +139,12 @@ class HarnessPopup(FrozenModel):
     trigger: PopupTrigger
     commands: tuple[str, ...] = ()
     action: PopupAction
-    # NOTICE only: replaces the notice's default "send it from the agent's terminal"
-    # body. A harness declares WHY a command is declined; the composer stays free of
-    # per-command branching, which is the whole point of shipping these declaratively.
+    # NOTICE: replaces the notice's default "send it from the agent's terminal" body. A
+    # harness declares WHY a command is declined; the composer stays free of per-command
+    # branching, which is the whole point of shipping these declaratively.
+    # FAST_MODE_LIMIT: a line the turn-limit notice adds after its default body, for a
+    # harness with something more to say about running fast (the frontend never branches
+    # on the harness name for it).
     notice_body: str | None = None
 
 
@@ -124,8 +158,8 @@ class HarnessPopup(FrozenModel):
 # the distinct rationale survives: those tuples are measured-against-a-live-agent lists,
 # and a future re-measure would find these three send fine and drop them.
 # Split by whether the harness HAS a fast mode. /model and /effort are universal, but
-# only claude and codex can launch fast (they are the harnesses declaring
-# ``_FAST_MODE_LIMIT_POPUP``), and their catalogs are the only ones carrying
+# only claude and codex can launch fast (they are the harnesses declaring a
+# ``FAST_MODE_LIMIT`` popup), and their catalogs are the only ones carrying
 # ``supports_fast``. Declining /fast on a harness with no fast mode would point the user at
 # a picker control that is not rendered for it -- worse than letting the text through.
 _MODEL_BAR_COMMANDS: Final[tuple[str, ...]] = ("/model", "/effort")
@@ -222,11 +256,10 @@ _CODEX_DECLINED_COMMANDS: Final[tuple[str, ...]] = (
 # Pi slash commands the chat declines to send. pi is driven through its lifecycle
 # extension's inbox rather than by typing into the pane, so these would reach the
 # model as literal prose; the ones that switch or discard a session (/new, /resume,
-# /fork, /clone, /compact, /quit) would also strand the chat's view of the
-# conversation if they ever did run. The notice points them at the terminal.
+# /fork, /clone, /quit) would also strand the chat's view of the conversation if they
+# ever did run. The notice points them at the terminal.
 _PI_DECLINED_COMMANDS: Final[tuple[str, ...]] = (
     "/clone",
-    "/compact",
     "/fork",
     "/llama",
     "/name",
@@ -242,9 +275,16 @@ _PI_DECLINED_COMMANDS: Final[tuple[str, ...]] = (
 # the harness's agent-auth surface instead of sending.
 _AUTH_COMMANDS: Final[tuple[str, ...]] = ("/login", "/logout")
 
-# The fast-mode turn limit, declared by the harnesses that can launch fast.
+# The fast-mode turn limit, declared by the harnesses that can launch fast. Claude Code
+# bills fast mode through the API even on a subscription; codex's fast tier has no such
+# split, so only claude's notice carries the billing line.
 _FAST_MODE_LIMIT_POPUP: Final[HarnessPopup] = HarnessPopup(
     trigger=PopupTrigger.TURN_CHECK, action=PopupAction.FAST_MODE_LIMIT
+)
+_CLAUDE_FAST_MODE_LIMIT_POPUP: Final[HarnessPopup] = HarnessPopup(
+    trigger=PopupTrigger.TURN_CHECK,
+    action=PopupAction.FAST_MODE_LIMIT,
+    notice_body="Fast mode always uses API billing, not subscription usage.",
 )
 
 
@@ -269,7 +309,7 @@ class HarnessSpec(FrozenModel):
     # state dir -- the one per-harness difference the shared live read/watch takes as data.
     # ``Path(".")`` = the state-dir root (claude, pi); codex writes under its CODEX_HOME.
     model_state_relative_path: Path
-    # A factory for the per-harness model catalog, called (once, cached) by ``get_catalog``.
+    # A factory for the per-harness model catalog, called by ``get_catalog``.
     # Behind a factory rather than a value because pi PARSES thousands of models off
     # disk -- too much for import time, and importing this module must not fail on an image
     # where a harness's data is absent. claude/codex just return their hand-written constant.
@@ -280,6 +320,10 @@ class HarnessSpec(FrozenModel):
     # agent that has been discovered but not yet wired up has no tracker to ask -- which
     # silently cost the prioritizer its aging for exactly the agents it most needs to age.
     process_started_marker_filename: str
+    # The marker the harness writes once a freshly launched process accepts input, which is how a
+    # send tells an agent still starting (shown as "Connecting...") from one that is up. None for a
+    # harness that writes none: its sends never read as connecting on this evidence.
+    startup_ready_marker: StartupReadyMarker | None = None
     # The special-event kinds this harness may emit. A parser emitting a kind outside its
     # own declaration is a bug; an empty set is the honest statement that a harness's
     # transcript carries no markers, not an omission.
@@ -297,6 +341,11 @@ class HarnessSpec(FrozenModel):
     # that taps through its live connection (codex) registers none and overrides
     # ``shoulder_tap`` on its session directly.
     shoulder_tap_class: type[AtomicShoulderTap] | None = None
+    # Whether a chat that launches fast turns fast mode on with a model switch once the agent is up,
+    # rather than through the fast create template. Codex does: its agent terminal re-sends any
+    # tier configured at launch whenever it attaches, which would undo a later switch to standard
+    # speed, while a tier set by a switch is kept with the conversation across restarts.
+    is_launch_fast_switched: bool = False
     # The popups this harness declares for the chat UI, shipped on the wire with the
     # catalog. An empty tuple is the honest statement that a harness has none (pi's
     # composer sends everything as-is and it never launches fast).
@@ -308,6 +357,33 @@ class HarnessSpec(FrozenModel):
     # to deliver blind. Declared here rather than imported from a harness module, so the
     # endpoints stay harness-neutral.
     cancel_chord: str = "M-q"
+    # How the harness's agents are bound to a signed-in account (the scope, the create's arguments,
+    # the rebind's edit, the sessions a rebind carries along). None for a harness no account can run:
+    # no lane signs in to it, so nothing binds one.
+    binding_class: type[AccountBinding] | None = None
+    # How the chat app asks this harness one question on a chat's account, outside the chat (a new
+    # chat's name). None for a harness that cannot yet: its chats keep the name they were minted with.
+    one_shot_completion_class: type[OneShotCompletion] | None = None
+    # Whether mngr can compact this harness's context (the autocompact plugin's request), which is
+    # what makes the chat's idle compaction setting meaningful for it. Shipped on the catalog.
+    supports_compaction: bool = False
+    # Whether the harness's interrupt (the stop button) cancels a compaction in progress. Where it
+    # does not, the page hides the stop button while the chat is compacting. Shipped on the catalog.
+    can_interrupt_compaction: bool = False
+    # What a /compact sent from the composer does; unless it is sent as text, the chat shows the
+    # compaction it starts.
+    composer_compact_handling: ComposerCompactHandling = ComposerCompactHandling.SENT_AS_TEXT
+    # Whether the harness is told a non-owner's author by the ``[from: <name>] `` prefix on the delivered text
+    # (the multiplayer spec, section 5.3). A room records the author structurally, so its messages carry none.
+    is_author_prefixed: bool = True
+    # Whether a send starts a stopped agent: mngr's send auto-starts a stopped file-session agent, and the codex
+    # session revives one itself. A room's send appends to its transcript and starts nothing, so a stopped room
+    # stays stopped until ``mngr message``, the start verb, or boot (the multiplayer spec, section 11).
+    is_revived_by_send: bool = True
+    # Whether a message the harness took can be lost with its process: mngr counts a message as delivered
+    # once the harness shows it, which can be before the harness writes it down (claude, while its startup
+    # hooks run). The chat sends such a message again when the process exits before the transcript holds it.
+    resends_sends_lost_with_process: bool = False
 
 
 HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
@@ -317,6 +393,9 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
         loader_class=ClaudeTranscriptLoader,
         tracker_class=ClaudeActivityTracker,
         process_started_marker_filename=ClaudeActivityTracker.marker_filename,
+        startup_ready_marker=CLAUDE_STARTUP_READY_MARKER,
+        binding_class=ClaudeAccountBinding,
+        one_shot_completion_class=ClaudeOneShotCompletion,
         resolver_class=ClaudeModelResolver,
         catalog_factory=lambda: CLAUDE_CATALOG,
         model_state_relative_path=CLAUDE_STATE_RELATIVE_PATH,
@@ -334,8 +413,14 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
                 trigger=PopupTrigger.COMPOSER_COMMAND, commands=_CLAUDE_DECLINED_COMMANDS, action=PopupAction.NOTICE
             ),
             _MODEL_BAR_POPUP_WITH_FAST,
-            _FAST_MODE_LIMIT_POPUP,
+            _CLAUDE_FAST_MODE_LIMIT_POPUP,
         ),
+        supports_compaction=True,
+        # The stop button presses the cancel chord (M-q, ``chat:cancel``: the action Escape takes in
+        # the Chat context) even with no turn in flight, which cancels a compaction.
+        can_interrupt_compaction=True,
+        composer_compact_handling=ComposerCompactHandling.FORWARDED_TO_HARNESS,
+        resends_sends_lost_with_process=True,
     ),
     HarnessType.CODEX: HarnessSpec(
         name=HarnessType.CODEX,
@@ -349,6 +434,8 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
         # queue/message-lifecycle authority; it does not drive the dot.)
         tracker_class=CodexActivityTracker,
         process_started_marker_filename=CodexActivityTracker.marker_filename,
+        binding_class=CodexAccountBinding,
+        one_shot_completion_class=CodexOneShotCompletion,
         resolver_class=CodexModelResolver,
         catalog_factory=lambda: CODEX_CATALOG,
         model_state_relative_path=CODEX_STATE_RELATIVE_PATH,
@@ -363,6 +450,7 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
         # ``turn/interrupt`` + a per-id settle / the combined early resend), so the registered
         # interrupter default is inert and no shoulder_tap_class is needed.
         session_class=CodexHarnessSession,
+        is_launch_fast_switched=True,
         popups=(
             HarnessPopup(trigger=PopupTrigger.COMPOSER_COMMAND, commands=_AUTH_COMMANDS, action=PopupAction.OPEN_AUTH),
             HarnessPopup(
@@ -371,6 +459,9 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
             _MODEL_BAR_POPUP_WITH_FAST,
             _FAST_MODE_LIMIT_POPUP,
         ),
+        supports_compaction=True,
+        can_interrupt_compaction=False,
+        composer_compact_handling=ComposerCompactHandling.REQUESTED_FROM_MNGR,
     ),
     HarnessType.PI_CODING: HarnessSpec(
         name=HarnessType.PI_CODING,
@@ -381,6 +472,8 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
         loader_class=PiTranscriptLoader,
         tracker_class=PiActivityTracker,
         process_started_marker_filename=PiActivityTracker.marker_filename,
+        startup_ready_marker=PI_STARTUP_READY_MARKER,
+        binding_class=PiAccountBinding,
         resolver_class=PiModelResolver,
         catalog_factory=get_pi_catalog,
         model_state_relative_path=PI_STATE_RELATIVE_PATH,
@@ -396,6 +489,9 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
             ),
             _MODEL_BAR_POPUP,
         ),
+        supports_compaction=True,
+        can_interrupt_compaction=False,
+        composer_compact_handling=ComposerCompactHandling.REQUESTED_FROM_MNGR,
     ),
     # opencode is LAUNCH-ONLY: its mngr plugin can create and run an agent, but it has no
     # transcript watcher, activity tracker, model resolver or catalog of its own. It is
@@ -430,9 +526,10 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
         loader_class=AntigravitySessionWatcher,
         tracker_class=AntigravityActivityTracker,
         process_started_marker_filename=AntigravityActivityTracker.marker_filename,
-        # Display-only model bar: agy's `/model` is an interactive TUI picker with no
-        # scriptable one-shot form, so the bar reflects and never drives. The session subclass
-        # exists only to absorb catalog staleness -- see its switch_options.
+        binding_class=AntigravityAccountBinding,
+        # A pick is held for the flush worker, which types agy's `/model` between turns (see
+        # antigravity/model.py). The session subclass also absorbs catalog staleness -- see
+        # its switch_options.
         resolver_class=AntigravityModelResolver,
         catalog_factory=lambda: ANTIGRAVITY_CATALOG,
         session_class=AntigravityHarnessSession,
@@ -459,8 +556,8 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
         # No `/login` popup, unlike codex and pi: agy has no such command. Signing in is what
         # a bare `agy` does on first launch, which is what the instructions below say.
     ),
-    # The seed segment of a chat the Mind app opened (``chat_seed.py``): turns the app wrote
-    # before the workspace had any agent, read like an archived segment. No agent ever runs
+    # The seed segment of a seeded chat (``chat_seed.py``): turns written before any agent joined
+    # it, read like an archived segment. No agent ever runs
     # on it, so every live part is inert: the watcher watches nothing, the tracker reads
     # idle, the resolver switches nothing, and there is no catalog and no popup.
     HarnessType.SEED: HarnessSpec(
@@ -473,6 +570,22 @@ HARNESS_SPECS: Final[dict[HarnessType, HarnessSpec]] = {
         catalog_factory=lambda: EMPTY_CATALOG,
         model_state_relative_path=Path("."),
         special_kinds=frozenset(),
+    ),
+    # A chat room (the multiplayer spec, section 7.3): the agent's process is a reader of its pane, so there is
+    # no model, no turn, and no account; the transcript is the room's own file, which a send appends to.
+    HarnessType.ROOM: HarnessSpec(
+        name=HarnessType.ROOM,
+        watcher_class=RoomSessionWatcher,
+        loader_class=RoomTranscriptLoader,
+        tracker_class=RoomActivityTracker,
+        process_started_marker_filename=RoomActivityTracker.marker_filename,
+        resolver_class=PlaceholderModelResolver,
+        catalog_factory=lambda: EMPTY_CATALOG,
+        model_state_relative_path=Path("."),
+        special_kinds=frozenset(),
+        session_class=RoomHarnessSession,
+        is_author_prefixed=False,
+        is_revived_by_send=False,
     ),
 }
 
@@ -504,9 +617,32 @@ def build_shoulder_tap(agent_info: AgentInfo) -> AtomicShoulderTap | None:
     return tap_class.build(agent_info) if tap_class is not None else None
 
 
+def build_account_binding(harness: HarnessType) -> AccountBinding:
+    """Build the account binding for ``harness``. Raises ``BindingError`` for a harness no account can be bound to."""
+    binding_class = get_harness_spec(harness).binding_class
+    if binding_class is None:
+        raise BindingError(f"{harness} has no account binding")
+    return binding_class()
+
+
+def build_one_shot_completion(harness: HarnessType) -> OneShotCompletion | None:
+    """Build the one-shot completion for ``harness``, or None when the harness registers none."""
+    completion_class = get_harness_spec(harness).one_shot_completion_class
+    return completion_class() if completion_class is not None else None
+
+
 def build_resolver(agent_info: AgentInfo) -> HarnessModelResolver:
     """Build the model resolver for ``agent_info``'s harness."""
     return get_harness_spec(agent_info.harness).resolver_class.build(agent_info)
+
+
+def list_account_options(harness: HarnessType, account_dir: Path) -> tuple[ModelOption, ...] | None:
+    """The models the account at ``account_dir`` offers for ``harness``, or None to offer its whole catalog.
+
+    Asks the resolver CLASS, not an instance: the question is about an account, which has no agent
+    to build one from (and may never have had one).
+    """
+    return get_harness_spec(harness).resolver_class.list_account_options(account_dir)
 
 
 def build_interrupt_to_composer(agent_info: AgentInfo) -> InterruptToComposer:
@@ -524,19 +660,6 @@ def get_model_state_path(harness: HarnessType, agent_state_dir: Path) -> Path:
     return model_state_path(agent_state_dir, get_harness_spec(harness).model_state_relative_path)
 
 
-# Built once per process from each harness's factory. The parsed catalogs (pi)
-# read data files that ship in the image, so a non-empty catalog is immutable for the
-# container's life and cached unconditionally; an empty one (harness data absent) is NOT
-# cached, so a later call retries rather than freezing the blank.
-_CATALOG_CACHE: dict[HarnessType, HarnessCatalog] = {}
-
-
 def get_catalog(harness: HarnessType) -> HarnessCatalog:
-    """The model catalog for ``harness``, built via its factory and cached when non-empty."""
-    cached = _CATALOG_CACHE.get(harness)
-    if cached is not None:
-        return cached
-    catalog = get_harness_spec(harness).catalog_factory()
-    if catalog.options:
-        _CATALOG_CACHE[harness] = catalog
-    return catalog
+    """The model catalog for ``harness``, from its factory (pi's factory caches the catalogs it parses)."""
+    return get_harness_spec(harness).catalog_factory()

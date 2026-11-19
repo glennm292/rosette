@@ -12,15 +12,50 @@ import {
   waitForComposerUploads,
 } from "../models/ComposerAttachments";
 import type { ComposerAttachment } from "../models/ComposerAttachments";
+import { matchesKeybinding } from "../models/keybindings";
 import { buildMessageWithAttachments, formatFileSize } from "../models/attachments";
-import { drainToComposer, getEventsForChat, interruptAgent, mintMessageId, sendMessage } from "../models/Response";
+import { stageElementReferences } from "../models/elementReferences";
+import {
+  drainToComposer,
+  getEventsForChat,
+  hasUserTurnLandedSince,
+  interruptAgent,
+  mintMessageId,
+  sendMessage,
+  sentUserTurnIds,
+} from "../models/Response";
 import { cancelHandoff, switchChat } from "../models/Handoffs";
-import { getPendingPick, pendingSwitchTarget, setPendingAccount, switchKind } from "../models/PendingLane";
+import { addModelChoiceFailureListener } from "../models/ModelSettings";
+import {
+  getPendingPick,
+  isSwitchSending,
+  nextSendSwitchTarget,
+  setPendingAccount,
+  setSwitchSending,
+} from "../models/PendingLane";
 import type { ProviderAccount } from "../models/Providers";
-import { openSwitchDialog } from "./SwitchDialog";
-import { addOutgoing, clearOutgoing, dropOutgoing, getOutgoingMessages } from "../models/OutgoingMessages";
-import { describeRequestError, describeRequestErrorKind } from "@imbue/workspace-ui/src/models/request-error";
-import { getSelectedAccount, openProviderChooser } from "../models/Providers";
+import { beginSwitchToAccountId, launchAwaitingChatAsRoom, openSwitchDialog } from "./SwitchDialog";
+import {
+  addOutgoing,
+  clearOutgoing,
+  dropOutgoing,
+  dropOutgoingNoTurnWillRetire,
+  getOutgoingMessages,
+} from "../models/OutgoingMessages";
+import {
+  describeRequestError,
+  describeRequestErrorKind,
+  isUnansweredRequest,
+} from "@imbue/workspace-ui/src/models/request-error";
+import {
+  accountForFirstSend,
+  areAccountsLoaded,
+  isAccountSignedOut,
+  loadAccounts,
+  openProviderChooser,
+  whenAccountsReadyToChoose,
+} from "../models/Providers";
+import type { ProvisionalChat } from "../models/Chats";
 import {
   ensureHarnessCatalogs,
   findComposerPopup,
@@ -31,18 +66,45 @@ import { chooseFastMode, parseFastModeCommand } from "./fast-mode-limit";
 import {
   getChatById,
   getProvisionalChat,
+  refuseSendToFailedChat,
   isHandoffCancellable,
+  isLaunchInFlight,
+  isRoomChat,
   launchChat,
   whenChatRegistered,
 } from "../models/Chats";
-import { isWorkingActivityState } from "./ActivityIndicator";
+import { COMPACTING_STATE, isWorkingActivityState } from "../models/activityState";
+import { isChatConnecting } from "./ConnectingIndicator";
+import { isAgentProcessDead } from "./agentLiveness";
+import { apiUrl, getBasePath } from "@imbue/workspace-ui/src/base-path";
 import { harnessLabel } from "./harness-labels";
 import { handoffComposerPlaceholder } from "./handoff-phase";
 import { hoverTooltipAttrs } from "@imbue/workspace-ui/src/components/hoverTooltip";
-import { icon, stopIcon } from "@imbue/workspace-ui/src/components/icons";
+import { ensureMentionHandles, matchingHandles } from "../models/Mentions";
+import type { MentionHandle } from "../models/Mentions";
+import { MENTION_ROW_CAP, insertMention, mentionDraftAt, mentionPopover } from "./MentionPopover";
+import type { MentionDraft } from "./MentionPopover";
+import { icon, spinnerIcon, stopIcon } from "@imbue/workspace-ui/src/components/icons";
 import { Button } from "@imbue/workspace-ui/src/components/Button";
+import { appPartAttrs } from "@imbue/workspace-ui/src/themes/parts";
+import { ATTACHMENT_CHIP_HEIGHT_CLASS, AttachmentStrip } from "./AttachmentStrip";
+import { keydownMatchesChords } from "@imbue/workspace-ui/src/keybindings";
+import { createDictation } from "@imbue/workspace-voice/src/dictation";
+import type { Dictation, DictationProblem, DictationState } from "@imbue/workspace-voice/src/dictation";
+import { appendFinal, clearTentative, openSpan, renderSpan, setTentative } from "@imbue/workspace-voice/src/liveSpan";
+import type { LiveSpan } from "@imbue/workspace-voice/src/liveSpan";
+import {
+  describeHost,
+  dictationShortcutChord,
+  dictationShortcutLabel,
+  isApplePlatform,
+  isDictationSupported,
+  pageDictationOptions,
+} from "@imbue/workspace-voice/src/support";
+import { DictationButton, dictationNotice, dictationProgressPercent } from "./DictationButton";
+import type { DictationProgress } from "./DictationButton";
 
-const MAX_TEXTAREA_HEIGHT_PX = 200;
+export const MAX_TEXTAREA_HEIGHT_PX = 240;
 
 /* Styling.
  * Utilities in the markup; the message-input and composer-attachment class
@@ -50,23 +112,67 @@ const MAX_TEXTAREA_HEIGHT_PX = 200;
  * by them). Attachment status looks are resolved in code, one utility per
  * property. */
 
-/** The composer card. The two-layer shadows are design-system-exceptions: a
- *  unique upward-cast composer shadow (negative y, Notion-charcoal base) with
- *  an accent-tinted glow on focus, which no elevation-scale value expresses;
- *  the border/shadow transition runs its two properties at different speeds,
- *  hence the arbitrary transition property. */
+/** The composer card. No shadow: it sits at the foot of its own pane
+ *  rather than floating over the transcript. Focus thickens its border to 2px
+ *  in the accent, taking the extra pixel out of the padding so nothing moves.
+ *  Its corners are concentric with the buttons and chips inside: their 6px
+ *  radius plus the padding and the border. */
 const INPUT_BOX_CLASS =
-  "message-input-box flex flex-col rounded-xl border bg-composer " +
-  "shadow-[0_-4px_20px_rgba(55,53,47,0.06),0_-1px_6px_rgba(55,53,47,0.04)] " +
-  "[transition:border-color_150ms,box-shadow_var(--dur-slow)] focus-within:border-accent " +
-  "focus-within:shadow-[0_-4px_24px_rgba(47,107,79,0.08),0_-1px_8px_rgba(47,107,79,0.06)]";
+  "message-input-box flex flex-col gap-0.5 rounded-[13px] border bg-composer p-1.5 " +
+  "[transition:border-color_150ms] focus-within:border-2 focus-within:border-accent focus-within:p-[5px]";
 
-const ATTACHMENT_DETAIL_BASE = "composer-attachment-detail text-(length:--font-size-helper)";
+/** The text and its buttons: paperclip | text | toolbar. ``fitComposer`` sets ``data-stacked`` on the row once
+ *  the text needs a second line or there are attachments (``data-attachments``); the text then takes the full
+ *  width, with the paperclip and the toolbar on a row under it, and any attachments on a row between the two. */
+const MESSAGE_ROW_CLASS =
+  "message-input-row group/row grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-0.5 " +
+  "data-[stacked]:gap-y-0.5";
+
+const ATTACH_BUTTON_CLASS =
+  "message-input-attach-button col-start-1 row-start-1 shrink-0 group-data-[stacked]/row:row-start-2 " +
+  "group-data-[attachments]/row:row-start-3!";
+
+const TOOLBAR_CLASS =
+  "message-input-toolbar col-start-3 row-start-1 flex shrink-0 items-center gap-1 justify-self-end " +
+  "group-data-[stacked]/row:row-start-2 group-data-[attachments]/row:row-start-3!";
+
+const ATTACHMENT_DETAIL_CLASS = "composer-attachment-detail truncate text-[11px] leading-[1.3]";
 
 const MESSAGE_TEXT_KEY_PREFIX = "message-text:";
+const COMPOSER_HINT_KEY_PREFIX = "composer-hint:";
+
+// The kind of the server's refusal of a send to a chat whose account was signed out.
+const ACCOUNT_SIGNED_OUT_SEND_FAILURE_KIND = "account_signed_out";
+// The kinds of the server's refusal of a /compact it declines to run: before the agent has anything
+// to compact, and while it is busy or stopped.
+const DECLINED_COMPACT_SEND_FAILURE_KINDS: ReadonlySet<unknown> = new Set([
+  "nothing_to_compact",
+  "compact_unavailable",
+]);
+
+// A NUL character cannot be typed into a terminal, so an agent that takes its input as keystrokes
+// refuses the whole message over one. A textarea does not show NULs anyway (they arrive by pasting
+// binary content), so dropping them sends exactly what the user saw.
+function withoutNulCharacters(draft: string): string {
+  return draft.split("\0").join("");
+}
+
+function sendFailureKind(sendError: unknown): unknown {
+  return (sendError as { response?: { kind?: unknown } | null } | null)?.response?.kind;
+}
+
+/** The kind the notice handles a failed send as. A send that got no answer may have been delivered
+ *  before its answer was lost, so it is handled as one mngr could not confirm. */
+function noticeKindOf(sendError: unknown): SendFailureKind {
+  return isUnansweredRequest(sendError) ? "submission_unconfirmed" : describeRequestErrorKind(sendError);
+}
 
 function messageTextKey(chatId: string): string {
   return `${MESSAGE_TEXT_KEY_PREFIX}${chatId}`;
+}
+
+function composerHintKey(chatId: string): string {
+  return `${COMPOSER_HINT_KEY_PREFIX}${chatId}`;
 }
 
 // Blocks handed back to the composer from OUTSIDE this component (a native shoulder tap whose combined
@@ -76,6 +182,31 @@ function messageTextKey(chatId: string): string {
 // merge-not-drop rule Stop's drain-to-composer uses. Persisted to localStorage regardless, so the text
 // survives even if the composer is not currently mounted -- never swallowed (contract A1a).
 const pendingComposerPrepends = new Map<string, string>();
+
+// What the failure notice says about a send, in place of mngr's reason, which is written for its own
+// command line. "unknown" keeps that reason: it is the only account of what went wrong.
+const SEND_FAILURE_SENTENCES: Partial<Record<SendFailureKind, string>> = {
+  input_blocked: "The agent is waiting on something in its terminal. Answer it there and try again.",
+  agent_unreachable: "The agent isn't running and didn't start.",
+  not_ready: "The agent isn't ready for messages yet. Try again in a moment.",
+  state_unknown: "Couldn't reach the agent just now. Try again in a moment.",
+  agent_not_found: "Couldn't find the agent. Try again in a moment.",
+  not_submitted: "The agent didn't take your message. Try again.",
+};
+
+// Added to the sentence above only when the notice offers Restart.
+const SEND_FAILURE_RESTART_SENTENCES: Partial<Record<SendFailureKind, string>> = {
+  input_blocked: "Or restart the agent.",
+  agent_unreachable: "Restart it to send your message.",
+};
+
+// The hint a chat's composer shows as its placeholder until its next send (the multiplayer spec, section 9.2:
+// "How do you want to change <app>?"), by chat; set from outside the component, as the prepends are, and taken
+// up on the composer's next view pass, which also focuses it once. Persisted to localStorage as the prepends
+// are: the chat root sets it from its own document, and the page's composer (another document, with a map of
+// its own) reads it from there when it mounts.
+const composerHints = new Map<string, string>();
+const pendingComposerFocuses = new Set<string>();
 
 /** A failure raised from OUTSIDE this component, waiting for the composer to show it. */
 interface PendingFailureNotice {
@@ -169,22 +300,93 @@ function restoreToComposer(chatId: string, text: string, attachments: readonly C
   ]);
 }
 
-/** Hand ``block`` back to ``chatId``'s composer (prepended above any draft), from a sibling view. */
+/** Show ``hint`` as ``chatId``'s composer placeholder until its next send, and focus the composer: what the chat
+ *  root hands a page when an intake carried a hint (a window's "Chat about this app"), from the page's own document
+ *  when it is loaded, else from the root's, where only the persisted hint reaches the page. */
+export function setComposerHint(chatId: string, hint: string): void {
+  if (!hint) {
+    return;
+  }
+  localStorage.setItem(composerHintKey(chatId), hint);
+  composerHints.set(chatId, hint);
+  pendingComposerFocuses.add(chatId);
+  m.redraw();
+}
+
+function clearComposerHint(chatId: string): void {
+  composerHints.delete(chatId);
+  localStorage.removeItem(composerHintKey(chatId));
+}
+
+/** Hand ``block`` back to ``chatId``'s composer (prepended above any draft), from a sibling view or from outside
+ *  the page. An element reference in it is attached as a file first, and only the prompt naming it goes in the
+ *  text (``stageElementReferences``). */
+// The page's composer box while it is mounted (a page has one), for the chat root to hand it the keyboard.
+let mountedComposerTextarea: HTMLTextAreaElement | null = null;
+
+/** Put the keyboard in the page's composer; false when there is none to take it (not mounted, or disabled). */
+export function focusComposer(): boolean {
+  if (mountedComposerTextarea === null || mountedComposerTextarea.disabled) {
+    return false;
+  }
+  mountedComposerTextarea.focus();
+  return true;
+}
+
 export function prependToComposer(chatId: string, block: string): void {
   if (!block) {
     return;
   }
   const existingDraft = localStorage.getItem(messageTextKey(chatId)) ?? "";
-  const merged = existingDraft.trim().length === 0 ? block : `${block}\n\n${existingDraft}`;
+  // The block already leads the draft (the app-chat button pressed again while its lead-in sits unsent):
+  // prepending it once more would stack identical copies. Checked before staging, which attaches files.
+  if (existingDraft.startsWith(block)) {
+    return;
+  }
+  const text = stageElementReferences(chatId, block);
+  if (!text) {
+    return;
+  }
+  const merged = existingDraft.trim().length === 0 ? text : `${text}\n\n${existingDraft}`;
   localStorage.setItem(messageTextKey(chatId), merged);
   pendingComposerPrepends.set(chatId, merged);
   m.redraw();
 }
 
-function autoResizeTextarea(textarea: HTMLTextAreaElement): void {
+/** Lay the composer out for its text: the buttons beside a message that fits on one line, or in a
+ *  row under a longer one, so the text gets the full width. A row holding attachments
+ *  (``data-attachments``) is always stacked, whatever the text's length. Wrapping is measured with the buttons
+ *  beside the text whichever layout is showing, so the stacked layout's extra width cannot unwrap
+ *  the text and flip it back.
+ *
+ *  The row holds its height while the text is measured collapsed to one line. Otherwise the page
+ *  lays out around a one-line composer for that moment, and the browser clamps the transcript's
+ *  scroll position to fit it: a tall composer would pull the transcript off its bottom on every
+ *  redraw.
+ *
+ *  Once the text outgrows the cap the textarea scrolls. It keeps its scroll position across the
+ *  collapse, which not every browser preserves. Typing (``isTyping``) with the caret at the end of the
+ *  draft scrolls it all the way down instead, since the browser scrolls the caret into view without
+ *  the padding under the last line. */
+function fitComposer(row: HTMLElement, textarea: HTMLTextAreaElement, isTyping: boolean): void {
+  const scrollTopPx = textarea.scrollTop;
+  const isTypingAtEnd = isTyping && textarea.selectionEnd === textarea.value.length;
+  row.style.height = `${row.getBoundingClientRect().height}px`;
+  row.removeAttribute("data-stacked");
+  textarea.style.overflowY = "hidden";
   textarea.style.height = "auto";
+  row.toggleAttribute(
+    "data-stacked",
+    row.hasAttribute("data-attachments") || textarea.scrollHeight > textarea.clientHeight,
+  );
   textarea.style.height = `${Math.min(textarea.scrollHeight, MAX_TEXTAREA_HEIGHT_PX)}px`;
-  textarea.style.overflowY = textarea.scrollHeight > MAX_TEXTAREA_HEIGHT_PX ? "auto" : "hidden";
+  const isOverflowing = textarea.scrollHeight > MAX_TEXTAREA_HEIGHT_PX;
+  textarea.style.overflowY = isOverflowing ? "auto" : "hidden";
+  const targetScrollTopPx =
+    isOverflowing && isTypingAtEnd ? textarea.scrollHeight - textarea.clientHeight : scrollTopPx;
+  // Writing scrollTop is a programmatic scroll, which would interrupt the reader scrolling the draft mid-gesture.
+  if (textarea.scrollTop !== targetScrollTopPx) textarea.scrollTop = targetScrollTopPx;
+  row.style.height = "";
 }
 
 function imageFilesFromClipboard(clipboardData: DataTransfer | null): File[] {
@@ -203,23 +405,145 @@ function imageFilesFromClipboard(clipboardData: DataTransfer | null): File[] {
   return files;
 }
 
-export function MessageInput(): m.Component<{ chatId: string | null }> {
+// The stopped agents this page asked to start because the user began a message to them, while that start
+// runs: one request per stop, not one per keystroke.
+const warmingAgentIds = new Set<string>();
+
+/**
+ * Start a stopped chat's agent as the user begins a message to it, so the send finds the agent up rather
+ * than waiting on it. Best-effort: when this start fails or is still running at the send, the send starts
+ * the agent itself, as it always has.
+ */
+function warmUpStoppedChat(chatId: string): void {
+  const chat = getChatById(chatId);
+  const agentId = chat?.active_agent.agent_id;
+  if (chat === undefined || agentId === undefined || chat.handoff !== null) return;
+  if (!isAgentProcessDead(chat.active_agent.state) || warmingAgentIds.has(agentId)) return;
+  warmingAgentIds.add(agentId);
+  fetch(apiUrl(`/api/chats/${encodeURIComponent(chatId)}/start`), { method: "POST" })
+    .then((response) => {
+      if (!response.ok) console.warn(`Could not start chat ${chatId} ahead of its message (HTTP ${response.status})`);
+    })
+    .catch((err: unknown) => console.warn(`Could not start chat ${chatId} ahead of its message: ${String(err)}`))
+    .finally(() => warmingAgentIds.delete(agentId));
+}
+
+/** Whether this page offers dictation at all (the workspace-voice-input spec, D5): a secure context with a
+ *  microphone, an audio worklet, WebAssembly, and a worker. */
+function isDictationOffered(): boolean {
+  return isDictationSupported(describeHost());
+}
+
+function isAppleKeyboard(): boolean {
+  return typeof navigator !== "undefined" && isApplePlatform(navigator);
+}
+
+// The mounted composer's hook for the page going out of view, which stops its dictation and keeps the words.
+let mountedDictationHide: (() => void) | null = null;
+
+/** Stop the page's dictation, keeping the words it heard: what the page does when the shell says it is hidden. */
+export function stopDictationWhenHidden(): void {
+  mountedDictationHide?.();
+}
+
+export interface MessageInputAttrs {
+  chatId: string | null;
+  /** A control at the left of the composer's box, bottom-aligned with it: the phone layout's settings button. */
+  leading?: m.Children;
+}
+
+/** A notice that stands in for the composer while the chat has no provider to run on: why, and a button that opens
+ *  the provider chooser. ``markerClass`` names which notice it is. */
+function providerNotice(markerClass: string, sentence: string, onChoose: () => void, onShown?: () => void): m.Vnode {
+  return m(
+    "div",
+    {
+      oncreate: onShown,
+      class:
+        `${markerClass} mb-2 flex flex-row items-center justify-between gap-3 rounded-[13px] border ` +
+        "border-default bg-surface-secondary py-3 pr-3 pl-5 text-(length:--font-size-body) text-secondary",
+    },
+    [
+      m("span", sentence),
+      m(
+        Button,
+        { variant: "primary", sm: true, extra: "message-input-choose-provider shrink-0", onclick: onChoose },
+        "Choose a provider",
+      ),
+    ],
+  );
+}
+
+/** The composer's box, beside ``leading`` when there is one. The row is there either way, so the box (and the
+ *  textarea in it, with its focus and the soft keyboard) is kept when ``leading`` comes or goes. */
+function composeRow(leading: m.Children | undefined, boxChildren: m.Children[]): m.Vnode {
+  return m("div", { class: "message-input-compose-row flex items-end gap-1.5" }, [
+    leading ?? null,
+    m(
+      "div",
+      { class: `${INPUT_BOX_CLASS} relative min-w-0 flex-1`, ...appPartAttrs("chat", "composer") },
+      boxChildren,
+    ),
+  ]);
+}
+
+/**
+ * Re-read the account list when a send was refused because the chat's account was signed out.
+ *
+ * The composer offers "Choose a provider" from that list, which only this page's own account
+ * actions refresh: a removal made in another window leaves it listing the account until then.
+ */
+function catchUpOnSignedOutAccount(sendError: unknown): void {
+  if (sendFailureKind(sendError) !== ACCOUNT_SIGNED_OUT_SEND_FAILURE_KIND) {
+    return;
+  }
+  loadAccounts().then(
+    () => m.redraw(),
+    (err: unknown) => console.error(`Failed to re-read the account list: ${describeRequestError(err)}`),
+  );
+}
+
+// A pick in the model bar the chat app refused (the chat is switching providers, say) is told in the chat's notice.
+addModelChoiceFailureListener((chatId, detail) =>
+  raiseFailureNotice(chatId, { title: "Couldn't change the model", detail }),
+);
+
+/** The provider chooser for a chat whose account was signed out: the account signed in to or picked is the one the
+ *  chat's next message moves it to. */
+function chooseProviderToContinue(chatId: string): void {
+  openProviderChooser({ onSignedIn: (chosen) => beginSwitchToAccountId(chatId, chosen) });
+}
+
+/** What an awaiting chat's first send launches it as: a chat on an account, or a room. */
+type FirstSendChoice = { kind: "account"; id: string } | { kind: "room" };
+
+export function MessageInput(): m.Component<MessageInputAttrs> {
   let messageText = "";
   let currentChatId: string | null = null;
   let messageTextareaElement: HTMLTextAreaElement | null = null;
+  // Whether the composer was disabled at the last render, so it takes focus the moment a provider makes it usable.
+  let wasComposerDisabled = false;
+  let messageRowElement: HTMLElement | null = null;
+  // An edit refits the composer as typing, and so does the redraw that follows it: the browser scrolls the caret
+  // into view after the input event, which can undo the edit's own scroll to the bottom.
+  let isTypingUntilRedraw = false;
+  // Refits the composer when its width changes, since that changes where the text wraps.
+  let messageRowResizeObserver: ResizeObserver | null = null;
+  let messageRowWidthPx = 0;
   // Set instead of sending when the user types one of the harness's declared
   // auth commands (the `open_auth` composer popup). Delivered raw, /login or
   // /logout would run the harness's own auth flow inside the agent's terminal
   // (or reach the model as prose), bypassing the managed agent-auth surface.
   let interceptedAuthCommand: string | null = null;
-  // A slash command the chat declines to deliver, because it would change the agent's terminal
-  // rather than start a turn. It still works from that terminal, which the notice says.
-  let declinedSlashCommand: { command: string; body: string | null } | null = null;
+  // A message the chat declines to deliver: a slash command that would change the agent's terminal
+  // rather than start a turn (it still works from that terminal, which the notice says), or a
+  // /compact the server declined to run (nothing to compact yet, or the agent is busy or stopped).
+  let declinedSend: { title: string; body: string } | null = null;
   // Why the last send or interrupt failed, in the harness's own words, shown as a notice.
   // Component state like the notices above, NOT module state: every open chat panel mounts its
   // own MessageInput, and a module-level value would raise the notice in all of them at once.
   // `recovery` is what makes the notice actionable, and it is carried by the OPERATION rather
-  // than the failure: a send can be repeated, so it offers Cancel / Retry / Force, while a
+  // than the failure: a send can be repeated, so it offers Cancel / Retry / Restart, while a
   // failed interrupt has nothing to repeat and gets a plain OK. Any send failure qualifies --
   // a dialog holding the input, a readiness timeout, a transport error -- because the ways out
   // are the same whatever the reason; only the text differs.
@@ -231,6 +555,9 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
     text: string;
     sentText: string;
     attachments: readonly ComposerAttachment[];
+    /** The failed send's id: a retry goes under it, so the chat app answers it as it answered the
+     *  first when the first was delivered after all, rather than delivering it twice. */
+    messageId: string;
   };
   let actionFailureDetail: string | null = null;
   // A failed Stop shares this notice, and telling the user their message could not be sent when
@@ -238,7 +565,7 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
   let actionFailureTitle = "Couldn't send your message";
   let actionFailureRecovery: SendRecovery | null = null;
   // Which recovery action is mid-flight, so the buttons disable rather than fire twice.
-  let actionFailureInFlight: "retry" | "force" | null = null;
+  let actionFailureInFlight: "retry" | "restart" | null = null;
   // One notice instance each: the component closes over its own dismiss handler, so sharing one
   // between notices would let whichever rendered last answer the others' Escape.
   const actionFailureNotice = makeNoticeDialog();
@@ -246,94 +573,382 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
   const authCommandNotice = makeNoticeDialog();
   // mngr's classification of the failure, which decides which recoveries are worth offering.
   let actionFailureKind: SendFailureKind = "unknown";
+  // A send mngr typed into the agent but could not confirm, or one the chat app never answered
+  // (it may have delivered it before the answer was lost): its text went back to the composer
+  // like any failed send's, but the agent may have it. Once its turn reaches the transcript
+  // the copy comes back out and its notice closes, so the user does not send it a second time.
+  // Kept past Cancel, which leaves the copy in the composer just the same. One per send, across
+  // every chat this composer serves.
+  let unconfirmedSends: { recovery: SendRecovery; priorTurnIds: ReadonlySet<string> }[] = [];
+
+  function watchForUnconfirmedTurn(err: unknown, recovery: SendRecovery, priorTurnIds: ReadonlySet<string>): void {
+    // A Send again that is unconfirmed too keeps the first watch: the turns read before the
+    // first send let a landing of either one count.
+    if (
+      noticeKindOf(err) === "submission_unconfirmed" &&
+      !unconfirmedSends.some((watched) => watched.recovery === recovery)
+    ) {
+      unconfirmedSends = [...unconfirmedSends, { recovery, priorTurnIds }];
+    }
+  }
+
+  function stopWatchingUnconfirmedTurn(recovery: SendRecovery): void {
+    unconfirmedSends = unconfirmedSends.filter((watched) => watched.recovery !== recovery);
+  }
+  // Whether the chat app refused the send because the chat's account was signed out: sending again cannot help, so
+  // the notice offers choosing a provider instead of Retry and Restart.
+  let isActionFailureOnSignedOutAccount = false;
   // Retry for a failure raised by a sibling view, which knows how to repeat its own operation.
   let externalRetry: (() => Promise<void>) | null = null;
   let fileInputElement: HTMLInputElement | null = null;
   let isInterruptInFlight = false;
-  // The switch to the pending lane (spec 5.1): the handoff request is out, or the cancel of a
-  // running switch is out.
-  let isSwitchInFlight = false;
+  // The cancel of a running switch is out.
   let isCancelSwitchInFlight = false;
+  // The chat whose switch-and-send message is still being prepared (uploads, the composer guard):
+  // not sent yet, so the switch is still the next send's.
+  let switchPreparingChatId: string | null = null;
+  // The mention being typed, while the caret follows an ``@`` (section 7.2); null otherwise.
+  let mentionDraft: MentionDraft | null = null;
+  // Dictation (the workspace-voice-input spec), made on first use since it pulls the speech runtime in; its
+  // state is mirrored here for the view, with the engine's own the truth for what a press does.
+  let dictation: Dictation | null = null;
+  let dictationState: DictationState = "idle";
+  let dictationProgress: DictationProgress | null = null;
+  let lastShownProgressPercent = -1;
+  let dictationProblem: DictationProblem | null = null;
+  // The stretch of the box the dictation owns, from the caret it started at; null while none runs.
+  let dictationSpan: LiveSpan | null = null;
+  // Fills the mic's capsule, handed over by the button while its glyph is in the document.
+  let setMeterLevel: ((level: number) => void) | null = null;
+  // Send or Enter came while dictating: the words are finished first, then the box is sent (spec D8).
+  let isSendPendingAfterDictation = false;
+  // Whether the composer took input at the last render, for the shortcut, which arrives outside a render.
+  let isComposerDisabledNow = false;
+
+  /** Write the dictation's words into the box: the live span, with the caret at its end so the words stay in
+   *  view, and only the final words to the saved draft. */
+  function applyDictationSpan(): void {
+    if (dictationSpan === null || currentChatId === null) return;
+    const rendered = renderSpan(dictationSpan);
+    messageText = rendered.text;
+    if (rendered.draft === "") localStorage.removeItem(messageTextKey(currentChatId));
+    else localStorage.setItem(messageTextKey(currentChatId), rendered.draft);
+    if (messageTextareaElement !== null) {
+      messageTextareaElement.value = rendered.text;
+      messageTextareaElement.setSelectionRange(rendered.spanEnd, rendered.spanEnd);
+      refitAfterEdit();
+    }
+    m.redraw();
+  }
+
+  /** Fix where the words will land: the caret (or the selection) as it is when dictation starts. */
+  function openDictationSpan(): void {
+    const textarea = messageTextareaElement;
+    const start = textarea?.selectionStart ?? messageText.length;
+    const end = textarea?.selectionEnd ?? messageText.length;
+    dictationSpan = openSpan(messageText, start, end);
+  }
+
+  function ensureDictation(): Dictation {
+    if (dictation !== null) return dictation;
+    // The page's own URL roots the runtime's files; a document-less test has none.
+    const pageUrl = typeof location === "undefined" ? "" : location.href;
+    dictation = createDictation(pageDictationOptions(localStorage, getBasePath(), pageUrl), {
+      onStateChange: (state) => {
+        dictationState = state;
+        if (state !== "loading") {
+          dictationProgress = null;
+          lastShownProgressPercent = -1;
+        }
+        // Once idle the words are ordinary text; the next dictation opens a span of its own.
+        if (state === "idle") dictationSpan = null;
+        m.redraw();
+      },
+      onProgress: (loadedBytes, totalBytes) => {
+        dictationProgress = { loadedBytes, totalBytes };
+        // A download reports every chunk; the ring and the tooltip move by whole percents.
+        const percent = dictationProgressPercent(dictationProgress);
+        if (percent !== lastShownProgressPercent) {
+          lastShownProgressPercent = percent;
+          m.redraw();
+        }
+      },
+      onLevel: (level) => setMeterLevel?.(level),
+      onFinalWords: (words) => {
+        if (dictationSpan === null) return;
+        dictationSpan = appendFinal(dictationSpan, words);
+        applyDictationSpan();
+        if (currentChatId !== null) warmUpStoppedChat(currentChatId);
+      },
+      onTentativeWords: (words) => {
+        if (dictationSpan === null) return;
+        dictationSpan = setTentative(dictationSpan, words);
+        applyDictationSpan();
+      },
+      onUtteranceEnd: () => {
+        if (dictationSpan === null) return;
+        dictationSpan = clearTentative(dictationSpan);
+        applyDictationSpan();
+      },
+      onProblem: (problem) => {
+        dictationProblem = problem;
+        m.redraw();
+      },
+    });
+    return dictation;
+  }
+
+  /** The mic and the shortcut: start from idle, stop while listening, nothing in between. */
+  function toggleDictation(): void {
+    if (currentChatId === null || isComposerDisabledNow) return;
+    const running = ensureDictation();
+    if (running.state === "listening") {
+      void running.stop();
+      return;
+    }
+    if (running.state !== "idle") return;
+    dictationProblem = null;
+    openDictationSpan();
+    void running.start();
+  }
+
+  /** Stop and keep the words heard so far; a dictation still starting has none, so it is called off. */
+  function stopDictationKeepingWords(): void {
+    if (dictation === null) return;
+    if (dictation.state === "listening") void dictation.stop();
+    else if (dictation.state === "loading" || dictation.state === "starting") void dictation.cancel();
+  }
+
+  function disposeDictation(): void {
+    dictation?.dispose();
+    dictation = null;
+    dictationState = "idle";
+    dictationProgress = null;
+    dictationProblem = null;
+    dictationSpan = null;
+    isSendPendingAfterDictation = false;
+  }
+
+  function handleDictationShortcut(event: KeyboardEvent): void {
+    if (!keydownMatchesChords(event, [dictationShortcutChord(isAppleKeyboard())])) return;
+    event.preventDefault();
+    toggleDictation();
+  }
+
+  function handleVisibilityChange(): void {
+    if (document.visibilityState === "hidden") stopDictationKeepingWords();
+  }
+
+  /** The shortcut works anywhere in the chat page, and the page going away takes the dictation with it: hidden
+   *  keeps the words, closed drops the unfinished ones. */
+  function attachDictationToPage(): void {
+    document.addEventListener("keydown", handleDictationShortcut);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("pagehide", disposeDictation);
+    mountedDictationHide = stopDictationKeepingWords;
+  }
+
+  function detachDictationFromPage(): void {
+    document.removeEventListener("keydown", handleDictationShortcut);
+    document.removeEventListener("visibilitychange", handleVisibilityChange);
+    window.removeEventListener("pagehide", disposeDictation);
+    if (mountedDictationHide === stopDictationKeepingWords) mountedDictationHide = null;
+    disposeDictation();
+  }
+
+  function mentionRows(): MentionHandle[] {
+    return mentionDraft === null ? [] : matchingHandles(mentionDraft.query).slice(0, MENTION_ROW_CAP);
+  }
+
+  /** Read the mention under the caret after the text changed or the caret moved; a fresh ``@`` asks for the table.
+   *  Only in a room (section 7.2): in an agent chat a handle is a word the agent reads like any other. */
+  function updateMentionDraft(textarea: HTMLTextAreaElement): void {
+    if (currentChatId === null || !isRoomChat(currentChatId)) {
+      mentionDraft = null;
+      return;
+    }
+    const previous = mentionDraft;
+    mentionDraft = mentionDraftAt(textarea.value, textarea.selectionStart ?? textarea.value.length, previous);
+    if (mentionDraft !== null && previous === null) void ensureMentionHandles().then(() => m.redraw());
+  }
+
+  function pickMention(handle: MentionHandle): void {
+    if (mentionDraft === null || messageTextareaElement === null || currentChatId === null) return;
+    const inserted = insertMention(messageText, mentionDraft, handle.handle);
+    messageText = inserted.text;
+    messageTextareaElement.value = inserted.text;
+    messageTextareaElement.setSelectionRange(inserted.caret, inserted.caret);
+    localStorage.setItem(messageTextKey(currentChatId), messageText);
+    mentionDraft = null;
+    refitAfterEdit();
+    focusMessageTextarea();
+    m.redraw();
+  }
+
+  /** The popover's keys while a mention is being typed; whether the key was taken. */
+  function handleMentionKeydown(event: KeyboardEvent): boolean {
+    if (mentionDraft === null) return false;
+    const rows = mentionRows();
+    if (event.key === "Escape") {
+      mentionDraft = null;
+      return true;
+    }
+    if (rows.length === 0) return false;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      mentionDraft = { ...mentionDraft, index: (mentionDraft.index + step + rows.length) % rows.length };
+      return true;
+    }
+    if (event.key === "Enter" || event.key === "Tab") {
+      pickMention(rows[Math.min(mentionDraft.index, rows.length - 1)]);
+      return true;
+    }
+    return false;
+  }
 
   function focusMessageTextarea(): void {
     messageTextareaElement?.focus();
   }
 
-  // Its own handler rather than the one above: each notice clears only its own state, and
-  // registering one shared function reference from two overlays would be de-duplicated by
-  // addEventListener and then torn down by whichever overlay closed first.
+  function refitComposer(isTyping = false): void {
+    if (messageRowElement !== null && messageTextareaElement !== null) {
+      fitComposer(messageRowElement, messageTextareaElement, isTyping);
+    }
+  }
+
+  function refitAfterEdit(): void {
+    isTypingUntilRedraw = true;
+    refitComposer(true);
+  }
+
+  function attachMessageRow(rowVnode: m.VnodeDOM): void {
+    const rowElement = rowVnode.dom as HTMLElement;
+    messageRowElement = rowElement;
+    messageRowWidthPx = rowElement.clientWidth;
+    messageRowResizeObserver = new ResizeObserver(() => {
+      if (rowElement.clientWidth !== messageRowWidthPx) {
+        messageRowWidthPx = rowElement.clientWidth;
+        refitComposer();
+      }
+    });
+    messageRowResizeObserver.observe(rowElement);
+    refitComposer();
+  }
+
+  function detachMessageRow(): void {
+    messageRowResizeObserver?.disconnect();
+    messageRowResizeObserver = null;
+    messageRowElement = null;
+  }
+
+  /**
+   * One attachment chip, 40px tall: an image is its thumbnail alone; anything else is an icon beside
+   * its name and its size, or what it points at for a file the chat made for the user (an element
+   * reference). While uploading, a spinner sits over the thumbnail on a dark wash, or where the icon
+   * would be. The remove button rides the top-right corner, shown on hover.
+   */
   function renderComposerAttachment(chatId: string, attachment: ComposerAttachment): m.Vnode {
-    const isReadyImage = attachment.status === "ready" && attachment.isImage && attachment.uploaded !== undefined;
-    const thumbnail = isReadyImage
-      ? m("img", {
-          class: "composer-attachment-thumb h-9 w-9 shrink-0 rounded-md object-cover",
-          src: attachment.uploaded?.url,
-          alt: attachment.fileName,
-        })
+    const isUploading = attachment.status === "uploading";
+    const isError = attachment.status === "error";
+    // The local pixels while uploading, then the uploaded copy.
+    const thumbnailUrl = attachment.previewUrl ?? attachment.uploaded?.url;
+    const isThumbnail = attachment.isImage && !isError && thumbnailUrl !== undefined;
+    const size = attachment.uploaded?.size ?? attachment.localSize;
+    const spinner = m.trust(spinnerIcon(16));
+    const isDescribed = attachment.summary !== undefined;
+    const remove = isUploading
+      ? null
       : m(
-          "span",
+          "button",
           {
-            class: "composer-attachment-icon inline-flex h-9 w-9 shrink-0 items-center justify-center text-secondary",
+            type: "button",
+            // z-10: above the strip's end fades, so a half-hidden chip's remove button stays usable.
+            // Centred on the corner inside the chip's 1px border, not on the border's outer edge.
+            class:
+              "composer-attachment-remove absolute -top-[9px] -right-[9px] z-10 inline-flex h-5 w-5 cursor-pointer " +
+              "items-center justify-center rounded-full bg-inverse text-on-accent opacity-0 shadow-sm " +
+              "transition-opacity group-hover/chip:opacity-100 focus-visible:opacity-100",
+            "aria-label": "Remove attachment",
+            ...hoverTooltipAttrs("Remove attachment", "above"),
+            onclick: () => removeComposerAttachment(chatId, attachment.localId),
           },
-          attachment.status === "uploading"
-            ? m("span", { class: "spinner" })
-            : m.trust(icon("file", { size: 18, strokeWidth: 1.8 })),
+          m.trust(icon("close", { size: 12, strokeWidth: 2.5 })),
         );
+    // The status modifier is an interpolated marker; the one status the look distinguishes (a
+    // failed upload's red border) rides beside it.
+    const chipMarker = `composer-attachment composer-attachment--${attachment.status}`;
+    if (isThumbnail) {
+      return m(
+        "div",
+        {
+          key: attachment.localId,
+          class: `${chipMarker} group/chip relative flex-none`,
+        },
+        [
+          // The image fills the whole 40px; its border is drawn over it rather than taking its edge.
+          m("img", {
+            class: `composer-attachment-thumb block ${ATTACHMENT_CHIP_HEIGHT_CLASS} w-10 rounded-md object-cover`,
+            src: thumbnailUrl,
+            alt: attachment.fileName,
+          }),
+          m("span", { class: "pointer-events-none absolute inset-0 rounded-md border border-subtle" }),
+          isUploading
+            ? m(
+                "span",
+                {
+                  class:
+                    "composer-attachment-uploading absolute inset-0 flex items-center justify-center rounded-md " +
+                    "bg-black/40 text-white",
+                  "aria-label": "Uploading",
+                  role: "img",
+                },
+                spinner,
+              )
+            : null,
+          remove,
+        ],
+      );
+    }
+    const summary = attachment.summary ?? (size === undefined ? undefined : formatFileSize(size));
+    const detail = isError
+      ? m(
+          "span",
+          { class: `${ATTACHMENT_DETAIL_CLASS} composer-attachment-detail--error text-danger` },
+          "Upload failed",
+        )
+      : summary === undefined
+        ? null
+        : m("span", { class: `${ATTACHMENT_DETAIL_CLASS} composer-attachment-summary text-secondary` }, summary);
     return m(
       "div",
       {
         key: attachment.localId,
-        // The status modifier is an interpolated marker; the one status the
-        // look distinguishes (a failed upload's red border) rides beside it.
         class:
-          `composer-attachment composer-attachment--${attachment.status} ` +
-          "inline-flex max-w-[240px] items-center gap-2 rounded-lg border bg-sidebar py-1.5 pr-2 pl-1.5 " +
-          (attachment.status === "error" ? "border-danger-border" : ""),
+          `${chipMarker} group/chip relative flex ${ATTACHMENT_CHIP_HEIGHT_CLASS} max-w-[160px] flex-none items-center ` +
+          "gap-1 rounded-md border bg-surface-secondary pr-1.5 pl-1 " +
+          (isError ? "border-danger-border" : "border-subtle"),
       },
       [
-        thumbnail,
+        m(
+          "span",
+          {
+            class: "composer-attachment-icon inline-flex h-4 w-4 flex-none items-center justify-center text-secondary",
+          },
+          isUploading
+            ? m("span", { class: "composer-attachment-uploading", "aria-label": "Uploading", role: "img" }, spinner)
+            : m.trust(icon(isDescribed ? "pointer" : "file", { size: 16, strokeWidth: 1.8 })),
+        ),
         m("span", { class: "composer-attachment-info flex min-w-0 flex-col" }, [
           m(
             "span",
             {
-              class: "composer-attachment-name truncate text-(length:--font-size-body) text-primary",
-              ...hoverTooltipAttrs(attachment.fileName),
+              class: "composer-attachment-name truncate text-(length:--font-size-helper) leading-[1.3] text-primary",
             },
             attachment.fileName,
           ),
-          attachment.status === "ready" && attachment.uploaded !== undefined
-            ? m(
-                "span",
-                { class: `${ATTACHMENT_DETAIL_BASE} text-secondary` },
-                formatFileSize(attachment.uploaded.size),
-              )
-            : null,
-          attachment.status === "uploading"
-            ? m("span", { class: `${ATTACHMENT_DETAIL_BASE} text-secondary` }, "Uploading…")
-            : null,
-          attachment.status === "error"
-            ? m(
-                "span",
-                { class: `${ATTACHMENT_DETAIL_BASE} composer-attachment-detail--error text-danger` },
-                "Upload failed",
-              )
-            : null,
+          detail,
         ]),
-        attachment.status === "uploading"
-          ? null
-          : m(
-              Button,
-              {
-                variant: "ghost",
-                icon: true,
-                xs: true,
-                extra: "composer-attachment-remove shrink-0",
-                "aria-label": "Remove attachment",
-                ...hoverTooltipAttrs("Remove attachment"),
-                onclick: () => removeComposerAttachment(chatId, attachment.localId),
-              },
-              m.trust(icon("close", { size: 12, strokeWidth: 2.5 })),
-            ),
+        remove,
       ],
     );
   }
@@ -347,14 +962,21 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
       }
 
       if (currentChatId !== chatId) {
+        // A dictation belongs to the chat it started in.
+        disposeDictation();
         currentChatId = chatId;
         messageText = localStorage.getItem(messageTextKey(chatId)) ?? "";
+        const persistedHint = localStorage.getItem(composerHintKey(chatId));
+        if (persistedHint !== null && !composerHints.has(chatId)) {
+          // Set by the chat root before this page loaded: taken up as a live hint would be, focusing once.
+          composerHints.set(chatId, persistedHint);
+          pendingComposerFocuses.add(chatId);
+        }
         isInterruptInFlight = false;
-        isSwitchInFlight = false;
         isCancelSwitchInFlight = false;
         // The notices name a command typed for the previous agent, so they must not follow the
         // user to the next one.
-        declinedSlashCommand = null;
+        declinedSend = null;
         interceptedAuthCommand = null;
         // Safe to drop: the failed message was put back in that agent's composer when the send
         // failed, so nothing is lost by closing its notice unanswered.
@@ -388,6 +1010,24 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
         pendingComposerPrepends.delete(chatId);
         messageText = pendingPrepend;
       }
+      if (pendingComposerFocuses.delete(chatId)) {
+        // After this pass has drawn the textarea the hint is for.
+        queueMicrotask(focusMessageTextarea);
+      }
+      const composerHint = composerHints.get(chatId) ?? null;
+
+      // After the hand-back above is adopted: the failed send's copy arrives through it.
+      for (const { recovery, priorTurnIds } of unconfirmedSends) {
+        if (!hasUserTurnLandedSince(recovery.chatId, recovery.sentText, priorTurnIds)) {
+          continue;
+        }
+        stopWatchingUnconfirmedTurn(recovery);
+        clearRestoredMessage(recovery.chatId, recovery.text, recovery.attachments);
+        // Only its own notice, and not out from under a Send again already on its way.
+        if (actionFailureRecovery === recovery && actionFailureInFlight === null) {
+          clearActionFailureNotice();
+        }
+      }
 
       /** What a send (or a switch) puts on the wire, with what to put back if it fails. */
       interface PreparedSend {
@@ -415,14 +1055,15 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
         // Only slash-shaped messages consult it, and only those block on the
         // catalog when it has not loaded yet -- otherwise an early /login could
         // slip through the fetch window.
-        if (messageText.trim().startsWith("/")) {
+        const guardedText = withoutNulCharacters(messageText);
+        if (guardedText.trim().startsWith("/")) {
           const harness = getChatById(chatId)?.active_agent.harness;
           if (getHarnessCatalog(harness) === null) {
             await ensureHarnessCatalogs();
           }
           // ``/fast on`` and ``/fast off`` choose the chat's fast mode (on a harness that has
           // one) rather than reaching the harness or its notice: the mode is the chat's setting.
-          const fastMode = parseFastModeCommand(messageText);
+          const fastMode = parseFastModeCommand(guardedText);
           if (fastMode !== null && hasFastModeLimit(harness)) {
             chooseFastMode(chatId, fastMode, getEventsForChat(chatId));
             messageText = "";
@@ -430,12 +1071,15 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
             m.redraw();
             return null;
           }
-          const match = findComposerPopup(harness, messageText);
+          const match = findComposerPopup(harness, guardedText);
           if (match !== null) {
             if (match.popup.action === "open_auth") {
               interceptedAuthCommand = match.command;
             } else {
-              declinedSlashCommand = { command: match.command, body: match.popup.notice_body ?? null };
+              declinedSend = {
+                title: `${match.command} can't be sent from chat`,
+                body: match.popup.notice_body ?? "You can still send it from the agent's terminal.",
+              };
             }
             m.redraw();
             return null;
@@ -446,7 +1090,7 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
         await waitForComposerUploads(chatId);
 
         const attachmentPaths = getReadyAttachmentPaths(chatId);
-        const text = messageText;
+        const text = withoutNulCharacters(messageText);
 
         // An upload that failed is dropped by getReadyAttachmentPaths and its chip is cleared
         // below, so without this the file would leave the message silently and the only clue
@@ -460,11 +1104,10 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
             return null;
           }
           const names = failedAttachments.map((attachment) => attachment.fileName).join(", ");
+          clearActionFailureNotice();
           actionFailureTitle =
             failedAttachments.length === 1 ? "An attachment didn't upload" : "Some attachments didn't upload";
           actionFailureDetail = `${names} could not be uploaded, so the message was not sent. Remove the attachment, or try again.`;
-          actionFailureRecovery = null;
-          externalRetry = null;
           m.redraw();
           return null;
         }
@@ -493,6 +1136,8 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
         if (prepared === null) {
           return;
         }
+        // The hint asked a question; the send answered it.
+        clearComposerHint(chatId);
         const { text: sentText, finalText, attachments: sentAttachments } = prepared;
 
         // Paint an optimistic "Sending…" bubble at the tail immediately -- the ONE
@@ -503,16 +1148,26 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
         // the send too, so a chat app that holds the message while the chat switches
         // harness can name it back and the bubble stands down for that rendering.
         const messageId = mintMessageId();
-        const outgoingId = addOutgoing(chatId, sentText, messageId);
+        const outgoingId = addOutgoing(chatId, finalText, messageId);
         m.redraw();
+        let priorTurnIds: ReadonlySet<string> = new Set();
 
         try {
-          // A seeded chat awaiting its first send has no agent yet, and this send is what
-          // launches one: on the signed-in account, else on the one the chooser produces. The
-          // message rides the launch as the agent's first, so nothing is sent after it lands.
-          if (getProvisionalChat(chatId)?.phase === "awaiting_first_send" && getChatById(chatId) === undefined) {
-            const accountId = await chooseAccountForFirstSend();
-            if (accountId === null) {
+          // A chat awaiting its first send (a seeded one, one an intake minted, or the one an empty
+          // chat list opens on) has no agent yet, and this send is what launches one: on the account
+          // it was minted for, else the signed-in one, else the one the chooser produces. A seeded
+          // chat's message rides the launch as the agent's first, wrapped in the seed; any other is
+          // sent once the launch is under way, held like any send to a starting chat, so Stop can
+          // take it back until the agent is up. A chat whose launch is already on its way (the
+          // sign-in's) is a creating chat to this send.
+          const awaiting = getProvisionalChat(chatId);
+          if (
+            awaiting?.phase === "awaiting_first_send" &&
+            getChatById(chatId) === undefined &&
+            !isLaunchInFlight(chatId)
+          ) {
+            const choice = await chooseAccountForFirstSend(awaiting);
+            if (choice === null) {
               // The chooser closed with no sign-in: nothing was launched, and the message is
               // the user's to keep.
               dropOutgoing(chatId, outgoingId);
@@ -520,7 +1175,19 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
               m.redraw();
               return;
             }
-            await launchChat(chatId, accountId, finalText);
+            if (choice.kind === "room") {
+              // A room is launched like a chat on an account, on none: the message rides the launch and is
+              // appended once the room is up.
+              await launchChat(chatId, "", finalText, "room");
+            } else if (awaiting.is_seeded) {
+              await launchChat(chatId, choice.id, finalText, "agent");
+            } else {
+              await launchChat(chatId, choice.id, "", "agent");
+              priorTurnIds = sentUserTurnIds(chatId);
+              dropOutgoingNoTurnWillRetire(chatId, outgoingId, await sendMessage(chatId, finalText, messageId));
+              refocusAfterSend();
+              return;
+            }
             try {
               await whenChatRegistered(chatId);
             } catch (err) {
@@ -535,34 +1202,49 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
             refocusAfterSend();
             return;
           }
-          // A chat still being created has no agent to deliver to yet: the bubble stays
-          // "Sending…" until the create lands, and the send goes out then. A create that
-          // fails rejects here and the message goes back to the composer like any failed send.
-          await whenChatRegistered(chatId);
-          await sendMessage(chatId, finalText, messageId);
+          // A chat still being created has no agent to deliver to yet: the chat app holds the send
+          // and delivers it once the create lands, so a page closed meanwhile loses nothing, and the
+          // bubble stays until the turn arrives. A create that has already failed takes no sends,
+          // and the message goes back to the composer like any failed send.
+          // A launch this page posted that the backend has not yet reported creating may not hold
+          // the send yet, so that one send waits for the chat to land.
+          if (isLaunchInFlight(chatId)) await whenChatRegistered(chatId);
+          refuseSendToFailedChat(chatId);
+          priorTurnIds = sentUserTurnIds(chatId);
+          const status = await sendMessage(chatId, finalText, messageId);
           // The send resolved: the message is now real (committed, queued, or held for the
           // agent the chat is switching to), so its "Sending…" bubble is removed by the arriving
-          // transcript turn, queued snapshot, or held-send snapshot (see
-          // OutgoingMessages) -- nothing to do here.
+          // transcript turn, queued snapshot, or held-send snapshot (see OutgoingMessages).
+          dropOutgoingNoTurnWillRetire(chatId, outgoingId, status);
         } catch (err) {
-          // The send genuinely failed (the backend confirms delivery before
-          // resolving, so a rejection means the message was NOT accepted). Drop the
-          // optimistic bubble and handle failure the original way: restore the
-          // text/attachments to the composer, then surface a popup.
+          // The backend confirms delivery before resolving, so a rejection means the message was
+          // NOT accepted. A /compact the server declined to run gets the declined-command notice
+          // rather than the failure notice, since retrying at once cannot change it.
           const detail = describeRequestError(err);
-          console.error(`Failed to send message to chat ${chatId}: ${detail}`);
+          const isDeclined = DECLINED_COMPACT_SEND_FAILURE_KINDS.has(sendFailureKind(err));
+          if (!isDeclined) {
+            console.error(`Failed to send message to chat ${chatId}: ${detail}`);
+          }
           dropOutgoing(chatId, outgoingId);
           // Back in the composer immediately: the recovery record is closure state, so a reload
           // would take the message with it (contract A1a). A repeat send removes that copy once
           // it has landed.
           restoreFailedMessageToComposer(chatId, sentText, sentAttachments);
-          // Actions only if they are still on the agent that failed -- this catch runs after an
+          const recovery = { chatId, text: sentText, sentText: finalText, attachments: sentAttachments, messageId };
+          watchForUnconfirmedTurn(err, recovery, priorTurnIds);
+          catchUpOnSignedOutAccount(err);
+          // Notices only if they are still on the agent that failed -- this catch runs after an
           // await, so they may have switched and the switch-clear has already gone by.
           if (currentChatId === chatId) {
-            actionFailureTitle = "Couldn't send your message";
-            actionFailureDetail = detail;
-            actionFailureKind = describeRequestErrorKind(err);
-            actionFailureRecovery = { chatId, text: sentText, sentText: finalText, attachments: sentAttachments };
+            if (isDeclined) {
+              declinedSend = { title: "/compact wasn't sent", body: detail };
+            } else {
+              actionFailureTitle = "Couldn't send your message";
+              actionFailureDetail = detail;
+              actionFailureKind = noticeKindOf(err);
+              isActionFailureOnSignedOutAccount = sendFailureKind(err) === ACCOUNT_SIGNED_OUT_SEND_FAILURE_KIND;
+              actionFailureRecovery = recovery;
+            }
           }
           m.redraw();
         }
@@ -571,16 +1253,23 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
       }
 
       /**
-       * The account a seeded chat's first send launches it on: the signed-in one when there is
-       * one, else whatever the provider chooser produces, or null when it is dismissed instead.
+       * What a chat's first send launches it as: the account the chat was minted for when it
+       * names one (an intake's), else the signed-in one when there is one, else whatever the
+       * provider chooser produces; a room when the chooser's room row was picked instead
+       * (section 7.3), or null when the chooser closed with neither.
        */
-      function chooseAccountForFirstSend(): Promise<string | null> {
-        const account = getSelectedAccount();
+      async function chooseAccountForFirstSend(provisional: ProvisionalChat): Promise<FirstSendChoice | null> {
+        await whenAccountsReadyToChoose();
+        const account = accountForFirstSend(provisional.account_id);
         if (account !== null) {
-          return Promise.resolve(account.id);
+          return { kind: "account", id: account.id };
         }
         return new Promise((resolve) => {
-          openProviderChooser({ onSignedIn: (accountId) => resolve(accountId), onDismissed: () => resolve(null) });
+          openProviderChooser({
+            onSignedIn: (accountId) => resolve({ kind: "account", id: accountId }),
+            onDismissed: () => resolve(null),
+            onRoomChosen: () => resolve({ kind: "room" }),
+          });
         });
       }
 
@@ -591,25 +1280,37 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
        * the held-send rendering the next snapshot brings replaces it exactly; the queued text
        * draining took off the old agent comes back for the composer.
        */
-      async function handleSwitchAndSend(target: ProviderAccount): Promise<void> {
-        if (!chatId || isSwitchInFlight) {
+      async function handleSwitchAndSend(): Promise<void> {
+        if (!chatId || isSwitchSending(chatId) || switchPreparingChatId === chatId) {
           return;
         }
-        isSwitchInFlight = true;
-        m.redraw();
-        const prepared = await prepareSend();
+        switchPreparingChatId = chatId;
+        let prepared: PreparedSend | null;
+        try {
+          prepared = await prepareSend();
+        } finally {
+          if (switchPreparingChatId === chatId) switchPreparingChatId = null;
+        }
         if (prepared === null) {
-          isSwitchInFlight = false;
           m.redraw();
           return;
         }
         const { text: sentText, finalText, attachments: sentAttachments } = prepared;
+        // Read once the message is ready, not at the press: until then the choice could still be
+        // changed or taken back, and the account and its pick must go out as one.
+        const target = nextSendSwitchTarget(chatId);
+        if (target === null) {
+          restoreFailedMessageToComposer(chatId, sentText, sentAttachments);
+          m.redraw();
+          return;
+        }
+        const pick = getPendingPick(chatId)?.identity ?? null;
+        setSwitchSending(chatId, true);
         const messageId = mintMessageId();
-        const outgoingId = addOutgoing(chatId, sentText, messageId);
+        const outgoingId = addOutgoing(chatId, finalText, messageId);
         m.redraw();
         try {
           await whenChatRegistered(chatId);
-          const pick = getPendingPick(chatId)?.identity ?? null;
           const { returned_block } = await switchChat(chatId, target.id, finalText, messageId, pick);
           prependToComposer(chatId, returned_block);
         } catch (err) {
@@ -623,7 +1324,7 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
             actionFailureDetail = detail;
           }
         } finally {
-          isSwitchInFlight = false;
+          setSwitchSending(chatId, false);
           m.redraw();
         }
         refocusAfterSend();
@@ -657,7 +1358,7 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
           // Not while a notice is open: this rAF lands after mithril has mounted the notice and
           // focused its OK button, so refocusing the composer would steal it -- leaving a modal
           // the keyboard cannot dismiss, and an Enter that re-sends the just-restored text.
-          if (actionFailureDetail === null) {
+          if (actionFailureDetail === null && declinedSend === null) {
             focusMessageTextarea();
           }
         });
@@ -715,14 +1416,37 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
 
       /** Enter and the send button do the same thing: send, or carry the armed switch out. */
       function handleSubmit(): Promise<void> {
+        if (chatId && isSwitchSending(chatId)) {
+          return Promise.resolve();
+        }
+        if (dictation !== null && dictation.state !== "idle") {
+          // One action sends what was said: the words are finished first, and the send follows (spec D8).
+          isSendPendingAfterDictation = true;
+          stopDictationKeepingWords();
+          m.redraw();
+          return Promise.resolve();
+        }
         if (switchTarget !== null) {
-          return chatId && canSend ? handleSwitchAndSend(switchTarget) : Promise.resolve();
+          return chatId && canSend ? handleSwitchAndSend() : Promise.resolve();
         }
         return handleSend();
       }
 
       function handleKeydown(event: KeyboardEvent): void {
-        if (event.key === "Enter" && !event.shiftKey) {
+        // Escape while dictating drops the words that are not yet final; the final ones stay (spec D5).
+        if (dictation !== null && dictation.state !== "idle" && event.key === "Escape") {
+          event.preventDefault();
+          void dictation.cancel();
+          return;
+        }
+        if (handleMentionKeydown(event)) {
+          event.preventDefault();
+          m.redraw();
+          return;
+        }
+        // The fallback is the manifest's defaults, so sending works in the moment
+        // before the resolved chords land; Shift+Enter stays the fixed line break.
+        if (matchesKeybinding(event, "send-message", ["enter", "ctrl+enter", "meta+enter"])) {
           event.preventDefault();
           void handleSubmit();
         }
@@ -753,7 +1477,7 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
       }
 
       function dismissDeclinedCommandNotice(): void {
-        declinedSlashCommand = null;
+        declinedSend = null;
         m.redraw();
       }
 
@@ -790,7 +1514,7 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
           .trimEnd();
       }
 
-      /** Remove just the restored copy once a repeat send has landed, leaving the rest alone. */
+      /** Remove just the restored copy once a repeat send (or an unconfirmed one's turn) has landed, leaving the rest alone. */
       function clearRestoredMessage(
         forChatId: string,
         restoredText: string,
@@ -798,11 +1522,11 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
       ): void {
         const deliveredIds = new Set(deliveredAttachments.map((attachment) => attachment.localId));
         // Emphatically NOT "clear the composer". By this point the box can also hold a draft
-        // typed while the send was failing, and -- after Force -- the queue block drained out of
+        // typed while the send was failing, and -- after Restart -- the queue block drained out of
         // the harness so the restart would not destroy it. Wiping it wholesale would throw away
         // the very messages this feature exists to protect. Remove the one copy that was just
         // delivered, and leave everything else exactly where it is.
-        // Removed wherever it sits, not just at the front: Force drains the harness queue back
+        // Removed wherever it sits, not just at the front: Restart drains the harness queue back
         // into the composer BEFORE sending, so by now the delivered message usually has that
         // block above it and a prefix-only strip would leave it behind -- sent, and still in the
         // box. Only the first occurrence goes, so a user who genuinely typed the same text twice
@@ -813,6 +1537,11 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
           localStorage.setItem(messageTextKey(forChatId), withoutRestored);
         } else {
           localStorage.removeItem(messageTextKey(forChatId));
+        }
+        // A hand-back the chat's composer has not taken in yet (the chat is not on screen) still
+        // carries the copy, and would put it back when the chat is shown.
+        if (pendingComposerPrepends.has(forChatId)) {
+          pendingComposerPrepends.set(forChatId, withoutRestored);
         }
         // The delivered attachments go regardless of whether text remains. Keying this off the
         // text emptying meant a Retry after the user had typed something left the files behind,
@@ -832,6 +1561,7 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
         actionFailureInFlight = null;
         externalRetry = null;
         actionFailureKind = "unknown";
+        isActionFailureOnSignedOutAccount = false;
         actionFailureTitle = "Couldn't send your message";
       }
 
@@ -874,13 +1604,14 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
           clearActionFailureNotice();
         } catch (err) {
           actionFailureDetail = describeRequestError(err);
+          actionFailureKind = describeRequestErrorKind(err);
           actionFailureInFlight = null;
         }
         m.redraw();
       }
 
       /**
-       * Shared tail of Retry and Force: send the message again and settle the notice.
+       * Shared tail of Retry and Restart: send the message again and settle the notice.
        *
        * Sends ``sentText`` -- what actually went to the agent, attachment references included --
        * not the typed prose, which would drop the attachments silently.
@@ -888,17 +1619,23 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
       async function repeatFailedSend(recovery: SendRecovery): Promise<void> {
         // Paint the same optimistic bubble the normal send path paints, so a retried message is
         // not simply absent from the transcript until the backend catches up.
-        const messageId = mintMessageId();
-        const outgoingId = addOutgoing(recovery.chatId, recovery.text, messageId);
+        const messageId = recovery.messageId;
+        const outgoingId = addOutgoing(recovery.chatId, recovery.sentText, messageId);
+        let priorTurnIds: ReadonlySet<string> = new Set();
         try {
-          await whenChatRegistered(recovery.chatId);
-          await sendMessage(recovery.chatId, recovery.sentText, messageId);
+          refuseSendToFailedChat(recovery.chatId);
+          priorTurnIds = sentUserTurnIds(recovery.chatId);
+          const status = await sendMessage(recovery.chatId, recovery.sentText, messageId, true);
+          dropOutgoingNoTurnWillRetire(recovery.chatId, outgoingId, status);
           // Landed, so take the restored copy back out of the composer.
           clearRestoredMessage(recovery.chatId, recovery.text, recovery.attachments);
+          stopWatchingUnconfirmedTurn(recovery);
           clearActionFailureNotice();
           focusMessageTextarea();
         } catch (err) {
           dropOutgoing(recovery.chatId, outgoingId);
+          watchForUnconfirmedTurn(err, recovery, priorTurnIds);
+          catchUpOnSignedOutAccount(err);
           // Failed again. Only re-open the notice if they are still on that agent -- otherwise
           // it would surface this agent's error over a different chat, with no way to act on it.
           // The message is already back in that agent's composer either way.
@@ -906,7 +1643,8 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
             actionFailureDetail = describeRequestError(err);
             // The reason can change between attempts -- a blocked input can become an agent that
             // is gone -- and the buttons follow the kind, so it has to be re-read with the text.
-            actionFailureKind = describeRequestErrorKind(err);
+            actionFailureKind = noticeKindOf(err);
+            isActionFailureOnSignedOutAccount = sendFailureKind(err) === ACCOUNT_SIGNED_OUT_SEND_FAILURE_KIND;
             actionFailureInFlight = null;
           } else {
             clearActionFailureNotice();
@@ -915,18 +1653,18 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
         m.redraw();
       }
 
-      /** Force: restart the agent, then send. Destructive -- it ends any in-progress turn. */
-      async function forceFailedSend(): Promise<void> {
+      /** Restart: restart the agent, then send. Destructive -- it ends any in-progress turn. */
+      async function restartFailedSend(): Promise<void> {
         const recovery = actionFailureRecovery;
         if (recovery === null || actionFailureInFlight !== null) {
           return;
         }
-        actionFailureInFlight = "force";
+        actionFailureInFlight = "restart";
         m.redraw();
         // Rescue anything queued inside the harness first. The restart below SIGKILLs the agent,
         // which drops that queue -- and a feature whose rule is "never lose the message" must not
         // have a button that quietly loses other people's. Best-effort on purpose: the agent we
-        // are about to force is often the one that is stuck, so a drain that fails or is refused
+        // are about to restart is often the one that is stuck, so a drain that fails or is refused
         // must not stop the restart the user actually asked for.
         try {
           const drained = await drainToComposer(recovery.chatId);
@@ -940,11 +1678,12 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
           // The restart itself, unconditionally: the drain does not guarantee one. Claude's
           // empty-queue path is a native chord, and pi/codex hand back a block without ever
           // restarting -- so a non-empty block is not evidence the process was replaced, and a
-          // wedged agent is exactly what Force is for. If this is refused (the services agent
+          // wedged agent is exactly what Restart is for. If this is refused (the services agent
           // carries is_primary=true, say) that refusal becomes the notice's text, nothing is sent.
           await interruptAgent(recovery.chatId);
         } catch (err) {
           actionFailureDetail = describeRequestError(err);
+          actionFailureKind = describeRequestErrorKind(err);
           actionFailureInFlight = null;
           m.redraw();
           return;
@@ -954,25 +1693,50 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
 
       function renderActionFailureNotice(detail: string): m.Children {
         const recovery = actionFailureRecovery;
-        // A pane that is gone is not going to be there on the next attempt, so Retry is not
-        // offered at all rather than offered and guaranteed to fail. Every other kind -- and
-        // anything unclassified -- keeps it.
+        if (isActionFailureOnSignedOutAccount) {
+          // The message is back in the composer; it goes out on the provider chosen here, with the chat's next send.
+          const signedOutChatId = recovery?.chatId ?? chatId;
+          return m(actionFailureNotice, {
+            title: actionFailureTitle,
+            body: [detail],
+            dismissLabel: "Cancel",
+            onDismiss: dismissActionFailureNotice,
+            actions: [
+              {
+                label: "Choose a provider",
+                run: () => {
+                  clearActionFailureNotice();
+                  m.redraw();
+                  if (signedOutChatId) chooseProviderToContinue(signedOutChatId);
+                },
+              },
+            ],
+          });
+        }
+        // The chat app already tried once more for an agent that was down and would not start,
+        // and Restart is the stronger way to bring it up, so Retry is not offered. Every
+        // other kind -- and anything unclassified -- keeps it.
         const canRetryHelp = actionFailureKind !== "agent_unreachable";
         const isRepeatable = (recovery !== null || externalRetry !== null) && canRetryHelp;
+        // The text was typed and Enter sent but nothing confirmed the agent took it, or the chat app
+        // never answered the send, so it may already be in the agent's input or turn and a resend
+        // can deliver it twice. The notice shows its own sentence: mngr's reason for this kind is its
+        // diagnostics (the whole pane included), and an unanswered send has no reason at all.
+        const isUnconfirmed = actionFailureKind === "submission_unconfirmed";
+        const sendFailureSentence = SEND_FAILURE_SENTENCES[actionFailureKind];
+        const retryWording = isUnconfirmed
+          ? { label: "Send again", inFlight: "Sending…", tooltip: "Sends the message again, even if the agent has it" }
+          : { label: "Retry", inFlight: "Retrying…", tooltip: "Tries the same thing again" };
         return m(actionFailureNotice, {
-          title: actionFailureTitle,
-          body: [
-            detail,
-            // Only when the detail does not already say what to do. An input_blocked reason is
-            // the dialog's own advice ("press Enter in its terminal to run it") -- following it
-            // with a vaguer paraphrase of the same instruction is the third time one screen has
-            // told the reader to go look at their terminal.
-            actionFailureKind === "agent_unreachable"
-              ? "The agent's terminal is gone, so restarting it is the only way to deliver this."
-              : isRepeatable && actionFailureKind !== "input_blocked"
-                ? "You can open the agent's terminal, fix it there, then Retry."
-                : null,
-          ],
+          title: isUnconfirmed ? "Couldn't confirm your message arrived" : actionFailureTitle,
+          body: isUnconfirmed
+            ? ["The agent may already have it, so check its terminal before you send it again."]
+            : sendFailureSentence !== undefined
+              ? [
+                  sendFailureSentence,
+                  recovery === null ? null : (SEND_FAILURE_RESTART_SENTENCES[actionFailureKind] ?? null),
+                ]
+              : [detail, isRepeatable ? "You can open the agent's terminal, fix it there, then Retry." : null],
           dismissLabel: isRepeatable || recovery !== null ? "Cancel" : "OK",
           isDismissable: actionFailureInFlight === null,
           onDismiss: dismissActionFailureNotice,
@@ -980,26 +1744,28 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
             ...(isRepeatable
               ? [
                   {
-                    label: actionFailureInFlight === "retry" ? "Retrying…" : "Retry",
-                    tooltip: "Tries the same thing again",
+                    label: actionFailureInFlight === "retry" ? retryWording.inFlight : retryWording.label,
+                    tooltip: retryWording.tooltip,
                     isDisabled: actionFailureInFlight !== null,
                     run: () => void retryFailedSend(),
                   },
                 ]
               : []),
-            // Force needs a message to send afterwards, so it is offered only for our own send --
+            // Restart needs a message to send afterwards, so it is offered only for our own send --
             // and never for an agent that is merely still starting, where restarting would
-            // discard the session it was about to finish bringing up. It is the only thing that
-            // helps an agent that is GONE, which is why it survives Retry being withheld.
-            ...(recovery === null || actionFailureKind === "not_ready"
+            // discard the session it was about to finish bringing up, or for one that may already
+            // be working on this message, where it would cut that turn off and send it twice. It
+            // survives Retry being withheld for an agent that would not start, whose restart is
+            // the stronger way to bring it up.
+            ...(recovery === null || actionFailureKind === "not_ready" || isUnconfirmed
               ? []
               : [
                   {
-                    label: actionFailureInFlight === "force" ? "Forcing…" : "Force",
-                    tooltip: "Restarts agent to reset it & resends message",
+                    label: actionFailureInFlight === "restart" ? "Restarting…" : "Restart",
+                    tooltip: "Restarts the agent, then sends your message. Anything it's working on stops.",
                     isDestructive: true,
                     isDisabled: actionFailureInFlight !== null,
-                    run: () => void forceFailedSend(),
+                    run: () => void restartFailedSend(),
                   },
                 ]),
           ],
@@ -1008,11 +1774,10 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
 
       /**
        * What the armed switch will do, above the composer (spec 5.1): the account the next message
-       * moves the chat to and the model picked for it, with a way to call the choice off. A handoff
-       * also offers a way back into the dialog; a rebind was armed without one, and carries no pick
-       * to change.
+       * moves the chat to and the model picked for it, with a way back into the dialog to change the
+       * pick and a way to call the choice off.
        */
-      function renderSwitchStrip(target: ProviderAccount, isHandoff: boolean): m.Children {
+      function renderSwitchStrip(target: ProviderAccount): m.Children {
         const pick = chatId ? getPendingPick(chatId) : null;
         const destination = pick === null ? target.label : `${target.label}, ${pick.label}`;
         return m(
@@ -1029,20 +1794,18 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
               { class: "message-input-switch-strip-text" },
               `Your next message switches this chat to ${destination}`,
             ),
-            isHandoff
-              ? m(
-                  Button,
-                  {
-                    variant: "ghost",
-                    sm: true,
-                    extra: "message-input-switch-change",
-                    onclick: () => {
-                      if (chatId) openSwitchDialog(chatId, target);
-                    },
-                  },
-                  "Change",
-                )
-              : null,
+            m(
+              Button,
+              {
+                variant: "ghost",
+                sm: true,
+                extra: "message-input-switch-change",
+                onclick: () => {
+                  if (chatId) openSwitchDialog(chatId, target);
+                },
+              },
+              "Change",
+            ),
             m(
               Button,
               {
@@ -1059,10 +1822,33 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
         );
       }
 
-      function renderDeclinedCommandNotice(declined: { command: string; body: string | null }): m.Children {
+      /** What dictation has to say, over the composer: Retry runs held words again, or starts dictation again. */
+      function renderDictationNotice(problem: DictationProblem): m.Children {
+        return dictationNotice(problem, {
+          onRetry: () => {
+            if (dictation?.isHeld) {
+              dictation.retryHeld();
+            } else {
+              dictationProblem = null;
+              toggleDictation();
+            }
+            m.redraw();
+          },
+          onDiscard: () => {
+            dictation?.discardHeld();
+            m.redraw();
+          },
+          onDismiss: () => {
+            dictationProblem = null;
+            m.redraw();
+          },
+        });
+      }
+
+      function renderDeclinedCommandNotice(declined: { title: string; body: string }): m.Children {
         return m(declinedCommandNotice, {
-          title: `${declined.command} can't be sent from chat`,
-          body: [declined.body ?? "You can still send it from the agent's terminal."],
+          title: declined.title,
+          body: [declined.body],
           dismissLabel: "OK",
           onDismiss: dismissDeclinedCommandNotice,
         });
@@ -1090,40 +1876,127 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
         });
       }
 
+      /** In place of the composer while the chat's account is signed out: nothing more goes to it. */
+      function renderSignedOutAccountNotice(signedOutChatId: string): m.Children {
+        return providerNotice(
+          "message-input-signed-out",
+          "You signed out of the account this chat runs on. Choose a provider to continue it on.",
+          () => chooseProviderToContinue(signedOutChatId),
+        );
+      }
+
+      /**
+       * The chooser for a chat with no provider to start on: the sign-in it produces launches a chat still
+       * awaiting its first send right away, so its agent is up before the user has typed, and the first send
+       * goes to the running agent (carrying the seeded conversation, for a seeded chat). A launch the chat app
+       * refuses lands on the page as a failed create, with its "Try again".
+       */
+      function openProviderChooserForFirstSend(awaitingChatId: string): void {
+        openProviderChooser({
+          onSignedIn: (accountId) => {
+            const awaiting = getProvisionalChat(awaitingChatId);
+            if (awaiting?.phase !== "awaiting_first_send" || getChatById(awaitingChatId) !== undefined) return;
+            if (isLaunchInFlight(awaitingChatId)) return;
+            launchChat(awaitingChatId, accountId, "", "agent").catch((error: unknown) => {
+              console.error(
+                `The chat ${awaitingChatId} could not be started on sign-in: ${describeRequestError(error)}`,
+              );
+            });
+          },
+          onRoomChosen: () => void launchAwaitingChatAsRoom(awaitingChatId),
+        });
+      }
+
+      /** In place of the composer while nothing is signed in that a new chat could start on. The chooser opens as the
+       *  notice appears, and its button opens it again once dismissed. */
+      function renderNoProviderNotice(awaitingChatId: string): m.Children {
+        return providerNotice(
+          "message-input-no-provider",
+          "Connect an AI provider to start chatting.",
+          () => openProviderChooserForFirstSend(awaitingChatId),
+          () => openProviderChooserForFirstSend(awaitingChatId),
+        );
+      }
+
       const attachments = getComposerAttachments(chatId);
       const hasMessageText = messageText.trim().length > 0;
       const canSend = hasMessageText || hasReadyAttachments(chatId);
 
       const chat = getChatById(chatId);
       // The switch the chat is in the middle of, if any, and the one the next send would start.
-      // Nothing is pending once a switch is running: the lane was applied by confirming it.
       const handoff = chat?.handoff ?? null;
-      const switchTarget = handoff === null ? pendingSwitchTarget(chatId) : null;
+      const switchTarget = nextSendSwitchTarget(chatId);
+      // A draft typed while the switch request is out waits for it: sent now, it would reach the
+      // agent the chat is leaving, ahead of the switch.
+      const isSendHeldForSwitch = isSwitchSending(chatId);
+      // A chosen provider arms a switch, and the next send carries the chat to it, so the composer
+      // comes back as soon as one is armed, and stays while that switch is sent.
+      const isBlockedBySignedOutAccount =
+        handoff === null &&
+        switchTarget === null &&
+        !isSendHeldForSwitch &&
+        isAccountSignedOut(chat?.active_agent.account_id);
+      // Until the account list has loaded the composer shows as usual: most pages have an account.
+      const awaitingFirstSend = chat === undefined ? getProvisionalChat(chatId) : undefined;
+      const isBlockedByNoProvider =
+        awaitingFirstSend?.phase === "awaiting_first_send" &&
+        areAccountsLoaded() &&
+        accountForFirstSend(awaitingFirstSend.account_id) === null;
+      const isComposerDisabled = isBlockedBySignedOutAccount || isBlockedByNoProvider;
+      isComposerDisabledNow = isComposerDisabled;
+      const canSendNow = canSend && !isComposerDisabled;
+      // The box is read-only while dictation owns it, from the press until the last words land.
+      const isDictating = dictationState !== "idle";
+      // The send that waited for the dictation's words goes once they are in, after this pass has drawn them.
+      if (isSendPendingAfterDictation && !isDictating) {
+        isSendPendingAfterDictation = false;
+        queueMicrotask(() => void handleSubmit());
+      }
+      const blockingNotice = isBlockedBySignedOutAccount
+        ? renderSignedOutAccountNotice(chatId)
+        : isBlockedByNoProvider && chatId !== null
+          ? renderNoProviderNotice(chatId)
+          : null;
 
-      // The stop button is only meaningful while the agent has an interruptible
-      // turn in progress -- the same condition that drives the activity indicator
-      // above the input, read straight off the backend-derived activity state. While the
-      // chat switches harness the turn in progress is the switch's own (the summary it asked
-      // for), so the button is the switch's cancel instead, for as long as that is possible.
-      const isAgentWorking = isWorkingActivityState(chat?.active_agent.activity_state ?? null);
-      const isStopButtonVisible = isAgentWorking && !isInterruptInFlight && handoff === null;
+      // The stop button is there whenever a message of the user's is in progress: while the
+      // agent has an interruptible turn -- the same condition that drives the status row at the
+      // end of the transcript, read straight off the backend-derived activity state -- and while a sent
+      // message waits for the agent to come up, when Stop takes it back. While the chat switches
+      // harness the turn in progress is the switch's own (the summary it asked for), so the button
+      // is the switch's cancel instead, for as long as that is possible.
+      const activityState = chat?.active_agent.activity_state ?? null;
+      const isAgentWorking = isWorkingActivityState(activityState);
+      const isConnecting = isChatConnecting(chatId);
+      const isUninterruptibleCompaction =
+        activityState === COMPACTING_STATE &&
+        getHarnessCatalog(chat?.active_agent.harness)?.can_interrupt_compaction === false;
+      const isStopButtonVisible =
+        (isAgentWorking || isConnecting) && !isInterruptInFlight && handoff === null && !isUninterruptibleCompaction;
       const isCancelSwitchVisible = handoff !== null && isHandoffCancellable(handoff);
       // Read straight off the backend's queue snapshot -- the frontend holds no queued state.
       const hasQueuedMessages = (chat?.active_agent.queued_messages ?? []).length > 0;
-      const stopButtonLabel = hasQueuedMessages
-        ? "Interrupt agent and bring queued messages to draft area"
-        : "Interrupt agent";
+      const stopButtonLabel =
+        isConnecting && !isAgentWorking
+          ? "Stop sending and bring your message back to draft area"
+          : hasQueuedMessages
+            ? "Interrupt agent and bring queued messages to draft area"
+            : "Interrupt agent";
 
+      const isDictationShown = isDictationOffered();
       return m(
         "div",
-        { class: "message-input mx-auto w-full max-w-[calc(var(--width-message-column)+2*var(--radius-xl))]" },
+        {
+          class: "message-input mx-auto w-full max-w-(--width-message-column)",
+          oncreate: isDictationShown ? attachDictationToPage : undefined,
+          onremove: isDictationShown ? detachDictationFromPage : undefined,
+        },
         [
           interceptedAuthCommand !== null ? renderAuthCommandNotice(interceptedAuthCommand) : null,
-          declinedSlashCommand !== null ? renderDeclinedCommandNotice(declinedSlashCommand) : null,
+          declinedSend !== null ? renderDeclinedCommandNotice(declinedSend) : null,
           actionFailureDetail !== null ? renderActionFailureNotice(actionFailureDetail) : null,
-          switchTarget !== null
-            ? renderSwitchStrip(switchTarget, chat === undefined || switchKind(chat, switchTarget) === "handoff")
-            : null,
+          dictationProblem !== null ? renderDictationNotice(dictationProblem) : null,
+          switchTarget !== null ? renderSwitchStrip(switchTarget) : null,
+          blockingNotice,
           m("input", {
             type: "file",
             multiple: true,
@@ -1140,138 +2013,211 @@ export function MessageInput(): m.Component<{ chatId: string | null }> {
               input.value = "";
             },
           }),
-          m("div", { class: INPUT_BOX_CLASS }, [
-            attachments.length > 0
-              ? m(
-                  "div",
-                  { class: "message-input-attachments flex flex-wrap gap-2 pt-3 pr-3 pl-4" },
-                  attachments.map((attachment) => renderComposerAttachment(chatId, attachment)),
-                )
-              : null,
-            m("div", { class: "message-input-row flex flex-row items-center" }, [
-              m("textarea", {
-                class:
-                  "message-input-textbox flex-1 resize-none border-none bg-transparent pt-3.5 pr-2 pb-3.5 pl-5 " +
-                  "font-sans text-(length:--font-size-body) leading-normal text-primary focus:outline-none " +
-                  "placeholder:text-faint",
-                placeholder:
-                  handoff !== null
-                    ? handoffComposerPlaceholder(handoff)
-                    : isAgentWorking
-                      ? "Type to queue more messages..."
-                      : "Type a message...",
-                rows: 1,
-                value: messageText,
-                oncreate: (textareaVnode: m.VnodeDOM) => {
-                  messageTextareaElement = textareaVnode.dom as HTMLTextAreaElement;
-                  autoResizeTextarea(messageTextareaElement);
-                  focusMessageTextarea();
+          composeRow(
+            vnode.attrs.leading,
+            // With no provider to send to, the composer stays in view, holding any draft, but takes nothing.
+            [
+              mentionPopover({
+                rows: mentionRows(),
+                selectedIndex: mentionDraft?.index ?? 0,
+                onPick: pickMention,
+                onHover: (index) => {
+                  if (mentionDraft !== null) mentionDraft = { ...mentionDraft, index };
                 },
-                onupdate: (textareaVnode: m.VnodeDOM) => {
-                  messageTextareaElement = textareaVnode.dom as HTMLTextAreaElement;
-                  autoResizeTextarea(messageTextareaElement);
-                },
-                onremove: () => {
-                  messageTextareaElement = null;
-                },
-                oninput: (event: Event) => {
-                  const textarea = event.target as HTMLTextAreaElement;
-                  messageText = textarea.value;
-                  localStorage.setItem(messageTextKey(chatId), messageText);
-                  autoResizeTextarea(textarea);
-                },
-                onkeydown: handleKeydown,
-                onpaste: handlePaste,
               }),
-              m("div", { class: "message-input-toolbar flex shrink-0 items-center gap-2 pr-3" }, [
-                m(
-                  Button,
-                  {
-                    variant: "ghost",
-                    icon: true,
-                    round: true,
-                    extra: "message-input-attach-button shrink-0",
-                    ...hoverTooltipAttrs("Attach files"),
-                    "aria-label": "Attach files",
-                    onclick: openFilePicker,
-                  },
-                  m.trust(icon("attach", { size: 18 })),
-                ),
-                isCancelSwitchVisible
-                  ? m(
-                      Button,
-                      {
-                        variant: "secondary",
-                        sm: true,
-                        extra: "message-input-cancel-switch-button shrink-0",
-                        readonly: isCancelSwitchInFlight,
-                        ...hoverTooltipAttrs("Keep this chat on its current agent; your message comes back here"),
-                        "aria-label": "Cancel switch",
-                        onclick: () => void handleCancelSwitch(),
-                      },
-                      isCancelSwitchInFlight ? "Cancelling…" : "Cancel switch",
-                    )
-                  : null,
-                isStopButtonVisible
-                  ? m(
-                      Button,
-                      {
-                        variant: "stop",
-                        icon: true,
-                        round: true,
-                        sm: true,
-                        extra: "message-input-stop-button shrink-0",
-                        // The label states what THIS press will do. The button always interrupts;
-                        // it only hands messages back when there are some parked in the harness,
-                        // so promising that unconditionally described a case that usually is not
-                        // the one in front of the user.
-                        ...hoverTooltipAttrs(stopButtonLabel),
-                        "aria-label": stopButtonLabel,
-                        onclick: handleStopToComposer,
-                      },
-                      m.trust(stopIcon(14)),
-                    )
-                  : null,
-                // The send button reads "Switch and send" while a pending lane differs from the
-                // chat's harness (spec 5.1): the next send moves the chat, so the button says so.
-                canSend && switchTarget !== null
-                  ? m(
-                      Button,
-                      {
-                        variant: "primary",
-                        sm: true,
-                        extra: "message-input-send-button message-input-send-button--switch shrink-0",
-                        ...hoverTooltipAttrs(`Switch this chat to ${switchTarget.label} and send`),
-                        "aria-label": "Switch and send",
-                        onclick: handleSubmit,
-                      },
-                      [
-                        m("span", "Switch and send"),
-                        m(
-                          "span",
-                          { class: "ml-1.5 inline-flex items-center" },
-                          m.trust(icon("send", { size: 14, strokeWidth: 2.5 })),
-                        ),
-                      ],
-                    )
-                  : canSend
+              m(
+                "div",
+                {
+                  class: MESSAGE_ROW_CLASS,
+                  "data-attachments": attachments.length > 0 ? "" : undefined,
+                  oncreate: attachMessageRow,
+                  onremove: detachMessageRow,
+                },
+                [
+                  m("textarea", {
+                    class:
+                      "message-input-textbox col-start-2 row-start-1 w-full resize-none border-none bg-transparent " +
+                      "px-1 py-1 font-sans text-(length:--font-size-body) leading-[1.4] text-primary focus:outline-none " +
+                      "placeholder:text-faint group-data-[stacked]/row:col-span-3 group-data-[stacked]/row:col-start-1 " +
+                      "disabled:cursor-not-allowed disabled:opacity-60",
+                    // A switch off a room holds the message like any switch, so its wording comes first.
+                    placeholder:
+                      handoff !== null
+                        ? handoffComposerPlaceholder(handoff)
+                        : composerHint !== null
+                          ? composerHint
+                          : isRoomChat(chatId)
+                            ? "Message (tag @agent to ask the agent)"
+                            : isAgentWorking
+                              ? "Type to queue more messages..."
+                              : "Type a message...",
+                    rows: 1,
+                    disabled: isComposerDisabled,
+                    readonly: isDictating,
+                    value: messageText,
+                    oncreate: (textareaVnode: m.VnodeDOM) => {
+                      messageTextareaElement = textareaVnode.dom as HTMLTextAreaElement;
+                      mountedComposerTextarea = messageTextareaElement;
+                      wasComposerDisabled = isComposerDisabled;
+                      refitComposer();
+                      focusMessageTextarea();
+                    },
+                    onupdate: (textareaVnode: m.VnodeDOM) => {
+                      messageTextareaElement = textareaVnode.dom as HTMLTextAreaElement;
+                      mountedComposerTextarea = messageTextareaElement;
+                      refitComposer(isTypingUntilRedraw);
+                      isTypingUntilRedraw = false;
+                      if (wasComposerDisabled && !isComposerDisabled) focusMessageTextarea();
+                      wasComposerDisabled = isComposerDisabled;
+                    },
+                    onremove: () => {
+                      if (mountedComposerTextarea === messageTextareaElement) mountedComposerTextarea = null;
+                      messageTextareaElement = null;
+                    },
+                    oninput: (event: Event) => {
+                      const textarea = event.target as HTMLTextAreaElement;
+                      messageText = textarea.value;
+                      localStorage.setItem(messageTextKey(chatId), messageText);
+                      updateMentionDraft(textarea);
+                      refitAfterEdit();
+                      if (messageText.trim() !== "") warmUpStoppedChat(chatId);
+                    },
+                    onclick: (event: MouseEvent) => updateMentionDraft(event.target as HTMLTextAreaElement),
+                    onblur: () => {
+                      mentionDraft = null;
+                    },
+                    onkeydown: handleKeydown,
+                    onpaste: handlePaste,
+                  }),
+                  m(
+                    Button,
+                    {
+                      variant: "ghost",
+                      icon: true,
+                      sm: true,
+                      extra: ATTACH_BUTTON_CLASS,
+                      ...hoverTooltipAttrs("Attach files", "above"),
+                      "aria-label": "Attach files",
+                      disabled: isComposerDisabled,
+                      onclick: openFilePicker,
+                    },
+                    m.trust(icon("attach", { size: 16, strokeWidth: 1.5 })),
+                  ),
+                  attachments.length > 0
                     ? m(
-                        Button,
-                        {
-                          variant: "primary",
-                          icon: true,
-                          round: true,
-                          extra: "message-input-send-button shrink-0",
-                          ...hoverTooltipAttrs("Send message"),
-                          "aria-label": "Send message",
-                          onclick: handleSubmit,
-                        },
-                        m.trust(icon("send", { size: 16, strokeWidth: 2.5 })),
+                        "div",
+                        { class: "col-span-3 col-start-1 row-start-2 min-w-0 pt-1" },
+                        m(AttachmentStrip, {
+                          children: attachments.map((attachment) => renderComposerAttachment(chatId, attachment)),
+                        }),
                       )
                     : null,
-              ]),
-            ]),
-          ]),
+                  m("div", { class: TOOLBAR_CLASS }, [
+                    isCancelSwitchVisible
+                      ? m(
+                          Button,
+                          {
+                            variant: "secondary",
+                            sm: true,
+                            extra: "message-input-cancel-switch-button shrink-0",
+                            readonly: isCancelSwitchInFlight,
+                            ...hoverTooltipAttrs(
+                              "Keep this chat on its current agent; your message comes back here",
+                              "above",
+                            ),
+                            "aria-label": "Cancel switch",
+                            onclick: () => void handleCancelSwitch(),
+                          },
+                          isCancelSwitchInFlight ? "Cancelling…" : "Cancel switch",
+                        )
+                      : null,
+                    isStopButtonVisible
+                      ? m(
+                          Button,
+                          {
+                            variant: "stop",
+                            icon: true,
+                            sm: true,
+                            extra: "message-input-stop-button shrink-0",
+                            // The label states what THIS press will do. The button always interrupts;
+                            // it only hands messages back when there are some parked in the harness,
+                            // so promising that unconditionally described a case that usually is not
+                            // the one in front of the user.
+                            ...hoverTooltipAttrs(stopButtonLabel, "above"),
+                            "aria-label": stopButtonLabel,
+                            onclick: handleStopToComposer,
+                          },
+                          m.trust(stopIcon(14)),
+                        )
+                      : null,
+                    isDictationShown
+                      ? m(DictationButton, {
+                          state: dictationState,
+                          progress: dictationProgress,
+                          shortcutLabel: dictationShortcutLabel(isAppleKeyboard()),
+                          disabled: isComposerDisabled,
+                          onToggle: toggleDictation,
+                          onMeter: (setLevel) => {
+                            setMeterLevel = setLevel;
+                          },
+                        })
+                      : null,
+                    // The send button reads "Switch and send" while a pending lane differs from the
+                    // chat's harness (spec 5.1): the next send moves the chat, so the button says so.
+                    // Otherwise it stays in place: the green send button, or with nothing it can send a
+                    // disabled ghost -- the bare arrow, faded.
+                    canSendNow && switchTarget !== null
+                      ? m(
+                          Button,
+                          {
+                            variant: "primary",
+                            sm: true,
+                            extra: "message-input-send-button message-input-send-button--switch shrink-0",
+                            ...hoverTooltipAttrs(`Switch this chat to ${switchTarget.label} and send`, "above"),
+                            "aria-label": "Switch and send",
+                            onclick: handleSubmit,
+                          },
+                          [
+                            m("span", "Switch and send"),
+                            m(
+                              "span",
+                              { class: "ml-1.5 inline-flex items-center" },
+                              m.trust(icon("send", { size: 14, strokeWidth: 2.5 })),
+                            ),
+                          ],
+                        )
+                      : m(
+                          Button,
+                          {
+                            variant: canSendNow ? "primary" : "ghost",
+                            icon: true,
+                            sm: true,
+                            extra: "message-input-send-button shrink-0",
+                            disabled: !canSendNow && !isSendPendingAfterDictation,
+                            // While the dictation's last words are landing, the send waits and says so (spec D8).
+                            readonly: isSendHeldForSwitch || isSendPendingAfterDictation,
+                            ...hoverTooltipAttrs(
+                              isSendPendingAfterDictation
+                                ? "Finishing your words"
+                                : !canSendNow
+                                  ? null
+                                  : isSendHeldForSwitch
+                                    ? "Sending is paused until the switch starts"
+                                    : "Send message",
+                              "above",
+                            ),
+                            "aria-label": "Send message",
+                            onclick: handleSubmit,
+                          },
+                          isSendPendingAfterDictation
+                            ? m.trust(spinnerIcon(16))
+                            : m.trust(icon("send", { size: 16, strokeWidth: 2 })),
+                        ),
+                  ]),
+                ],
+              ),
+            ],
+          ),
         ],
       );
     },

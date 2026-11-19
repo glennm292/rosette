@@ -1,0 +1,622 @@
+/**
+ * The desktop's state and the reducers over it (desktop-interface plan section 6.2): one frozen
+ * record of what this client knows (the apps, the desktops, the active desktop, this client's
+ * layout of it, the render modes, this client's presentation of each pinned entry, the avatar,
+ * and what the phone layout shows),
+ * and every verb of plan section 4 as a pure ``(state, event) -> state`` step. The store applies
+ * these, schedules redraws, and saves when a step marked the layout dirty; nothing here reads the
+ * DOM or the network.
+ */
+
+import type {
+  AppRecord,
+  AvatarStatus,
+  Desktop,
+  EntryMode,
+  EntryPresentation,
+  FloatingPosition,
+  Frame,
+  LaunchPath,
+  Layout,
+  PinStyle,
+  Placement,
+  StoredWindowPath,
+  WindowRecord,
+  WindowState,
+} from "../model/records";
+import { EMPTY_LAYOUT, SHOWN_HOME } from "../model/records";
+import type { UpdateNotice } from "../model/UpdateNotice";
+import {
+  effectivePlacements,
+  focusedWindowId,
+  withWindowDetached,
+  withWindowFrame,
+  withWindowMinimized,
+  withWindowPlacedOnOpen,
+  withWindowRaised,
+  withWindowReattached,
+  withWindowRestored,
+  withWindowState,
+  withoutPlacement,
+} from "../geometry/stack";
+import type { RenderModes } from "../theme/metrics";
+
+export interface DesktopState {
+  readonly clientId: string;
+  readonly apps: readonly AppRecord[];
+  /** False until the first ``apps_updated`` has arrived, so an empty list is not read as "no apps". */
+  readonly isAppsLoaded: boolean;
+  readonly desktops: readonly Desktop[];
+  readonly isDesktopsLoaded: boolean;
+  readonly activeDesktopId: string | null;
+  /** This client's layout of the active desktop. */
+  readonly layout: Layout;
+  /** False between a desktop switch and the fetch of its layout answering. */
+  readonly isLayoutLoaded: boolean;
+  /** This client's last known own path and title of each independent window on a desktop other than the active
+   *  one, which the layout does not hold: the phone shows every desktop's windows. */
+  readonly otherDesktopWindowPaths: Readonly<Record<string, StoredWindowPath>>;
+  /** Bumped by every gesture that changed the layout; a save carries the version it wrote. */
+  readonly layoutVersion: number;
+  /** The version the last save wrote, so ``isLayoutDirty`` is a comparison rather than a flag. */
+  readonly savedLayoutVersion: number;
+  readonly modes: RenderModes;
+  /** This client's presentation of each pinned entry, by app name (global across desktops). */
+  readonly entries: Readonly<Record<string, EntryPresentation>>;
+  /** The avatar every window of the workspace draws (pinned-taskbar-entries plan section 4.6). */
+  readonly avatar: AvatarState;
+  /** The rollback point the last update-app careful-flow apply kept, until a person closes its notice. */
+  readonly updateNotice: UpdateNotice | null;
+  /** What the workspace is called, as the inventory names it. */
+  readonly workspaceName: string;
+  /** What the phone layout shows and has shown (plan-phone-interface.md). */
+  readonly phone: PhoneState;
+}
+
+/** What the phone layout puts on the screen: the home grid, or one window's page. */
+export type PhoneShown = { readonly kind: "home" } | { readonly kind: "window"; readonly windowId: string };
+
+/** The phone's sheets: the windows sheet the pill opens, and the start sheet the plus opens. */
+export type PhoneSheet = "windows" | "start";
+
+export interface PhoneState {
+  /** Null until the phone layout first lands (the desktops have not arrived, or only the desktop layout has been
+   *  drawn); kept across a switch to the desktop layout and back, so the phone resumes where it was. */
+  readonly shown: PhoneShown | null;
+  /** What this client recorded showing, most recent last: window ids and ``SHOWN_HOME``, each at most once. */
+  readonly history: readonly string[];
+  readonly sheet: PhoneSheet | null;
+}
+
+/** The most entries the shown history keeps, as the shell bounds it. */
+export const SHOWN_HISTORY_LIMIT = 20;
+
+export const INITIAL_PHONE_STATE: PhoneState = { shown: null, history: [], sheet: null };
+
+/** The avatar as this window draws it: the workspace's design, the design a failed load falls back to, and
+ *  the last status the shell pushed (stale and idle until one arrives). */
+export interface AvatarState {
+  readonly design: string;
+  readonly defaultDesign: string;
+  readonly status: AvatarStatus;
+}
+
+/** The design drawn until the shell says otherwise: the one the shell bundles as its default. */
+export const INITIAL_AVATAR_DESIGN = "imbue-character";
+
+export const INITIAL_AVATAR_STATE: AvatarState = {
+  design: INITIAL_AVATAR_DESIGN,
+  defaultDesign: INITIAL_AVATAR_DESIGN,
+  status: { mood: "idle", is_stale: true },
+};
+
+export function initialDesktopState(clientId: string, modes: RenderModes): DesktopState {
+  return {
+    clientId,
+    apps: [],
+    isAppsLoaded: false,
+    desktops: [],
+    isDesktopsLoaded: false,
+    activeDesktopId: null,
+    layout: EMPTY_LAYOUT,
+    isLayoutLoaded: false,
+    otherDesktopWindowPaths: {},
+    layoutVersion: 0,
+    savedLayoutVersion: 0,
+    modes,
+    entries: {},
+    avatar: INITIAL_AVATAR_STATE,
+    updateNotice: null,
+    workspaceName: "",
+    phone: INITIAL_PHONE_STATE,
+  };
+}
+
+export type DesktopEvent =
+  | { readonly type: "apps_updated"; readonly apps: readonly AppRecord[] }
+  | { readonly type: "desktops_updated"; readonly desktops: readonly Desktop[] }
+  | { readonly type: "desktop_activated"; readonly desktopId: string }
+  | { readonly type: "layout_loaded"; readonly desktopId: string; readonly layout: Layout }
+  | {
+      readonly type: "window_paths_loaded";
+      readonly desktopId: string;
+      readonly windowPaths: Readonly<Record<string, StoredWindowPath>>;
+    }
+  | {
+      readonly type: "layout_saved";
+      readonly desktopId: string;
+      readonly version: number;
+      readonly updatedAt: string | null;
+    }
+  | { readonly type: "window_raised"; readonly windowId: string }
+  | { readonly type: "window_minimized"; readonly windowId: string }
+  | { readonly type: "window_restored"; readonly windowId: string }
+  | { readonly type: "window_state_set"; readonly windowId: string; readonly state: WindowState }
+  | { readonly type: "window_frame_set"; readonly windowId: string; readonly frame: Frame }
+  /** The window was pulled out into a desktop window of the chrome's own (the pull-out-window spec). */
+  | { readonly type: "window_detached"; readonly windowId: string }
+  /** The window came back to the desktop, at ``frame`` when a drop back onto the desktop named one. */
+  | { readonly type: "window_reattached"; readonly windowId: string; readonly frame: Frame | null }
+  | {
+      readonly type: "window_opened_here";
+      readonly desktopId: string;
+      readonly window: WindowRecord;
+      readonly isNew: boolean;
+      /** The shell placed a new window out of sight for this client. */
+      readonly isMinimized: boolean;
+    }
+  | { readonly type: "window_closed_here"; readonly desktopId: string; readonly windowId: string }
+  | { readonly type: "window_location_reported"; readonly desktopId: string; readonly window: WindowRecord }
+  | { readonly type: "render_modes_changed"; readonly modes: RenderModes }
+  /** This client's entry presentations, as its record or a ``client_entries_changed`` says. */
+  | { readonly type: "entries_updated"; readonly entries: Readonly<Record<string, EntryPresentation>> }
+  /** The ``avatar_status`` the shell pushed. */
+  | { readonly type: "avatar_status_updated"; readonly status: AvatarStatus }
+  /** The workspace's design, as the catalog or an ``avatar_selection_changed`` says. */
+  | { readonly type: "avatar_selection_updated"; readonly design: string; readonly defaultDesign: string | null }
+  /** The ``update_notice_changed`` the shell pushed (and its seed on connect); null once the record is cleared. */
+  | { readonly type: "update_notice_changed"; readonly notice: UpdateNotice | null }
+  | { readonly type: "workspace_name_updated"; readonly workspaceName: string }
+  /** The phone shows the home grid or a window, which goes to the front of its history. */
+  | { readonly type: "phone_shown"; readonly shown: PhoneShown }
+  /** The history this client's record carries, as the shell answered it. */
+  | { readonly type: "phone_history_loaded"; readonly history: readonly string[] }
+  | { readonly type: "phone_sheet_set"; readonly sheet: PhoneSheet | null };
+
+/** Whether a gesture has changed the layout since the last save wrote it. */
+export function isLayoutDirty(state: DesktopState): boolean {
+  return state.layoutVersion !== state.savedLayoutVersion;
+}
+
+function withLayoutEdited(state: DesktopState, layout: Layout): DesktopState {
+  if (layout === state.layout) return state;
+  return { ...state, layout, layoutVersion: state.layoutVersion + 1 };
+}
+
+/** The state after a switch to ``desktopId``: the layout unknown until it is fetched. */
+function withDesktopActivated(state: DesktopState, desktopId: string): DesktopState {
+  if (state.activeDesktopId === desktopId) return state;
+  return {
+    ...state,
+    activeDesktopId: desktopId,
+    layout: EMPTY_LAYOUT,
+    isLayoutLoaded: false,
+    otherDesktopWindowPaths: { ...state.otherDesktopWindowPaths, ...state.layout.window_paths },
+    layoutVersion: state.layoutVersion + 1,
+    savedLayoutVersion: state.layoutVersion + 1,
+  };
+}
+
+function withDesktopsUpdated(state: DesktopState, desktops: readonly Desktop[]): DesktopState {
+  const next: DesktopState = { ...state, desktops, isDesktopsLoaded: true };
+  // A client whose desktop was deleted lands on the first remaining one (plan section 3.5).
+  const isActiveGone =
+    next.activeDesktopId !== null && !desktops.some((desktop) => desktop.id === next.activeDesktopId);
+  if (isActiveGone && desktops.length > 0) return withDesktopActivated(next, desktops[0].id);
+  return next;
+}
+
+function withWindowOpenedHere(
+  state: DesktopState,
+  desktopId: string,
+  window: WindowRecord,
+  isNew: boolean,
+  isMinimized: boolean,
+): DesktopState {
+  const desktops = state.desktops.map((desktop) => {
+    if (desktop.id !== desktopId || desktop.windows.some((candidate) => candidate.id === window.id)) return desktop;
+    return { ...desktop, windows: [...desktop.windows, window] };
+  });
+  const withWindow: DesktopState = { ...state, desktops };
+  if (desktopId !== state.activeDesktopId) return withWindow;
+  // The shell already wrote this placement; the local copy is what the broadcast will confirm, so
+  // it is not counted as a gesture to save. When the broadcast's refetch landed before the answer,
+  // the layout already holds the stored placement, which is kept rather than cascaded again.
+  const isPlaced = state.layout.placements.some((placement) => placement.window_id === window.id);
+  if (isMinimized) {
+    if (!isNew || isPlaced) return withWindow;
+    return { ...withWindow, layout: withWindowMinimized(withWindowPlacedOnOpen(state.layout, window.id), window.id) };
+  }
+  const layout =
+    isNew && !isPlaced ? withWindowPlacedOnOpen(state.layout, window.id) : withWindowRaised(state.layout, window.id);
+  return { ...withWindow, layout };
+}
+
+/** ``entry`` moved to the end of ``history`` (an entry is recorded once), keeping the newest ``SHOWN_HISTORY_LIMIT``. */
+export function withShownRecorded(history: readonly string[], entry: string): string[] {
+  return [...history.filter((candidate) => candidate !== entry), entry].slice(-SHOWN_HISTORY_LIMIT);
+}
+
+/** The ``shown_history`` spelling of what the phone shows. */
+export function shownHistoryEntry(shown: PhoneShown): string {
+  return shown.kind === "home" ? SHOWN_HOME : shown.windowId;
+}
+
+function withPhoneShown(state: DesktopState, shown: PhoneShown): DesktopState {
+  const history = withShownRecorded(state.phone.history, shownHistoryEntry(shown));
+  return { ...state, phone: { ...state.phone, shown, history, sheet: null } };
+}
+
+function withWindowClosedHere(state: DesktopState, desktopId: string, windowId: string): DesktopState {
+  const desktops = state.desktops.map((desktop) =>
+    desktop.id === desktopId
+      ? { ...desktop, windows: desktop.windows.filter((candidate) => candidate.id !== windowId) }
+      : desktop,
+  );
+  const layout = desktopId === state.activeDesktopId ? withoutPlacement(state.layout, windowId) : state.layout;
+  return { ...state, desktops, layout };
+}
+
+/** The window's record as the location route answered it, in place; nothing for a window since gone. An
+ *  independent window's answer is this client's own path and title, which live beside the layout rather than on
+ *  the shared record (not a gesture: the layout's version is untouched), or beside the state for a window on
+ *  another desktop. */
+function withWindowLocationReported(state: DesktopState, desktopId: string, window: WindowRecord): DesktopState {
+  const desktop = state.desktops.find((candidate) => candidate.id === desktopId);
+  if (desktop === undefined || !desktop.windows.some((candidate) => candidate.id === window.id)) return state;
+  if (window.scope === "independent") {
+    const reported = { path: window.path, title: window.title };
+    if (desktopId !== state.activeDesktopId) {
+      const known = state.otherDesktopWindowPaths[window.id];
+      if (known?.path === window.path && known.title === window.title) return state;
+      return { ...state, otherDesktopWindowPaths: { ...state.otherDesktopWindowPaths, [window.id]: reported } };
+    }
+    const stored = state.layout.window_paths[window.id];
+    if (stored?.path === window.path && stored.title === window.title) return state;
+    const window_paths = { ...state.layout.window_paths, [window.id]: reported };
+    return { ...state, layout: { ...state.layout, window_paths } };
+  }
+  const desktops = state.desktops.map((candidate) =>
+    candidate.id === desktopId
+      ? { ...candidate, windows: candidate.windows.map((current) => (current.id === window.id ? window : current)) }
+      : candidate,
+  );
+  return { ...state, desktops };
+}
+
+export function reduceDesktopState(state: DesktopState, event: DesktopEvent): DesktopState {
+  switch (event.type) {
+    case "apps_updated":
+      return { ...state, apps: event.apps, isAppsLoaded: true };
+    case "desktops_updated":
+      return withDesktopsUpdated(state, event.desktops);
+    case "desktop_activated":
+      return withDesktopActivated(state, event.desktopId);
+    case "layout_loaded":
+      if (event.desktopId !== state.activeDesktopId) return state;
+      return {
+        ...state,
+        layout: event.layout,
+        isLayoutLoaded: true,
+        layoutVersion: state.layoutVersion + 1,
+        savedLayoutVersion: state.layoutVersion + 1,
+      };
+    case "window_paths_loaded":
+      // The client's stored paths alone: the placements file did not move, so the local placements (a gesture
+      // still waiting to be saved among them) stay as they are.
+      if (event.desktopId !== state.activeDesktopId) return state;
+      return { ...state, layout: { ...state.layout, window_paths: event.windowPaths } };
+    case "layout_saved": {
+      if (event.desktopId !== state.activeDesktopId) return state;
+      // A save answered after a newer layout was loaded says nothing about the layout now held.
+      if (event.version < state.savedLayoutVersion) return state;
+      const layout = event.updatedAt === null ? state.layout : { ...state.layout, updated_at: event.updatedAt };
+      return { ...state, layout, savedLayoutVersion: event.version };
+    }
+    case "window_raised":
+      return withLayoutEdited(state, withWindowRaised(state.layout, event.windowId));
+    case "window_minimized":
+      return withLayoutEdited(state, withWindowMinimized(state.layout, event.windowId));
+    case "window_restored":
+      return withLayoutEdited(state, withWindowRestored(state.layout, event.windowId));
+    case "window_state_set":
+      return withLayoutEdited(state, withWindowState(state.layout, event.windowId, event.state));
+    case "window_frame_set":
+      return withLayoutEdited(state, withWindowFrame(state.layout, event.windowId, event.frame));
+    case "window_detached":
+      return withLayoutEdited(state, withWindowDetached(state.layout, event.windowId));
+    case "window_reattached":
+      return withLayoutEdited(state, withWindowReattached(state.layout, event.windowId, event.frame));
+    case "window_opened_here":
+      return withWindowOpenedHere(state, event.desktopId, event.window, event.isNew, event.isMinimized);
+    case "window_closed_here":
+      return withWindowClosedHere(state, event.desktopId, event.windowId);
+    case "window_location_reported":
+      return withWindowLocationReported(state, event.desktopId, event.window);
+    case "render_modes_changed":
+      return { ...state, modes: event.modes };
+    case "entries_updated":
+      return { ...state, entries: event.entries };
+    case "avatar_status_updated":
+      return { ...state, avatar: { ...state.avatar, status: event.status } };
+    case "avatar_selection_updated":
+      return {
+        ...state,
+        avatar: {
+          ...state.avatar,
+          design: event.design,
+          defaultDesign: event.defaultDesign ?? state.avatar.defaultDesign,
+        },
+      };
+    case "update_notice_changed":
+      return { ...state, updateNotice: event.notice };
+    case "workspace_name_updated":
+      return { ...state, workspaceName: event.workspaceName };
+    case "phone_shown":
+      return withPhoneShown(state, event.shown);
+    case "phone_history_loaded":
+      return { ...state, phone: { ...state.phone, history: event.history.slice(-SHOWN_HISTORY_LIMIT) } };
+    case "phone_sheet_set":
+      if (state.phone.sheet === event.sheet) return state;
+      return { ...state, phone: { ...state.phone, sheet: event.sheet } };
+  }
+}
+
+export function activeDesktop(state: DesktopState): Desktop | null {
+  return state.desktops.find((desktop) => desktop.id === state.activeDesktopId) ?? null;
+}
+
+export function desktopById(state: DesktopState, desktopId: string): Desktop | null {
+  return state.desktops.find((desktop) => desktop.id === desktopId) ?? null;
+}
+
+export function appByName(state: DesktopState, name: string): AppRecord | undefined {
+  return state.apps.find((app) => app.name === name);
+}
+
+/** The apps a user can open from: every non-internal row, in registry order. */
+export function openableApps(state: DesktopState): AppRecord[] {
+  return state.apps.filter((app) => !app.internal);
+}
+
+/** Where a draft goes (pinned-taskbar-entries plan section 4.7, the post-launch-paths plan section 4.3): a pinned
+ *  window on the active desktop whose app declares a launch path with a ``draft_param``; the launch is run into
+ *  that window with the text as the draft param. Null when no pinned app takes a draft. */
+export interface DraftTarget {
+  readonly window: WindowRecord;
+  readonly launchPath: LaunchPath;
+}
+
+export function draftTargetOf(state: DesktopState): DraftTarget | null {
+  for (const window of activeDesktop(state)?.windows ?? []) {
+    if (!window.is_pinned) continue;
+    const app = appByName(state, window.app);
+    const launchPath = app?.launch_paths.find((candidate) => candidate.draft_param !== null);
+    if (launchPath !== undefined) return { window, launchPath };
+  }
+  return null;
+}
+
+/** The app's pinned window on the active desktop (the shell keeps one per pinned app per desktop), or null. */
+export function pinnedWindowOf(state: DesktopState, app: string): WindowRecord | null {
+  return activeDesktop(state)?.windows.find((window) => window.app === app && window.is_pinned) ?? null;
+}
+
+/** The pinned window the avatar stands for, on the active desktop: the one whose pin declares the avatar style,
+ *  else the first pinned window there; null with none. The shell names no app: whichever app declares the style
+ *  is the avatar's. */
+export function avatarPinnedWindow(state: DesktopState): WindowRecord | null {
+  const pinned = taskbarEntries(state).filter((entry) => entry.isPinned);
+  return pinned.find((entry) => entry.look?.declaredStyle === "avatar")?.window ?? pinned[0]?.window ?? null;
+}
+
+/** A window of any desktop, with the desktop it is on. */
+export function findWindow(state: DesktopState, windowId: string): { desktop: Desktop; window: WindowRecord } | null {
+  for (const desktop of state.desktops) {
+    const window = desktop.windows.find((candidate) => candidate.id === windowId);
+    if (window !== undefined) return { desktop, window };
+  }
+  return null;
+}
+
+/** Whether an app registered for the Imbue Studio chrome's messages of ``type``, so the shell relays them. */
+export function isEmbedderMessageHandled(state: DesktopState, type: string): boolean {
+  return state.apps.some((app) => app.message_handlers.some((handler) => handler.type === type));
+}
+
+/** Every window of the active desktop placed, back to front. */
+export function activePlacements(state: DesktopState): Placement[] {
+  const desktop = activeDesktop(state);
+  return desktop === null ? [] : effectivePlacements(state.layout, desktop);
+}
+
+export function activeFocusedWindowId(state: DesktopState): string | null {
+  return focusedWindowId(activePlacements(state));
+}
+
+/** The title a window shows: what its page reported, else its app's display name. */
+export function windowTitle(window: WindowRecord, app: AppRecord | undefined): string {
+  if (window.title !== "") return window.title;
+  return app?.display_name ?? window.app;
+}
+
+/** The window as this client sees it: an independent window wears the client's stored path and title (the home
+ *  path with no title when it has none), from the active desktop's layout or, for another desktop's window, what
+ *  this client last knew of it; a linked window is the shared record. */
+export function effectiveWindow(state: DesktopState, window: WindowRecord): WindowRecord {
+  if (window.scope === "linked") return window;
+  const stored = state.layout.window_paths[window.id] ?? state.otherDesktopWindowPaths[window.id];
+  return stored === undefined ? window : { ...window, path: stored.path, title: stored.title };
+}
+
+/** The title this client shows for the window. */
+export function effectiveWindowTitle(state: DesktopState, window: WindowRecord, app: AppRecord | undefined): string {
+  return windowTitle(effectiveWindow(state, window), app);
+}
+
+/** Whether the workspace may Quit this app, and the shell's parker wakes it while it is stopped: supervised, not
+ *  critical to the workspace, and not running inside a critical app's program (the shell refuses those the same
+ *  way). */
+export function isAppStoppable(state: DesktopState, app: AppRecord): boolean {
+  if (app.program === "" || app.critical) return false;
+  return !state.apps.some((other) => other.critical && other.program === app.program);
+}
+
+/** Whether an app is shown as stopped: not running, and nothing brings it back on a request. A stoppable app's
+ *  stopped state is the shell's parker answering for it (the stop-when-no-windows spec, decision 7), so its
+ *  windows and shortcuts draw as ready; a row the workspace cannot start (no supervised program, critical, or
+ *  inside a critical app's program) is honestly down. */
+export function isAppShownStopped(state: DesktopState, app: AppRecord | undefined): boolean {
+  return app !== undefined && !app.is_running && !isAppStoppable(state, app);
+}
+
+/** Whether a window reads as minimized in these placements; one the placements lack reads as minimized. */
+export function isWindowMinimized(placements: readonly Placement[], windowId: string): boolean {
+  return placements.find((placement) => placement.window_id === windowId)?.is_minimized ?? true;
+}
+
+/** Whether a window is pulled out into a desktop window of the chrome's own. */
+export function isWindowDetached(placements: readonly Placement[], windowId: string): boolean {
+  return placements.find((placement) => placement.window_id === windowId)?.is_detached ?? false;
+}
+
+/** One pulled-out window as the shell reports it to the embedder (the pull-out-window spec, section 5.5). */
+export interface DetachedWindowReport {
+  readonly windowId: string;
+  readonly title: string;
+}
+
+/** The pulled-out windows of the active desktop with their titles, in opening order. */
+export function detachedWindowsOf(state: DesktopState): DetachedWindowReport[] {
+  const desktop = activeDesktop(state);
+  if (desktop === null) return [];
+  const placements = activePlacements(state);
+  return desktop.windows
+    .filter((window) => isWindowDetached(placements, window.id))
+    .map((window) => ({
+      windowId: window.id,
+      title: effectiveWindowTitle(state, window, appByName(state, window.app)),
+    }));
+}
+
+/** What a pinned entry looks like for this client: the mode and style it chose, or the pin's defaults. */
+export interface EntryLook {
+  readonly mode: EntryMode;
+  readonly style: PinStyle;
+  /** The style the pin declares, which the client may choose over plain; ``plain`` when it declares none. */
+  readonly declaredStyle: PinStyle;
+  readonly position: FloatingPosition | null;
+  /** Whether this client lists the pinned window in its taskbar; false after the client closed it. */
+  readonly isWindowShown: boolean;
+}
+
+/** One entry of the taskbar: a window of the active desktop, in opening order. */
+export interface TaskbarEntry {
+  readonly window: WindowRecord;
+  readonly app: AppRecord | undefined;
+  readonly title: string;
+  readonly isMinimized: boolean;
+  /** Pulled out into a desktop window of the chrome's own; the entry shows that window rather than restoring. */
+  readonly isDetached: boolean;
+  readonly isFocused: boolean;
+  /** The app's pinned window: its entry is a plain bar entry, absent while this client closed the window, and
+   *  its Close closes the window for this client alone rather than for everyone. */
+  readonly isPinned: boolean;
+  /** How this client shows the entry; null for an ordinary window's entry. */
+  readonly look: EntryLook | null;
+}
+
+/** The look a pinned entry has for this client (plan section 3.4): its own presentation, else the pin's defaults. */
+export function entryLook(state: DesktopState, window: WindowRecord, app: AppRecord | undefined): EntryLook | null {
+  if (!window.is_pinned) return null;
+  const pin = app?.pin ?? null;
+  const declaredStyle = pin?.style ?? "plain";
+  const own = state.entries[window.app];
+  // A stored style is plain or the declared one; one stored under an earlier manifest falls back.
+  const ownStyle = own !== undefined && (own.style === "plain" || own.style === declaredStyle) ? own.style : null;
+  return {
+    mode: own?.mode ?? pin?.default_mode ?? "bar",
+    style: ownStyle ?? declaredStyle,
+    declaredStyle,
+    position: own?.position ?? null,
+    isWindowShown: own?.is_window_shown ?? true,
+  };
+}
+
+export function taskbarEntries(state: DesktopState): TaskbarEntry[] {
+  const desktop = activeDesktop(state);
+  if (desktop === null) return [];
+  const placements = effectivePlacements(state.layout, desktop);
+  const focused = focusedWindowId(placements);
+  return desktop.windows.map((window) => {
+    const app = appByName(state, window.app);
+    return {
+      window,
+      app,
+      title: effectiveWindowTitle(state, window, app),
+      isMinimized: isWindowMinimized(placements, window.id),
+      isDetached: isWindowDetached(placements, window.id),
+      isFocused: window.id === focused,
+      isPinned: window.is_pinned,
+      look: entryLook(state, window, app),
+    };
+  });
+}
+
+/** Whether an entry's app also draws its floating creature: its mode says so. */
+export function isEntryFloating(entry: TaskbarEntry): boolean {
+  return entry.look !== null && entry.look.mode === "floating";
+}
+
+/** The entries the bar draws, in opening order: every window of the active desktop, the pinned ones as plain
+ *  entries whatever their mode (the floating creature is the avatar, not the window's entry) -- except a pinned
+ *  window this client closed, which stays out of the bar while it is minimized (showing it lists it back). */
+export function barEntries(state: DesktopState): TaskbarEntry[] {
+  return taskbarEntries(state).filter(
+    (entry) => entry.look === null || entry.look.isWindowShown || !entry.isMinimized,
+  );
+}
+
+/** The entries drawn floating above the windows. */
+export function floatingEntries(state: DesktopState): TaskbarEntry[] {
+  return taskbarEntries(state).filter((entry) => isEntryFloating(entry));
+}
+
+/** The pinned entry drawn as the workspace's avatar (the chat's), whose window the agent attends to while it is
+ *  focused (the multiplayer spec, section 6.4); null when no pinned app declares the avatar style. */
+export function avatarPinnedEntryOf(state: DesktopState): TaskbarEntry | null {
+  return taskbarEntries(state).find((entry) => entry.isPinned && entry.look?.declaredStyle === "avatar") ?? null;
+}
+
+/** The values of a window path's query ("/?chat=abc" gives ["abc"]); none with no query. */
+function pathQueryValues(path: string): string[] {
+  const queryStart = path.indexOf("?");
+  if (queryStart === -1) return [];
+  return Array.from(new URLSearchParams(path.slice(queryStart + 1)).values());
+}
+
+/** Whether this client is looking at the chat (the multiplayer spec, section 6.5): a window of the active desktop
+ *  whose path carries the chat's id among its query values, and which is the focused (topmost shown) window or is
+ *  pulled out into a desktop window of the chrome's own (on the user's screen whatever the stack says). A
+ *  minimized window, and a window on another desktop, is not being looked at. The shell names no app: the id is
+ *  matched against every query value, never a key of the chat app's own. */
+export function isChatOnScreen(state: DesktopState, chatId: string): boolean {
+  if (chatId === "") return false;
+  const placements = activePlacements(state);
+  const focused = focusedWindowId(placements);
+  return (activeDesktop(state)?.windows ?? []).some(
+    (window) =>
+      (window.id === focused || isWindowDetached(placements, window.id)) &&
+      pathQueryValues(effectiveWindow(state, window).path).includes(chatId),
+  );
+}

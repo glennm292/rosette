@@ -1,0 +1,169 @@
+// @vitest-environment jsdom
+import "../testing/dom";
+import { mountView, unmountViews } from "@imbue/workspace-ui/src/testing/mount";
+import m from "mithril";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  appRecord,
+  chatLikeAppRecord,
+  desktopRecord,
+  getMethodFreeTextAppRecord,
+  launchPathRecord,
+  windowRecord,
+} from "../testing/records";
+import { desktopStateWithApps } from "../testing/states";
+import { initialDesktopState, reduceDesktopState } from "../reducers/desktopState";
+import type { DesktopState } from "../reducers/desktopState";
+import { defaultHighlightIndex, launcherRowsOf } from "../reducers/launcherRows";
+import type { LauncherMenuRows } from "../reducers/launcherRows";
+import { LauncherMenu, secondaryKeyLabel, textPreview } from "./LauncherMenu";
+import type { LauncherMenuAttrs } from "./LauncherMenu";
+
+afterEach(unmountViews);
+
+const chatty = chatLikeAppRecord("chatty");
+const terminal = appRecord("terminal", { launch_paths: [launchPathRecord({ id: "new", label: "New Terminal" })] });
+
+function stateWithWindows(): DesktopState {
+  let next = initialDesktopState("client-1", { isPhone: false, isTouch: false });
+  next = reduceDesktopState(next, { type: "apps_updated", apps: [terminal, chatty] });
+  next = reduceDesktopState(next, {
+    type: "desktops_updated",
+    desktops: [
+      desktopRecord("home", { windows: [windowRecord("win-2", "terminal", "/?session=t", { title: "shell" })] }),
+    ],
+  });
+  return reduceDesktopState(next, { type: "desktop_activated", desktopId: "home" });
+}
+
+function render(
+  menu: LauncherMenuRows,
+  overrides: Partial<LauncherMenuAttrs> = {},
+): { root: HTMLElement; attrs: LauncherMenuAttrs } {
+  const attrs: LauncherMenuAttrs = {
+    menu,
+    highlightIndex: defaultHighlightIndex(menu.rows),
+    isApplePlatform: false,
+    bottomOffsetPx: 0,
+    onRun: vi.fn(),
+    onHighlight: vi.fn(),
+    onAppShortcutContextMenu: vi.fn(),
+    ...overrides,
+  };
+  return { root: mountView(() => m(LauncherMenu, attrs)), attrs };
+}
+
+function rowKeys(root: HTMLElement): string[] {
+  return Array.from(root.querySelectorAll("[data-launcher-row]")).map((row) => row.getAttribute("data-launcher-row")!);
+}
+
+describe("the launcher menu", () => {
+  it("draws the launch-path rows then the primary text row, the first highlighted and wearing Enter", () => {
+    const { root } = render(launcherRowsOf(stateWithWindows(), ""));
+    expect(root.querySelector("[data-launcher-overlay]")).not.toBeNull();
+    expect(rowKeys(root)).toEqual(["launch:chatty:root", "launch:terminal:new", "tour", "text:chatty:new"]);
+    expect(root.querySelector("[data-tour-row]")!.textContent).toContain("Show me around");
+    // Each row is the menu's own row part, which themes dress as they dress every menu's rows.
+    expect(
+      Array.from(root.querySelectorAll("[data-launcher-row]")).map((row) => row.getAttribute("data-part")),
+    ).toEqual(["menu-item", "menu-item", "menu-item", "menu-item"]);
+    const first = root.querySelector('[data-launch="chatty:root"]')!;
+    expect(first.getAttribute("data-highlighted")).toBe("true");
+    expect(first.querySelector('[data-key="enter"]')!.textContent).toBe("Enter");
+    expect(root.querySelector('[data-launch="terminal:new"]')!.getAttribute("data-highlighted")).toBe("false");
+    expect(root.querySelector('[data-text-action="primary"]')!.getAttribute("data-launch")).toBe("chatty:new");
+    // The Enter caption is the highlight's alone; nothing typed, so no secondary row and no window rows.
+    expect(root.querySelectorAll('[data-key="enter"]')).toHaveLength(1);
+    expect(root.querySelector('[data-text-action="secondary"]')).toBeNull();
+    expect(root.querySelector("[data-launcher-window]")).toBeNull();
+    expect(root.querySelector(".launcher-no-matches")).toBeNull();
+  });
+
+  it("sits above the field: its foot is lifted by the field's rise", () => {
+    const grounded = render(launcherRowsOf(stateWithWindows(), ""));
+    expect((grounded.root.querySelector("[data-launcher-overlay]") as HTMLElement).style.bottom).toBe("0px");
+    unmountViews();
+    const lifted = render(launcherRowsOf(stateWithWindows(), ""), { bottomOffsetPx: 140 });
+    expect((lifted.root.querySelector("[data-launcher-overlay]") as HTMLElement).style.bottom).toBe("140px");
+  });
+
+  it("the Enter caption follows a moved highlight; the secondary row always wears its chord", () => {
+    const menu = launcherRowsOf(stateWithWindows(), "shell");
+    const secondaryIndex = menu.rows.findIndex((row) => row.kind === "text" && row.textAction === "secondary");
+    const { root } = render(menu, { highlightIndex: secondaryIndex });
+    const secondary = root.querySelector('[data-text-action="secondary"]')!;
+    expect(secondary.getAttribute("data-highlighted")).toBe("true");
+    expect(secondary.textContent).toContain("Ctrl+Enter");
+    expect(secondary.querySelector('[data-key="enter"]')).not.toBeNull();
+    expect(root.querySelector('[data-text-action="primary"]')!.querySelector('[data-key="enter"]')).toBeNull();
+    expect(root.querySelectorAll('[data-key="enter"]')).toHaveLength(1);
+  });
+
+  it("while typing shows the matching windows and repeats the text on the free-text rows; with no match, says so", () => {
+    const { root } = render(launcherRowsOf(stateWithWindows(), "shell"));
+    expect(root.querySelector('[data-launcher-window="win-2"]')).not.toBeNull();
+    expect(root.querySelector('[data-text-action="primary"]')!.textContent).toContain("“shell”");
+    expect(root.querySelector('[data-text-action="secondary"]')!.getAttribute("data-disabled")).toBeNull();
+    unmountViews();
+    const noMatch = render(launcherRowsOf(stateWithWindows(), "zzzz"));
+    expect(noMatch.root.querySelector(".launcher-no-matches")!.textContent).toBe("No apps or windows match");
+    expect(noMatch.root.querySelector('[data-text-action="primary"]')!.getAttribute("data-highlighted")).toBe("true");
+    // The note stands in for the empty sections, so it opens the card and the divider sits between it and the rows.
+    const textSection = noMatch.root.querySelector('[data-section="text"]')!;
+    expect(textSection.children[0].className).toContain("launcher-no-matches");
+    expect(textSection.children[1].className).toContain("border-t");
+    expect(textSection.children[2].getAttribute("data-text-action")).toBe("primary");
+  });
+
+  it("a click runs an enabled row and a hover moves the highlight; a disabled row runs nothing and takes no hover", () => {
+    const { root, attrs } = render(launcherRowsOf(stateWithWindows(), ""));
+    (root.querySelector('[data-launch="terminal:new"]') as HTMLElement).click();
+    expect(attrs.onRun).toHaveBeenCalledWith(expect.objectContaining({ key: "launch:terminal:new" }));
+    root.querySelector('[data-text-action="primary"]')!.dispatchEvent(new PointerEvent("pointerenter"));
+    expect(attrs.onHighlight).toHaveBeenCalledWith(3);
+    (root.querySelector("[data-tour-row]") as HTMLElement).click();
+    expect(attrs.onRun).toHaveBeenCalledWith(expect.objectContaining({ kind: "tour" }));
+    unmountViews();
+    // A GET free-text row over the path bound is the disabled row; the chat-like app's POST rows never are.
+    const bounded = desktopStateWithApps([getMethodFreeTextAppRecord("noting", ["new", "send"])]);
+    const tooLong = render(launcherRowsOf(bounded, "x".repeat(2100)));
+    const disabled = tooLong.root.querySelector('[data-text-action="secondary"]') as HTMLElement;
+    expect(disabled.getAttribute("data-disabled")).toBe("true");
+    disabled.click();
+    disabled.dispatchEvent(new PointerEvent("pointerenter"));
+    expect(tooLong.attrs.onRun).not.toHaveBeenCalled();
+    expect(tooLong.attrs.onHighlight).not.toHaveBeenCalled();
+  });
+
+  it("reports a right-click on the row of an app's own desktop shortcut, and leaves every other row's alone", () => {
+    const { root, attrs } = render(launcherRowsOf(stateWithWindows(), ""));
+    const row = root.querySelector('[data-launch="terminal:new"]') as HTMLElement;
+    const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 12, clientY: 34 });
+    row.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(attrs.onAppShortcutContextMenu).toHaveBeenCalledWith("terminal", "new", 12, 34, row);
+    // The chat-like app's default shortcut names its text launch path, which has no launcher row, so its root row
+    // (not its shortcut), like a free-text row, keeps the right-click every other surface gets.
+    for (const selector of ['[data-launch="chatty:root"]', '[data-text-action="primary"]']) {
+      const other = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+      root.querySelector(selector)!.dispatchEvent(other);
+      expect(other.defaultPrevented).toBe(false);
+    }
+    expect(attrs.onAppShortcutContextMenu).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the shortcut row's right-click alone with no handler, as the phone's start sheet passes", () => {
+    const { root } = render(launcherRowsOf(stateWithWindows(), ""), { onAppShortcutContextMenu: null });
+    const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    root.querySelector('[data-launch="terminal:new"]')!.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("spells the secondary key for the platform and previews the first words of the text", () => {
+    expect(secondaryKeyLabel(true)).toBe("Cmd+Enter");
+    expect(secondaryKeyLabel(false)).toBe("Ctrl+Enter");
+    expect(textPreview("")).toBe("");
+    expect(textPreview("plan the launch")).toBe("plan the launch");
+    expect(textPreview("one two three four five six")).toBe("one two three four…");
+  });
+});

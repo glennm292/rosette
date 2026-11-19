@@ -1,11 +1,14 @@
 """Verification of the broker's handoff JWT at the gateway's login callback.
 
 The broker (at the accounts domain) mints a 60-second RS256 token
-``{sub, email, aud: <workspace-domain>, jti, nonce}`` and redirects the
+``{sub, email, owner, aud: <workspace-domain>, jti, nonce}`` and redirects the
 visitor here. Verification: signature against the broker's published JWKS
 (cached; refreshed once on an unknown ``kid``), audience must be exactly this
 workspace's domain, ``nonce`` must match the state this gateway minted for the
-pending login, and each ``jti`` is single-use.
+pending login, and each ``jti`` is single-use. The verified claims become the
+requester's identity record, which the session cookie then carries. An older
+broker may still add profile claims (``display_name``, ``avatar_url``); they
+are ignored -- profiles live in the connector, not in the gateway's record.
 """
 
 import threading
@@ -13,7 +16,10 @@ import time
 
 import httpx
 import jwt
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from jwt import algorithms as jwt_algorithms
+
+from share_gateway.identity import RequesterIdentity
 
 _HANDOFF_ALGORITHM = "RS256"
 _JWKS_FETCH_TIMEOUT_SECONDS = 10.0
@@ -24,40 +30,29 @@ class HandoffVerificationError(ValueError):
     """Raised when a handoff token fails any verification step."""
 
 
-class HandoffResult:
-    """A verified handoff token's identity: the visitor's email and whether they own the workspace."""
-
-    def __init__(self, email: str, is_owner: bool) -> None:
-        self.email = email
-        self.is_owner = is_owner
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, HandoffResult):
-            return NotImplemented
-        return self.email == other.email and self.is_owner == other.is_owner
-
-
 class JwksCache:
     """Fetches and caches the broker's JWKS, refreshing once when a kid is unknown."""
 
-    def __init__(self, jwks_url: str, preloaded_keys_by_kid: dict[str, object] | None = None) -> None:
+    def __init__(self, jwks_url: str, preloaded_keys_by_kid: dict[str, RSAPublicKey] | None = None) -> None:
         # preloaded_keys_by_kid lets tests (and pre-warmed callers) inject keys
         # without a network fetch; unknown kids still trigger a refresh.
         self._jwks_url = jwks_url
-        self._keys_by_kid: dict[str, object] = dict(preloaded_keys_by_kid or {})
+        self._keys_by_kid: dict[str, RSAPublicKey] = dict(preloaded_keys_by_kid or {})
         self._lock = threading.Lock()
 
     def _refresh(self) -> None:
         response = httpx.get(self._jwks_url, timeout=_JWKS_FETCH_TIMEOUT_SECONDS)
         response.raise_for_status()
-        fresh_keys: dict[str, object] = {}
+        fresh_keys: dict[str, RSAPublicKey] = {}
         for key_entry in response.json().get("keys", []):
             kid = key_entry.get("kid")
             if kid and key_entry.get("kty") == "RSA":
-                fresh_keys[str(kid)] = jwt_algorithms.RSAAlgorithm.from_jwk(key_entry)
+                key = jwt_algorithms.RSAAlgorithm.from_jwk(key_entry)
+                if isinstance(key, RSAPublicKey):
+                    fresh_keys[str(kid)] = key
         self._keys_by_kid = fresh_keys
 
-    def key_for_kid(self, kid: str) -> object:
+    def key_for_kid(self, kid: str) -> RSAPublicKey:
         """The public key for ``kid``; raises HandoffVerificationError when unknown even after refresh."""
         with self._lock:
             cached = self._keys_by_kid.get(kid)
@@ -101,8 +96,8 @@ def verify_handoff_token(
     workspace_domain: str,
     jwks_cache: JwksCache,
     jti_registry: SingleUseJtiRegistry,
-) -> HandoffResult:
-    """Verify a handoff token end to end and return the visitor's identity."""
+) -> RequesterIdentity:
+    """Verify a handoff token end to end and return the visitor's identity record."""
     try:
         header = jwt.get_unverified_header(token)
     except jwt.PyJWTError as exc:
@@ -127,7 +122,10 @@ def verify_handoff_token(
         raise HandoffVerificationError("handoff token has no jti")
     if not jti_registry.claim(jti):
         raise HandoffVerificationError("handoff token was already used")
+    user_id = claims.get("sub")
+    if not isinstance(user_id, str) or not user_id:
+        raise HandoffVerificationError("handoff token has no sub")
     email = claims.get("email")
     if not isinstance(email, str) or not email:
         raise HandoffVerificationError("handoff token has no email")
-    return HandoffResult(email=email, is_owner=bool(claims.get("owner", False)))
+    return RequesterIdentity(user_id=user_id, email=email, is_owner=bool(claims.get("owner", False)))

@@ -7,7 +7,7 @@ import { buildMessageWithAttachments } from "../models/attachments";
 vi.mock("@imbue/workspace-ui/src/base-path", () => ({ apiUrl: (path: string) => path }));
 // message-renderers pulls in the shell connection (chat/shell.ts, and the agents store
 // behind it); stub it out.
-vi.mock("../shell", () => ({ openSubagentTab: vi.fn(), startChatOnAccount: vi.fn() }));
+vi.mock("../shell", () => ({ openSubagentView: vi.fn(), startChatOnAccount: vi.fn() }));
 // The bubble renders the attachment block through MarkdownContent, which sets
 // innerHTML imperatively in oncreate. Stub it with a marker component so the
 // vnode walk can read the content it was handed without needing a DOM.
@@ -72,19 +72,19 @@ function renderBubble(content: string): Collected {
 }
 
 describe("user message bubble with attachments", () => {
-  it("keeps the typed text and hands the attachment line to markdown (not hidden)", () => {
+  it("keeps the typed text and hands the attachment markdown, without its label, to markdown", () => {
     const { texts, markdownContents } = renderBubble(buildMessageWithAttachments("here is the file", [IMAGE_PATH]));
 
     expect(texts.join(" ")).toContain("here is the file");
     // The path is not in the plain-text nodes: it lives inside the markdown block.
     expect(texts.join(" ")).not.toContain(IMAGE_PATH);
     expect(markdownContents).toHaveLength(1);
-    expect(markdownContents[0]).toContain("See attachment here:");
+    expect(markdownContents[0]).not.toContain("See attachment here:");
     // Image: inline image markdown with the absolute path as both alt and URL.
     expect(markdownContents[0]).toContain(`![${IMAGE_PATH}](${IMAGE_PATH})`);
   });
 
-  it("renders a non-image attachment as a download link, not an inline image", () => {
+  it("renders a non-image attachment as a file link, not an inline image", () => {
     const { markdownContents } = renderBubble(buildMessageWithAttachments("", [FILE_PATH]));
 
     expect(markdownContents).toHaveLength(1);

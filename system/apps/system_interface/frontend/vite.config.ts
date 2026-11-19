@@ -2,6 +2,7 @@ import { defineConfig } from "vite";
 import tailwindcss from "@tailwindcss/vite";
 import { configDefaults } from "vitest/config";
 import path from "path";
+import { themeBoot } from "@imbue/workspace-ui/src/themes/themeBoot";
 
 export default defineConfig({
   // `dist/` is not part of this project's output -- the bundle goes to
@@ -19,18 +20,20 @@ export default defineConfig({
   test: {
     exclude: [...configDefaults.exclude, "dist/**"],
   },
-  plugins: [tailwindcss()],
+  // themeBoot wears the theme this origin last wore before the first paint (workspace-themes plan section 5.3).
+  plugins: [tailwindcss(), themeBoot()],
   publicDir: "media",
   root: ".",
   resolve: {
     alias: {
-      // The minds embed contract -- the single sanctioned postMessage channel
-      // between this UI and the embedding minds chrome -- is consumed from the
-      // vendored mngr tree so both sides always ship from one source of truth.
-      // Types come from the library's src/embed-contract.d.ts; keep the two in sync.
+      // The Imbue Studio embed contract -- the single sanctioned postMessage channel
+      // between this UI and the embedding Imbue Studio chrome -- is fetched from the
+      // mngr commit pyproject.toml pins (system/scripts/fetch_mngr_assets.sh, run
+      // by the npm workspace root's prebuild) so both sides always ship from one source.
+      // Types come from src/embed-contract.d.ts; keep the two in sync.
       "@minds/embed-contract": path.resolve(
         __dirname,
-        "../../../vendor/mngr/apps/minds/imbue/minds/desktop_client/static/embed_contract.js",
+        "../../../vendor/mngr-assets/apps/minds/imbue/minds/desktop_client/static/embed_contract.js",
       ),
     },
   },
@@ -42,6 +45,8 @@ export default defineConfig({
       // (vite.contract.config.ts); the chat page is the chat app's own build.
       input: {
         index: path.resolve(__dirname, "index.html"),
+        // The theme gallery (workspace-themes plan section 8.2), served at /theme-gallery.
+        gallery: path.resolve(__dirname, "theme-gallery.html"),
       },
     },
   },

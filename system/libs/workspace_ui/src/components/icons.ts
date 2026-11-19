@@ -2,7 +2,7 @@
 //
 // Icons are authored once here and consumed everywhere as SVG *strings*, which
 // works for both rendering paths in this codebase: Mithril views wrap them with
-// `m.trust(...)`, and the plain-DOM tab bar / lightbox assign them to
+// `m.trust(...)`, and the plain-DOM lightbox assigns them to
 // `element.innerHTML`. Keeping icons as strings (rather than Mithril vnodes)
 // is what lets a single definition serve both.
 //
@@ -11,8 +11,15 @@
 // differs, so it lives in STROKE_PATHS and `icon()` wraps it. Filled or
 // otherwise non-standard glyphs (stop, warning, the Claude logo, the progress
 // status badges, the login spinner) have their own builders below.
+//
+// The glyphs named for Lucide below are that project's path data, copied rather
+// than imported; its notice is in THIRD_PARTY_NOTICES.md at the repo root.
 
 const XMLNS = "http://www.w3.org/2000/svg";
+
+/** The capsule of the Lucide "mic" glyph, which the chat's dictation button also draws filled to the input
+ *  level; the glyph is the capsule, its cradle, and its stand. */
+export const MIC_CAPSULE_PATH = "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z";
 
 // Inner markup for stroke-outline icons, all drawn on a 24x24 grid.
 const STROKE_PATHS = {
@@ -20,24 +27,20 @@ const STROKE_PATHS = {
     '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
   // The single canonical "x".
   close: '<path d="M18 6L6 18"/><path d="M6 6l12 12"/>',
-  // Closing a tab and taking its object off the machine are different acts, so
-  // they get different glyphs: a minus puts the tab away and leaves the thing
-  // running, an "x" ends it everywhere.
-  minus: '<path d="M6 12h12"/>',
-  // A third act between those two, and it gets a third glyph: taking an object
-  // out of ONE project. The bare minus is already "put the tab away", and the
-  // object here keeps running and stays in Everything, so neither that nor the
-  // "x" says it. The ring is what marks it as acting on the filing rather than
-  // on the tab.
-  "minus-circle": '<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>',
   file: '<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z"/>',
+  pointer:
+    '<path d="M9 9l5 12 1.8-5.2L21 14z"/><path d="M7.2 2.2l.6 2.4"/><path d="M2.2 7.2l2.4.6"/><path d="M3.6 3.6l1.7 1.7"/>',
   send: '<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>',
+  // Lucide "mic": the composer's dictation button.
+  mic: `<path d="${MIC_CAPSULE_PATH}"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/>`,
   trash:
     '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
   // Lucide "user-plus": sharing grants people access by email, so the glyph
   // shows a person being added.
   "user-plus":
     '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6"/><path d="M22 11h-6"/>',
+  // Lucide "user": a neutral silhouette for a person who has no name or picture to show.
+  user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
   power: '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>',
   refresh:
     '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
@@ -47,7 +50,7 @@ const STROKE_PATHS = {
   check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
   // The key that heads a permission request, and the cube that stands in for a
   // app with no bundled brand mark. Both are lucide (`key-round`, `box`) --
-  // the same two glyphs the minds app draws on its own permission surfaces, so
+  // the same two glyphs Imbue Studio draws on its own permission surfaces, so
   // the in-chat card and the review popup agree.
   key: '<path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/>',
   box: '<path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>',
@@ -61,16 +64,63 @@ const STROKE_PATHS = {
   // others as the toggle that would pin them.
   star: '<path d="M12 2.5l2.94 6.26 6.86.83-5.06 4.73 1.32 6.79L12 17.77l-6.06 3.34 1.32-6.79-5.06-4.73 6.86-.83z"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
+  // The tool glyphs the transcript's inline tool chips draw, one per kind of
+  // thing an agent does (see views/ToolChipGroup.ts). All lucide, like `key`
+  // and `box` above; the kinds the workspace already had a glyph for reuse it
+  // (`file` reads a file, `edit` writes one, `search` greps).
+  terminal: '<path d="m7 11 2-2-2-2"/><path d="M11 13h4"/><rect width="18" height="18" x="3" y="3" rx="2"/>',
+  // lucide `sparkle`: the skill/agentic flourish, one star rather than three so
+  // it still reads at 13px.
+  sparkle:
+    '<path d="M9.94 15.5A2 2 0 0 0 8.5 14.06l-6.14-1.58a.5.5 0 0 1 0-.96L8.5 9.94A2 2 0 0 0 9.94 8.5l1.58-6.14a.5.5 0 0 1 .96 0L14.06 8.5A2 2 0 0 0 15.5 9.94l6.14 1.58a.5.5 0 0 1 0 .96L15.5 14.06a2 2 0 0 0-1.44 1.44l-1.58 6.14a.5.5 0 0 1-.96 0z"/>',
+  bot: '<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>',
+  globe:
+    '<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>',
+  // The fallback for a tool with no glyph of its own.
+  wrench:
+    '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  // lucide `package-open` and `package`: the chips that mark a compaction of the
+  // agent's context starting and finishing.
+  "package-open":
+    '<path d="M12 22v-9"/><path d="M15.17 2.21a1.67 1.67 0 0 1 1.63 0L21 4.57a1.93 1.93 0 0 1 0 3.36L8.82 14.79a1.655 1.655 0 0 1-1.64 0L3 12.43a1.93 1.93 0 0 1 0-3.36z"/><path d="M20 13v3.87a2.06 2.06 0 0 1-1.11 1.83l-6 3.08a1.93 1.93 0 0 1-1.78 0l-6-3.08A2.06 2.06 0 0 1 4 16.87V13"/><path d="M21 12.43a1.93 1.93 0 0 0 0-3.36L8.83 2.2a1.64 1.64 0 0 0-1.63 0L3 4.57a1.93 1.93 0 0 0 0 3.36l12.18 6.86a1.636 1.636 0 0 0 1.63 0z"/>',
+  package:
+    '<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M12 22V12"/><polyline points="3.29 7 12 12 20.71 7"/><path d="m7.5 4.27 9 5.15"/>',
   "external-link":
     '<path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M19 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h6"/>',
   edit: '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/>',
   "folder-plus":
     '<path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  // The Files app's chrome: its view switcher, its sidebar's shortcuts and shares, and the verbs of its menus. All lucide.
+  "layout-grid":
+    '<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/>',
+  list: '<path d="M3 12h.01"/><path d="M3 18h.01"/><path d="M3 6h.01"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M8 6h13"/>',
+  columns: '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="M15 3v18"/>',
+  plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  upload:
+    '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
+  "panel-left": '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>',
+  info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
+  ellipsis: '<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
+  // Folder and page in the Files app icon's hand: no edge quite straight (system/apps/files/icon.svg).
+  folder:
+    '<path d="M5.34 3.72C7.32 3.67 8.61 3.72 9.46 3.81C10.45 3.91 10.97 4.43 11.54 5.28C12.11 6.13 12.44 6.56 13.34 6.61C15.22 6.7 17.72 6.51 19.66 6.61C21.27 6.7 22.09 7.93 21.99 9.49C21.85 12.04 21.47 15.26 21.04 17.77C20.76 19.38 19.77 20.18 17.97 20.23C13.81 20.32 8.37 20.32 4.72 20.18C2.97 20.09 2.23 19.52 2.11 17.77C1.79 13.39 2.26 9.21 2.5 6.56C2.64 4.71 3.54 3.77 5.34 3.72Z"/>',
+  page: '<path d="M6.46 2.1C8.94 1.94 11.5 1.97 13.76 2.05C14.3 2.06 14.66 2.23 15.04 2.6L18.66 6.28C19 6.64 19.15 7.01 19.15 7.55C19.22 11.28 18.84 16.28 18.14 20.32C18.05 21.5 17.4 21.97 16.32 22.03C13.22 22.13 9.26 21.77 6.6 21.61C5.52 21.52 4.94 20.98 4.85 19.94C4.67 16.32 4.69 9.8 4.89 3.77C4.93 2.64 5.43 2.15 6.46 2.1Z"/><path d="M13.85 2.12C14.07 3.61 14.03 4.91 14.12 5.93C14.2 6.73 14.59 7.1 15.4 7.16C16.61 7.23 17.92 7.18 19.09 7.23"/>',
+  house:
+    '<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  inbox:
+    '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+  mail: '<rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/>',
+  "file-plus":
+    '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M9 15h6"/><path d="M12 18v-6"/>',
+  copy: '<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
   settings:
     '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
 } as const;
 
 export type IconName = keyof typeof STROKE_PATHS;
+
+/** Every stroke-outline icon's name, in the order above. */
+export const ICON_NAMES = Object.keys(STROKE_PATHS) as readonly IconName[];
 
 export interface IconOptions {
   // Pixel size. Omit to let CSS size the svg.
@@ -80,6 +130,12 @@ export interface IconOptions {
   // Draw the glyph solid instead of as an outline. Only sensible for shapes that read as a
   // silhouette -- the composer chip's "fast mode" bolt, which has to say "on" at 12px.
   filled?: boolean;
+}
+
+/** The paths of a stroke-outline icon alone, for a drawing that frames them itself (the dictation button draws
+ *  the mic over its own filled capsule) on the same 24x24 grid. */
+export function iconPaths(name: IconName): string {
+  return STROKE_PATHS[name];
 }
 
 /** Full <svg> string for a stroke-outline icon. */
@@ -113,12 +169,23 @@ export function warningIcon(size = 26): string {
   );
 }
 
-/** Animated login spinner. Not a CSS ring like .spinner (the faded ring +
+/** A filled disc with a white exclamation, in the current colour: something needs a look. */
+export function alertDotIcon(size = 12, className = ""): string {
+  const cls = className === "" ? "" : ` class="${className}"`;
+  return (
+    `<svg xmlns="${XMLNS}"${cls} width="${size}" height="${size}" viewBox="0 0 24 24" aria-hidden="true">` +
+    `<circle cx="12" cy="12" r="11" fill="currentColor"/>` +
+    `<path d="M12 6.8v6" stroke="#fff" stroke-width="2.8" stroke-linecap="round"/>` +
+    `<circle cx="12" cy="17" r="1.6" fill="#fff"/></svg>`
+  );
+}
+
+/** Animated spinner: sign-in, an attachment's upload. Not a CSS ring like .spinner (the faded ring +
  *  solid arc are drawn in the SVG itself), so it carries its own size and
  *  rotation -- the animation references the shared @keyframes spin. */
-export function loginSpinnerIcon(): string {
+export function spinnerIcon(size = 32): string {
   return (
-    `<svg xmlns="${XMLNS}" class="claude-login-spinner h-8 w-8 animate-[spin_800ms_linear_infinite]" viewBox="0 0 24 24" fill="none" aria-hidden="true">` +
+    `<svg xmlns="${XMLNS}" width="${size}" height="${size}" class="spinner-icon animate-[spin_800ms_linear_infinite]" viewBox="0 0 24 24" fill="none" aria-hidden="true">` +
     `<circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.18" stroke-width="3"/>` +
     `<path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>`
   );
@@ -132,7 +199,7 @@ const PV_ICON_BASE = "inline-flex shrink-0 items-center justify-center";
 /** Completed step: filled disc with a white check. */
 export function statusDoneIcon(): string {
   return (
-    `<svg xmlns="${XMLNS}" class="pv-icon pv-icon--done ${PV_ICON_BASE} text-secondary" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">` +
+    `<svg xmlns="${XMLNS}" class="pv-icon pv-icon--done ${PV_ICON_BASE} text-step-done" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">` +
     `<circle cx="8" cy="8" r="7" fill="currentColor"/>` +
     `<path d="M4.5 8L7 10.5L11.5 6" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`
   );
@@ -150,7 +217,7 @@ export function statusRingIcon(): string {
 /** Pending step: a dashed circle outline. */
 export function statusPendingIcon(): string {
   return (
-    `<svg xmlns="${XMLNS}" class="pv-icon pv-icon--pending ${PV_ICON_BASE} text-faint" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">` +
+    `<svg xmlns="${XMLNS}" class="pv-icon pv-icon--pending ${PV_ICON_BASE} text-step-pending" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">` +
     `<circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2"/></svg>`
   );
 }

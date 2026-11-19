@@ -19,11 +19,13 @@ from imbue.chat.accounts import Account
 from imbue.chat.accounts import AccountError
 from imbue.chat.agent_discovery import AgentInfo
 from imbue.chat.agent_discovery import SendFailedError
+from imbue.chat.chat_autocompact import ChatAutocompactState
 from imbue.chat.chat_rebinds import RebindCancelledError
 from imbue.chat.chat_rebinds import RebindDeps
 from imbue.chat.chat_rebinds import RebindRunner
 from imbue.chat.chat_rebinds import rebind_cancel_refused_detail
 from imbue.chat.chat_rebinds import relabel_account_command
+from imbue.chat.chat_rebinds import relabel_autocompact_command
 from imbue.chat.chat_rebinds import start_command
 from imbue.chat.chat_records import ChatAgentEntry
 from imbue.chat.chat_records import ChatRecord
@@ -31,9 +33,13 @@ from imbue.chat.chat_records import InMemoryChatRecordStore
 from imbue.chat.harnesses.harness_type import HarnessType
 from imbue.chat.harnesses.session import SendOutcome
 from imbue.chat.models import AgentStateItem
+from imbue.chat.models import HandoffFailedStep
 from imbue.chat.models import HandoffPhase
 from imbue.chat.models import HeldSend
 from imbue.chat.models import HeldSendOrigin
+from imbue.chat.models import ModelApplyError
+from imbue.chat.models import ModelPick
+from imbue.chat.models import ModelPickRejectedError
 from imbue.chat.primitives import ChatId
 from imbue.chat.testing import make_chat_rebind_record
 from imbue.concurrency_group.event_utils import ShutdownEvent
@@ -58,11 +64,23 @@ class _FakeWorkspace(MutableModel):
     store: InMemoryChatRecordStore = Field(default_factory=InMemoryChatRecordStore)
     agents: dict[str, AgentStateItem] = Field(default_factory=dict)
     delivered: list[tuple[str, str, str]] = Field(default_factory=list)
+    # The message ids the rebind lists as delivered at each delivery, the one being delivered last.
+    delivered_lists_seen: list[list[str]] = Field(default_factory=list)
     drained: list[str] = Field(default_factory=list)
     stopped: list[str] = Field(default_factory=list)
     evicted: list[str] = Field(default_factory=list)
     revived: list[str] = Field(default_factory=list)
     relabeled: list[tuple[str, dict[str, str]]] = Field(default_factory=list)
+    # The model picks that landed, and how many attempts were made in all.
+    applied_picks: list[tuple[str, ModelPick]] = Field(default_factory=list)
+    pick_attempt_count: int = 0
+    # How many attempts the harness refuses before taking the pick; a rejection refuses every one.
+    pick_refusal_count: int = 0
+    is_pick_rejected: bool = False
+    # The steps that reach the agent, in order: the start, the pick, and each delivery.
+    agent_steps: list[str] = Field(default_factory=list)
+    clock: float = 0.0
+    slept: list[float] = Field(default_factory=list)
     drain_block: str = ""
     is_delivery_refused: bool = False
     is_target_account_gone: bool = False
@@ -94,8 +112,7 @@ class _FakeWorkspace(MutableModel):
             rebind = record.rebind
             assert rebind is not None
             if rebind.held_sends:
-                remaining = rebind.model_copy_update(to_update(rebind.field_ref().held_sends, rebind.held_sends[1:]))
-                self.store.write(record.with_converging(remaining))
+                self.store.write(record.with_converging(rebind.with_oldest_held_send_delivered()))
                 return rebind.held_sends[0]
             # The manager drops a one-agent chat's record with the finished rebind.
             if len(record.agents) == 1:
@@ -137,10 +154,30 @@ class _FakeWorkspace(MutableModel):
         return self.tmp_path / "accounts" / account_id
 
     def deliver(self, agent_info: AgentInfo, text: str, message_id: str) -> SendOutcome:
+        record = self.record()
+        if record is not None and record.rebind is not None:
+            self.delivered_lists_seen.append([held.message_id for held in record.rebind.delivered_sends])
         if self.is_delivery_refused:
             raise SendFailedError("the agent is in shell mode", kind="INPUT_BLOCKED")
         self.delivered.append((agent_info.id, text, message_id))
+        self.agent_steps.append(f"deliver {text}")
         return SendOutcome.OK
+
+    def apply_model(self, agent_info: AgentInfo, pick: ModelPick) -> None:
+        self.pick_attempt_count += 1
+        if self.is_pick_rejected:
+            raise ModelPickRejectedError(f"Unknown model: {pick.model_id}")
+        if self.pick_attempt_count <= self.pick_refusal_count:
+            raise ModelApplyError("Failed to deliver /model to the agent")
+        self.applied_picks.append((agent_info.id, pick))
+        self.agent_steps.append(f"model {pick.model_id}")
+
+    def monotonic(self) -> float:
+        return self.clock
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.clock += seconds
 
     def drain_to_composer(self, agent_info: AgentInfo) -> str:
         self.drained.append(agent_info.id)
@@ -163,6 +200,7 @@ class _FakeWorkspace(MutableModel):
 
     def note_agent_alive(self, agent_id: str) -> None:
         self.revived.append(agent_id)
+        self.agent_steps.append("start")
         state = self.agents[agent_id]
         self.agents[agent_id] = state.model_copy_update(to_update(state.field_ref().state, "WAITING"))
 
@@ -254,17 +292,23 @@ def _runner(workspace: _FakeWorkspace, **overrides: Any) -> RebindRunner:
         resolve_account=workspace.resolve_account,
         account_dir=workspace.account_dir,
         deliver=workspace.deliver,
+        apply_model=workspace.apply_model,
         drain_to_composer=workspace.drain_to_composer,
         stop_agent=workspace.stop_agent,
         evict_watcher=workspace.evict_watcher,
         note_agent_relabeled=workspace.note_agent_relabeled,
         note_agent_alive=workspace.note_agent_alive,
+        monotonic=workspace.monotonic,
+        sleep=workspace.sleep,
+        model_pick_budget_seconds=5.0,
+        model_pick_retry_interval_seconds=1.0,
     )
     return RebindRunner.build(RebindDeps(**{**bound, **overrides}))
 
 
 def test_the_relabel_and_start_argv_are_accepted_by_the_live_cli() -> None:
     assert_mngr_argv_valid(relabel_account_command("mngr", "agent-1", "acct-2"))
+    assert_mngr_argv_valid(relabel_autocompact_command("mngr", "agent-1", ChatAutocompactState(is_enabled=False)))
     assert_mngr_argv_valid(start_command("mngr", "Chat-1"))
 
 
@@ -364,7 +408,7 @@ def test_a_failed_start_leaves_the_failed_phase_with_mngrs_words_and_the_binding
 
     record = workspace.record()
     assert record is not None and record.rebind is not None
-    assert record.rebind.phase is HandoffPhase.FAILED
+    assert record.rebind.phase is HandoffPhase.FAILED and record.rebind.failed_step is HandoffFailedStep.START
     # The exit summary on one line, mngr's output under it, neither repeated.
     assert record.rebind.error == "mngr start exited with code 1\ntmux: server exited"
     assert workspace.delivered == [] and workspace.revived == []
@@ -428,9 +472,7 @@ def test_a_resume_after_the_env_was_rewritten_still_finds_the_sessions_where_the
     # A last process that died after recording the old dir and rewriting the env, before moving.
     workspace.store.write(
         record.with_converging(
-            record.rebind.model_copy_update(
-                to_update(record.rebind.field_ref().claude_sessions_config_dir, str(old_dir))
-            )
+            record.rebind.model_copy_update(to_update(record.rebind.field_ref().sessions_dir, str(old_dir)))
         )
     )
     (tmp_path / "agents" / agent_id / "env").write_text(
@@ -458,7 +500,7 @@ def test_a_retry_on_a_third_account_moves_the_sessions_on_from_where_the_failed_
     _runner(workspace).run(workspace.chat_id, "rebind-1")
     failed = workspace.record()
     assert failed is not None and failed.rebind is not None and failed.rebind.phase is HandoffPhase.FAILED
-    assert failed.rebind.claude_sessions_config_dir == str(workspace.account_dir(_NEW_ACCOUNT.id))
+    assert failed.rebind.sessions_dir == str(workspace.account_dir(_NEW_ACCOUNT.id))
 
     # The retry on a third account of the same lane, as the manager rewrites the entry.
     (workspace.fail_dir / "fail-start").unlink()
@@ -595,8 +637,10 @@ def test_a_refused_held_send_does_not_stop_the_ones_behind_it(tmp_path: Path) ->
 
     _runner(workspace).run(workspace.chat_id, "rebind-1")
 
-    # Both were popped (a refusal is logged, not raised), and the rebind finished.
+    # Both were taken to be delivered (a refusal is logged, not raised), each leaving the delivered list once
+    # refused, and the rebind finished.
     assert workspace.delivered == [] and workspace.record() is None
+    assert workspace.delivered_lists_seen == [["trigger-1"], ["m-2"]]
 
 
 def test_a_runner_for_a_rebind_that_is_gone_does_nothing(tmp_path: Path) -> None:
@@ -607,3 +651,149 @@ def test_a_runner_for_a_rebind_that_is_gone_does_nothing(tmp_path: Path) -> None
     with pytest.raises(RebindCancelledError):
         _runner(workspace).drain(workspace.chat_id, "rebind-1")
     assert workspace.agents[agent_id].state == "RUNNING"
+
+
+_PICK = ModelPick(model_id="claude-opus-4-6", effort="high")
+
+
+def _pick_rebind(
+    workspace: _FakeWorkspace,
+    restarted_account_id: str | None = None,
+    is_model_pick_applied: bool = False,
+    target_account_id: str = _NEW_ACCOUNT.id,
+) -> None:
+    """Give the workspace's rebind the model pick, with how far an earlier attempt got."""
+    record = workspace.record()
+    assert record is not None and record.rebind is not None
+    rebind = record.rebind.model_copy_update(
+        to_update(record.rebind.field_ref().model_pick, _PICK),
+        to_update(record.rebind.field_ref().restarted_account_id, restarted_account_id),
+        to_update(record.rebind.field_ref().is_model_pick_applied, is_model_pick_applied),
+        to_update(record.rebind.field_ref().target_account_id, target_account_id),
+    )
+    workspace.store.write(record.with_converging(rebind))
+
+
+def _retry_as_the_manager_does(workspace: _FakeWorkspace) -> None:
+    """The retry route's rewrite of a failed rebind on the same account: back to restarting, the failure cleared."""
+    record = workspace.record()
+    assert record is not None and record.rebind is not None
+    workspace.store.write(
+        record.with_converging(
+            record.rebind.model_copy_update(
+                to_update(record.rebind.field_ref().phase, HandoffPhase.RESTARTING),
+                to_update(record.rebind.field_ref().error, None),
+                to_update(record.rebind.field_ref().failed_step, None),
+            )
+        )
+    )
+
+
+def test_a_rebinds_model_pick_lands_after_the_restart_and_before_the_held_sends(tmp_path: Path) -> None:
+    """The pick governs the agent's first turn back, so it reaches the agent once it is up and before anything held."""
+    workspace, agent_id = _workspace(tmp_path, phase=HandoffPhase.RESTARTING)
+    _pick_rebind(workspace)
+
+    _runner(workspace).run(workspace.chat_id, "rebind-1")
+
+    assert workspace.agent_steps == ["start", "model claude-opus-4-6", "deliver Carry on on the other account"]
+    assert workspace.applied_picks == [(agent_id, _PICK)]
+    assert workspace.record() is None
+
+
+def test_a_pick_the_restarted_agent_refuses_is_tried_again_while_it_comes_up(tmp_path: Path) -> None:
+    """``mngr start`` does not wait for the harness, so the first tries can meet an agent that cannot take a switch yet."""
+    workspace, agent_id = _workspace(tmp_path, phase=HandoffPhase.RESTARTING)
+    _pick_rebind(workspace)
+    workspace.pick_refusal_count = 2
+
+    _runner(workspace).run(workspace.chat_id, "rebind-1")
+
+    assert workspace.pick_attempt_count == 3 and workspace.slept == [1.0, 1.0]
+    assert workspace.applied_picks == [(agent_id, _PICK)]
+    assert workspace.delivered == [(agent_id, "Carry on on the other account", "trigger-1")]
+    assert workspace.record() is None
+
+
+def test_a_pick_still_refused_when_the_budget_runs_out_fails_the_rebind_at_the_model_step(tmp_path: Path) -> None:
+    workspace, agent_id = _workspace(tmp_path, phase=HandoffPhase.RESTARTING)
+    _pick_rebind(workspace)
+    workspace.pick_refusal_count = 1_000
+
+    _runner(workspace).run(workspace.chat_id, "rebind-1")
+
+    record = workspace.record()
+    assert record is not None and record.rebind is not None
+    assert record.rebind.phase is HandoffPhase.FAILED and record.rebind.failed_step is HandoffFailedStep.MODEL
+    assert record.rebind.error == "Failed to deliver /model to the agent"
+    # The budget, not an attempt count, ended it: tries every interval up to the deadline, then one last.
+    assert workspace.slept == [1.0] * 5 and workspace.pick_attempt_count == 6
+    assert workspace.delivered == []
+
+
+def test_a_rejected_pick_fails_at_once_and_a_retry_reruns_only_the_pick(tmp_path: Path) -> None:
+    """A pick outside the agent's options cannot land by waiting. The restart already landed on the target, so the
+    retry does not stop, relabel, or start the agent again: it applies the pick and delivers."""
+    workspace, agent_id = _workspace(tmp_path, phase=HandoffPhase.RESTARTING)
+    _pick_rebind(workspace)
+    workspace.is_pick_rejected = True
+
+    _runner(workspace).run(workspace.chat_id, "rebind-1")
+
+    failed = workspace.record()
+    assert failed is not None and failed.rebind is not None
+    assert failed.rebind.phase is HandoffPhase.FAILED and failed.rebind.failed_step is HandoffFailedStep.MODEL
+    assert failed.rebind.error == "Unknown model: claude-opus-4-6"
+    assert workspace.pick_attempt_count == 1 and workspace.slept == []
+    assert failed.rebind.restarted_account_id == _NEW_ACCOUNT.id and not failed.rebind.is_model_pick_applied
+    assert workspace.delivered == []
+
+    workspace.is_pick_rejected = False
+    _retry_as_the_manager_does(workspace)
+    _runner(workspace).run(workspace.chat_id, "rebind-1")
+
+    assert [line.split(" ")[0] for line in workspace.argv_lines()] == ["label", "start"]
+    assert workspace.stopped == [agent_id]
+    assert workspace.agent_steps == ["start", "model claude-opus-4-6", "deliver Carry on on the other account"]
+    assert workspace.record() is None
+
+
+def test_a_resume_after_the_start_landed_applies_a_pending_pick_without_restarting(tmp_path: Path) -> None:
+    workspace, agent_id = _workspace(tmp_path, phase=HandoffPhase.RESTARTING)
+    _pick_rebind(workspace, restarted_account_id=_NEW_ACCOUNT.id)
+
+    _runner(workspace).run(workspace.chat_id, "rebind-1")
+
+    assert workspace.argv_lines() == [] and workspace.stopped == []
+    assert workspace.agent_steps == ["model claude-opus-4-6", "deliver Carry on on the other account"]
+    assert workspace.record() is None
+
+
+def test_a_resume_after_the_pick_landed_does_not_apply_it_again(tmp_path: Path) -> None:
+    """A second ``/model`` typed into a resumed session is traffic the user never asked for."""
+    workspace, agent_id = _workspace(tmp_path, phase=HandoffPhase.RESTARTING)
+    _pick_rebind(workspace, restarted_account_id=_NEW_ACCOUNT.id, is_model_pick_applied=True)
+
+    _runner(workspace).run(workspace.chat_id, "rebind-1")
+
+    assert workspace.pick_attempt_count == 0
+    assert workspace.agent_steps == ["deliver Carry on on the other account"]
+    assert workspace.record() is None
+
+
+def test_a_pick_recorded_as_applied_survives_a_retry_on_another_account(tmp_path: Path) -> None:
+    """The agent keeps its model settings through a restart, so a pick that already landed is not sent again after
+    a later step failed and the user retried elsewhere on the lane."""
+    workspace, agent_id = _workspace(tmp_path, phase=HandoffPhase.RESTARTING)
+    _pick_rebind(
+        workspace,
+        restarted_account_id=_NEW_ACCOUNT.id,
+        is_model_pick_applied=True,
+        target_account_id=_THIRD_ACCOUNT.id,
+    )
+
+    _runner(workspace).run(workspace.chat_id, "rebind-1")
+
+    assert workspace.argv_lines()[-1] == "start Chat-1 --no-resume"
+    assert workspace.pick_attempt_count == 0
+    assert workspace.agent_steps == ["start", "deliver Carry on on the other account"]

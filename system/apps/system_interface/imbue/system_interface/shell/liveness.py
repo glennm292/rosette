@@ -3,9 +3,12 @@
 The registry row is an app's identity; whether it is running is derived state,
 never stored. A row carrying a ``program`` (see ``forward_port.py --program``)
 is supervised, so supervisord's own process state -- read over the same RPC
-socket ``supervisorctl`` uses -- is the authority. A row without one is managed
-outside the workspace, so the best available signal is whether anything answers
-a TCP connect on the row's registered URL.
+socket ``supervisorctl`` uses -- is the only authority: while such an app is
+stopped its port may be the shell's own parker (``shell/port_parking.py``),
+whose first accepted connection starts the app, so a TCP connect would both
+wake it and read it as running. A row without one is managed outside the
+workspace, so the best available signal is whether anything answers a TCP
+connect on the row's registered URL.
 """
 
 import os
@@ -18,7 +21,9 @@ from pathlib import Path
 from typing import Final
 
 from loguru import logger as _loguru_logger
+from pydantic import Field
 
+from imbue.imbue_common.frozen_model import FrozenModel
 from imbue.system_interface.shell.errors import SupervisorProgramActionError
 
 # The socket supervisord's ``[unix_http_server]`` section binds (see
@@ -30,9 +35,29 @@ ENV_SUPERVISOR_SOCKET: Final[str] = "MINDS_SUPERVISOR_SOCKET"
 # targets are loopback-local, so anything slower than this is effectively down.
 _PROBE_TIMEOUT_SECONDS: Final[float] = 2.0
 
+SUPERVISOR_RUNNING_STATENAME: Final[str] = "RUNNING"
+SUPERVISOR_STARTING_STATENAME: Final[str] = "STARTING"
+SUPERVISOR_BACKOFF_STATENAME: Final[str] = "BACKOFF"
+SUPERVISOR_FATAL_STATENAME: Final[str] = "FATAL"
+# Reached only through stopProcess (a start that fails ends in FATAL, an exit after running in EXITED).
+SUPERVISOR_STOPPED_STATENAME: Final[str] = "STOPPED"
 # The supervisord process states that mean "the program is up (or coming up)".
 # STOPPED / STOPPING / EXITED / BACKOFF / FATAL / UNKNOWN all render as stopped.
-_RUNNING_STATE_NAMES: Final[frozenset[str]] = frozenset({"RUNNING", "STARTING"})
+_RUNNING_STATE_NAMES: Final[frozenset[str]] = frozenset({SUPERVISOR_RUNNING_STATENAME, SUPERVISOR_STARTING_STATENAME})
+# The states in which a program is neither up nor about to bind its port again on its own: what the shell parks.
+SUPERVISOR_DOWN_STATENAMES: Final[frozenset[str]] = frozenset(
+    {SUPERVISOR_STOPPED_STATENAME, "EXITED", SUPERVISOR_FATAL_STATENAME, "UNKNOWN"}
+)
+
+
+class SupervisorProgramState(FrozenModel):
+    """One supervised program as getAllProcessInfo reports it."""
+
+    statename: str = Field(description="Supervisord's state name for the program (RUNNING, STARTING, STOPPED, ...)")
+    pid: int = Field(
+        description="The process supervisord last spawned for the program, so a new value means the program was "
+        "started again; 0 when supervisord has none"
+    )
 
 
 def supervisor_socket_path() -> Path:
@@ -111,11 +136,19 @@ def stop_supervisor_program(program: str, socket_path: Path) -> None:
 
 
 def fetch_supervisor_program_states(socket_path: Path) -> dict[str, bool] | None:
-    """Every supervised program's up/down state in one getAllProcessInfo RPC.
+    """Every supervised program's up/down state in one getAllProcessInfo RPC; None when supervisord cannot be
+    reached, so the caller keeps what it last knew rather than presenting a guess as supervisord's answer."""
+    state_by_program = fetch_supervisor_programs(socket_path)
+    if state_by_program is None:
+        return None
+    return {program: state.statename in _RUNNING_STATE_NAMES for program, state in state_by_program.items()}
+
+
+def fetch_supervisor_programs(socket_path: Path) -> dict[str, SupervisorProgramState] | None:
+    """Every supervised program's ``statename`` and ``pid`` in one getAllProcessInfo RPC.
 
     Returns None when supervisord cannot be reached (or answers with something
-    unmarshallable), so the caller falls back to per-row TCP probes rather than
-    presenting a guess as supervisord's answer. Keys are bare program names --
+    unmarshallable). Keys are bare program names --
     the same names ``forward_port.py --program`` registers and the per-program
     RPCs use (this config defines no supervisord groups).
     """
@@ -131,36 +164,41 @@ def fetch_supervisor_program_states(socket_path: Path) -> dict[str, bool] | None
         return None
     if not isinstance(process_infos, list):
         return None
-    is_running_by_program: dict[str, bool] = {}
+    state_by_program: dict[str, SupervisorProgramState] = {}
     for process_info in process_infos:
         if not isinstance(process_info, dict):
             continue
-        # Read the two keys by iteration: the proxy stub's inferred dict
+        # Read the keys by iteration: the proxy stub's inferred dict
         # variants make every keyed access an overload mismatch, while an
         # argument-free ``items()`` walk types cleanly on all of them.
         program_name = ""
         statename = ""
+        pid = 0
         for key, value in process_info.items():
             if key == "name":
                 program_name = str(value)
             elif key == "statename":
                 statename = str(value)
+            elif key == "pid" and isinstance(value, int):
+                pid = value
             else:
                 pass
         if program_name:
-            is_running_by_program[program_name] = statename in _RUNNING_STATE_NAMES
-    return is_running_by_program
+            state_by_program[program_name] = SupervisorProgramState(statename=statename, pid=pid)
+    return state_by_program
 
 
 def probe_all_app_liveness(probe_targets: Sequence[tuple[str, str, str]]) -> dict[str, bool]:
-    """Derive ``is_running`` for every registry row in one sweep.
+    """Derive ``is_running`` for the registry rows in one sweep; a row the answer leaves out keeps its last liveness.
 
     At most one batched supervisord RPC answers for all supervised rows,
     instead of one unix-socket round trip per row per sweep (and none at all
     when no row is supervised -- the sweep runs on a timer regardless of
     registry contents, so an idle registry must not cost an RPC per pass).
-    A row falls back to the TCP probe when supervisord cannot answer at all,
-    does not know the row's program, or the row is unsupervised (no program).
+    A supervised row is answered by supervisord alone and is left out when
+    supervisord cannot answer at all or does not know the program: its port may
+    be the shell's parker, which a TCP connect would wake. An unsupervised row
+    (no program) is answered by the TCP probe.
     """
     is_any_row_supervised = any(program for _name, program, _url in probe_targets)
     is_running_by_program = (
@@ -168,11 +206,12 @@ def probe_all_app_liveness(probe_targets: Sequence[tuple[str, str, str]]) -> dic
     )
     is_running_by_name: dict[str, bool] = {}
     for name, program, url in probe_targets:
-        supervised_state = is_running_by_program.get(program) if is_running_by_program is not None else None
-        if program and supervised_state is not None:
-            is_running_by_name[name] = supervised_state
-        else:
+        if not program:
             is_running_by_name[name] = probe_tcp_url(url)
+            continue
+        supervised_state = is_running_by_program.get(program) if is_running_by_program is not None else None
+        if supervised_state is not None:
+            is_running_by_name[name] = supervised_state
     return is_running_by_name
 
 

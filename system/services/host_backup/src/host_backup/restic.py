@@ -15,11 +15,22 @@ from pathlib import Path
 from typing import Final
 
 _RESTIC_TIMEOUT_SECONDS: Final[float] = 3600.0
-# Tags the minds backup restore stamps on its safety + restored-state snapshots
+# Caps restic to one core and one file read at a time so a backup cannot starve
+# the workspace's agents and UI. `nice`/`ionice` cannot do this: gVisor, which
+# remote workspaces run under, ignores `nice` and rejects `ionice` outright.
+_RESOURCE_LIMIT_ENV: Final[Mapping[str, str]] = {
+    "GOMAXPROCS": "1",
+    "RESTIC_READ_CONCURRENCY": "1",
+}
+# Tags the Imbue Studio backup restore stamps on its safety + restored-state snapshots
 # (kept in sync with the desktop client's restore script). The retention forget
 # preserves any snapshot carrying either so a recent "Restored from ..." timeline
 # marker survives the normal hourly/daily thinning; the runner ages old ones out.
 RESTORE_MARKER_TAGS: Final[tuple[str, ...]] = ("restored", "pre-restore")
+# A directory holding a file of this name is backed up as just that file: how an
+# app marks a store it can rebuild. Not CACHEDIR.TAG, which uv writes into every
+# virtualenv and tool environment, and a restore would leave those empty.
+NO_BACKUP_MARKER_FILENAME: Final[str] = ".nobackup"
 _REPO_MISSING_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"unable to open config file", re.IGNORECASE),
     re.compile(r"repository does not exist", re.IGNORECASE),
@@ -29,6 +40,16 @@ _REPO_LOCKED_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"repository is already locked", re.IGNORECASE),
     re.compile(r"unable to create lock", re.IGNORECASE),
 )
+# The backup store refuses a data upload past the account's hard storage limit
+# with 507, which restic reports as "unexpected HTTP response (507): 507
+# Insufficient Storage" and treats as permanent (no retry).
+_QUOTA_EXCEEDED_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"\(507\)"),
+    re.compile(r"507 Insufficient Storage", re.IGNORECASE),
+)
+# restic's default target pack size, pinned so an upload can never approach the
+# backup store's request body limit however the default moves.
+PACK_SIZE_MIB: Final[int] = 16
 
 
 def is_repo_missing_error(stderr: str) -> bool:
@@ -36,15 +57,28 @@ def is_repo_missing_error(stderr: str) -> bool:
     return any(p.search(stderr) for p in _REPO_MISSING_PATTERNS)
 
 
+def is_quota_exceeded_error(stderr: str) -> bool:
+    """Return True if `stderr` says the backup store refused an upload for lack of storage (507)."""
+    return any(p.search(stderr) for p in _QUOTA_EXCEEDED_PATTERNS)
+
+
 def is_repo_locked_error(stderr: str) -> bool:
     """Return True if `stderr` looks like a restic 'repository is locked' error.
 
-    A dead container incarnation can leave an exclusive lock behind whose owning
-    PID no longer exists; every subsequent tick then fails to acquire a lock.
-    Detecting this lets the runner clear the stale lock and retry rather than
-    wedging indefinitely.
+    A restic process killed with its container leaves its lock behind. An
+    exclusive one (forget, prune) blocks every later operation; a non-exclusive
+    one (backup) blocks only the exclusive ones. Detecting this lets the runner
+    clear the stale lock and retry rather than failing every tick indefinitely.
     """
     return any(p.search(stderr) for p in _REPO_LOCKED_PATTERNS)
+
+
+def build_restic_environment(env_overrides: Mapping[str, str]) -> dict[str, str]:
+    """This process's environment plus the resource limits, with `env_overrides` merged on top."""
+    env = dict(os.environ)
+    env.update(_RESOURCE_LIMIT_ENV)
+    env.update(env_overrides)
+    return env
 
 
 def run_restic(
@@ -52,17 +86,17 @@ def run_restic(
     *,
     env_overrides: Mapping[str, str],
     timeout_seconds: float = _RESTIC_TIMEOUT_SECONDS,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run `restic <args...>` with `env_overrides` merged onto `os.environ`."""
-    env = dict(os.environ)
-    env.update(env_overrides)
+    """Run `restic <args...>` under the resource limits, with `env_overrides` merged on top."""
     return subprocess.run(
         ["restic", *args],
         capture_output=True,
         text=True,
         check=False,
-        env=env,
+        env=build_restic_environment(env_overrides),
         timeout=timeout_seconds,
+        cwd=cwd,
     )
 
 
@@ -98,11 +132,39 @@ def backup(
     tag: str,
     env_overrides: Mapping[str, str],
 ) -> subprocess.CompletedProcess[str]:
-    """`restic backup --json <source> --tag <tag> [--exclude=<glob>...]`."""
-    args: list[str] = ["backup", "--json", str(source_path), "--tag", tag]
+    """`restic backup --json .` run inside `source_path`, so the snapshot holds its tree at the root.
+
+    restic skips re-reading a file only when the parent snapshot has a file at
+    the same path *inside the snapshot*, and an absolute source records every
+    component of it. outer_trigger reads each tick from a new
+    `<mount>/snapshots/<timestamp>/home`, so an absolute source never matches
+    the parent and every tick re-reads and re-hashes the whole tree.
+
+    The recorded path still changes every tick, so `--group-by ''` picks the
+    newest snapshot as the parent instead of looking for one with the same
+    path. `--ignore-inode` judges files by size and mtime alone, since a fresh
+    snapshot is not guaranteed to keep the inode numbers of the last one.
+
+    `--exclude-if-present` skips the contents of any directory holding the
+    no-backup marker file. `--pack-size` pins the pack size restic uploads in.
+    """
+    args: list[str] = [
+        "backup",
+        "--json",
+        ".",
+        "--group-by",
+        "",
+        "--ignore-inode",
+        "--exclude-if-present",
+        NO_BACKUP_MARKER_FILENAME,
+        "--pack-size",
+        str(PACK_SIZE_MIB),
+        "--tag",
+        tag,
+    ]
     for pattern in excludes:
         args.append(f"--exclude={pattern}")
-    return run_restic(tuple(args), env_overrides=env_overrides)
+    return run_restic(tuple(args), env_overrides=env_overrides, cwd=source_path)
 
 
 def forget(
@@ -113,7 +175,7 @@ def forget(
     keep_monthly: int,
     env_overrides: Mapping[str, str],
 ) -> subprocess.CompletedProcess[str]:
-    """`restic forget --group-by '' --keep-* ... --keep-tag <restore-marker>...` (does not prune).
+    """`restic forget --group-by '' --keep-within 1h --keep-* ... --keep-tag <restore-marker>...` (does not prune).
 
     Restic applies the keep-* policy once per *group*, and its default grouping
     (`host,paths`) puts every one of our snapshots in a group of its own: the
@@ -129,11 +191,18 @@ def forget(
     entry (the markers otherwise share the hour with the ordinary hourly backups
     and lose the keep-hourly bucket). The runner ages the old markers out
     separately so they stay bounded.
+
+    `--keep-within 1h` keeps every snapshot taken within an hour of the newest
+    one. Without it, any extra tick in the same hour (a restarted service, a
+    changed restic.env, "back up now") would thin away the hour's previous
+    snapshot -- the one a user may have just picked to restore.
     """
     args = [
         "forget",
         "--group-by",
         "",
+        "--keep-within",
+        "1h",
         "--keep-hourly",
         str(keep_hourly),
         "--keep-daily",
@@ -172,16 +241,34 @@ def forget_snapshot_ids(
     return run_restic(args, env_overrides=env_overrides, timeout_seconds=600.0)
 
 
-def prune(env_overrides: Mapping[str, str]) -> subprocess.CompletedProcess[str]:
-    """`restic prune` -- actually delete data referenced by no remaining snapshot."""
-    return run_restic(("prune",), env_overrides=env_overrides)
+def prune(
+    env_overrides: Mapping[str, str],
+    *,
+    max_repack_bytes: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """`restic prune` -- actually delete data referenced by no remaining snapshot.
+
+    `--pack-size` pins the size of the packs the repack writes, as `backup` does
+    for the packs it uploads. `max_repack_bytes` bounds how much restic repacks in
+    this run (its `--max-repack-size`): a prune writes the repacked data before it
+    deletes the old packs, so an account near its hard storage limit prunes in
+    bounded slices.
+    """
+    args: tuple[str, ...] = ("prune", "--pack-size", str(PACK_SIZE_MIB))
+    if max_repack_bytes is not None:
+        args += ("--max-repack-size", format_restic_size(max_repack_bytes))
+    return run_restic(args, env_overrides=env_overrides)
 
 
-def extract_snapshot_id_from_backup_output(stdout: str) -> str:
-    """Pluck the snapshot_id from `restic backup --json` stdout (best-effort).
+def format_restic_size(size_bytes: int) -> str:
+    """Render a byte count in the unit suffix form restic's size flags take (whole MiB, floor)."""
+    return f"{max(0, size_bytes) // (1024 * 1024)}M"
 
-    Restic emits one JSON document per line; the final `summary` document
-    carries the snapshot id. Returns "" when we can't find one.
+
+def find_backup_summary(stdout: str) -> dict[str, object] | None:
+    """The final `summary` document of `restic backup --json` stdout, or None if there is none.
+
+    Restic emits one JSON document per line; lines that are not JSON are skipped.
     """
     for line in reversed(stdout.splitlines()):
         line = line.strip()
@@ -192,7 +279,18 @@ def extract_snapshot_id_from_backup_output(stdout: str) -> str:
         except ValueError:
             continue
         if isinstance(payload, dict) and payload.get("message_type") == "summary":
-            sid = payload.get("snapshot_id")
-            if isinstance(sid, str):
-                return sid
-    return ""
+            return payload
+    return None
+
+
+def extract_snapshot_id_from_backup_output(stdout: str) -> str:
+    """Pluck the snapshot_id from `restic backup --json` stdout (best-effort).
+
+    The final `summary` document carries the snapshot id. Returns "" when we
+    can't find one.
+    """
+    summary = find_backup_summary(stdout)
+    if summary is None:
+        return ""
+    sid = summary.get("snapshot_id")
+    return sid if isinstance(sid, str) else ""

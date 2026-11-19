@@ -16,8 +16,8 @@
  *
  * The random suffix is the one hostname component that never leaks via CT, so
  * a share cannot be enumerated from the public cert name. Callers resolve an
- * app's NAME to its LABEL via ``labelForApp`` (models/Inventory) before
- * calling this.
+ * app's NAME to its LABEL via ``labelForApp`` (the shell's model/pageUrl)
+ * before calling this.
  *
  * The base is the workspace host COORDINATE -- the ``host-<hex>`` label and
  * everything after it -- NOT ``window.location.host`` verbatim. The shell does
@@ -26,35 +26,15 @@
  * is served, so the shell always runs at ``<shell-label>.<coordinate>``.
  * Deriving relative to ``window.location.host`` verbatim would therefore nest
  * every app under the shell's label (``foo.<shell-label>.host-<hex>...``),
- * which routes back to the shell -- a dockview inside a dockview. Stripping to
+ * which routes back to the shell -- a desktop inside a desktop. Stripping to
  * the coordinate first keeps every app origin a single label deep.
  *
- * Nothing about an origin is ever persisted: saved layouts carry the app's
- * name in a tab's address, and the URL is re-derived from that name's CURRENT label at
- * render time, so a layout stays portable across hosts and shares.
+ * Nothing about an origin is ever persisted: a desktop's windows carry the app's
+ * name and a path, and the URL is re-derived from that name's CURRENT label at
+ * render time, so a desktop stays portable across hosts and shares.
  */
 
-/** A label that starts a workspace coordinate: ``host-<hex>`` (``agent-`` is
- *  the legacy spelling of the same coordinate), or a bare 32-hex label -- the
- *  share label leading a workspace-keyed share domain
- *  (``<share-label>.<user-hash>.<region>.<domain>``). App labels can never
- *  match either form: ``host-``/``agent-`` prefixes are reserved in
- *  forward_port.py, and a minted label is always ``<name>-<rand>`` (the hyphen
- *  plus non-hex name keeps it out of the bare 32-hex shape). */
-const WORKSPACE_COORDINATE_LABEL = /^(?:(?:host|agent)-[a-f0-9]+|[a-f0-9]{32})$/i;
-
-/** The workspace coordinate within ``host``: the first coordinate label and
- *  everything after it (``host-<hex>.localhost:8421`` locally,
- *  ``host-<hex>.<user>.<region>.<domain>`` on a legacy share,
- *  ``<share-label>.<user-hash>.<region>.<domain>`` on a workspace-keyed
- *  share), with any leading app label(s) stripped. Returns ``host``
- *  unchanged when it carries no coordinate label (a non-workspace host), so
- *  the derivation degrades safely. */
-export function workspaceHostCoordinate(host: string): string {
-  const labels = host.split(".");
-  const coordinateIndex = labels.findIndex((label) => WORKSPACE_COORDINATE_LABEL.test(label));
-  return coordinateIndex < 0 ? host : labels.slice(coordinateIndex).join(".");
-}
+import { workspaceHostCoordinate } from "./app_contract";
 
 /** Derive the origin URL (with trailing slash) whose first hostname label is
  *  ``hostLabel`` (an app's ``<name>-<rand>`` origin label). ``host`` and

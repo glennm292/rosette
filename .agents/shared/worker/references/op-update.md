@@ -30,24 +30,43 @@ absent or unrecognized.
   in your task file or the repo.
 - Terminal statuses: `done`, `stuck`, `no-update-needed`.
 
-**System-interface exception.** When the creation is the system interface, there
-is no `## Change origin` toggle and **no approval gate**: the change is
-handed to you as a plain brief, and user approval happens through the lead's
-pre-merge live preview, not a worker gate. Implement the brief, verify it per
-`type-system-interface.md`, then report `done` (or a mid-flight `question`,
-or `stuck`) with a body that summarizes the work so the lead can frame the
-preview:
+**Critical-app handoff.** When the task says it is the careful flow's handoff
+for a critical app (the shell, the chat, the terminal, or a user app whose
+manifest says `critical = true`; see `type-app.md`, "Critical apps"), there is
+no `## Change origin` toggle and **no approval gate**. The user already
+approved the shape in the lead's live editing loop, before you existed, and the
+lead committed every round it showed them, so the branch you are checked out on
+*already carries the approved change*. There is nothing for an approval gate to
+ask; a mid-flight `question` is still valid when the answer is not in your task
+file or the repo.
+
+Read the task body for which of the two handoff shapes you were given:
+
+- **Implement for real, then harden.** The branch carries an approved but
+  deliberately rough edit. Turn it into the real implementation, keeping the shape
+  the user approved, then harden it.
+- **Harden only.** The branch already carries the real, user-approved change.
+  Verify and harden it -- **do not re-implement it**, and do not redesign the
+  approved shape.
+
+Either way, verify each creation in the pass per its own `type-<TYPE>.md` --
+the apps per `type-app.md` and `web-frontend-testing.md` -- then report `done`
+(or a mid-flight `question`, or `stuck`) with a body that tells the lead what
+landed:
 
 ```
-Updated the system interface on branch `<branch>`. Ready to preview.
+Hardened <every creation the pass covers> on branch `<branch>`.
 - Change: <one-sentence>
 - Frontend / backend: <which, and the files touched>
-- Tests run: <backend pytest / frontend lint+test / Playwright -- all pass>
+- Bundles built: <the static/ path of every bundle you built, all three when the shared library changed>
+- Tests run: <the test gate's commands (select-tests) and Playwright -- all pass>
+- Undeclared couplings: <none, or each built-in suite select-tests missed, and the path it observes>
+- Flaky tests: <none, or each test that failed in the gate and passed when rerun alone>
 - Screenshots reviewed: <pages/states you eyeballed>
 ```
 
-The committed/emergent paths and gates below apply only to skill, app, and service
-creations.
+The committed/emergent paths and gates below apply to every other skill, app,
+and service task.
 
 ## Emergent path
 
@@ -66,7 +85,8 @@ per `.agents/shared/worker/references/update-vs-create-new.md` (default to in-pl
 only split when the gap has a concrete standalone use case). Other creations
 update in place.
 
-Propose an outline. For a **skill**, the outline contents are defined in
+Propose one outline covering every creation in the pass. For a **skill**, the
+outline contents are defined in
 `.agents/shared/worker/references/skill-outline-fields.md`; add the update decision
 (update-in-place vs. new sibling). For an **app** (or a service), the
 outline is the decision, what changes, and the routes/scenarios affected. Write a
@@ -140,6 +160,8 @@ Write a `type: gate`, `name: final-creation` report plus "Approve and save? (yes
   consumer or surface would need to adapt to>
 - References registered: <none, or one path per line>
 - Outside footprint: <none, or one path per line with why it changed>
+- Undeclared couplings: <none, or each built-in suite select-tests missed, and the path it observes>
+- Flaky tests: <none, or each test that failed in the gate and passed when rerun alone>
 ```
 
 **App or service:**
@@ -151,10 +173,18 @@ Updated app or service `<name>`:
 - Scenarios / tests run: <list, all pass>
 - References registered: <none, or one path per line>
 - Outside footprint: <none, or one path per line with why it changed>
+- Undeclared couplings: <none, or each built-in suite select-tests missed, and the path it observes>
+- Flaky tests: <none, or each test that failed in the gate and passed when rerun alone>
 ```
 
-The last two lines come from the scope file (`harden-creation.md`); a
-creation with no footprint writes `none` for both.
+The `References registered` and `Outside footprint` lines come from the scope
+file (`harden-creation.md`).
+
+In a pass over several creations, write one block per creation, in the order
+the task lists them; the lines about the pass as a whole (the scenarios and tests
+run, `Outside footprint`, which the scope file judges against every creation at
+once, `Undeclared couplings`, `Flaky tests`) may instead come once, after the
+last block.
 
 Push it and stop. On approval, emit a `name: done` terminal report. In the
 committed path a clean verification may produce no new worker commits -- that is

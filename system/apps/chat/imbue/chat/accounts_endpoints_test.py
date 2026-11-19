@@ -8,40 +8,35 @@ about the WIRE -- the key sets and the status codes -- which is the part nothing
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from uuid import uuid4
 
+import pytest
 from flask.testing import FlaskClient
 
 from imbue.chat.accounts import commit_account
 from imbue.chat.accounts import mint_account_dir
 from imbue.chat.accounts import read_index
-from imbue.chat.agent_discovery import agent_state_dir
-from imbue.chat.agent_discovery import get_host_dir
-from imbue.chat.agent_manager import AgentManager
 from imbue.chat.harnesses.auth_flows import AuthFlowService
-from imbue.chat.harnesses.codex.model import get_codex_model_options_path
+from imbue.chat.harnesses.codex.model import codex_model_options_path
 from imbue.chat.harnesses.codex.model import write_codex_model_options
-from imbue.chat.harnesses.harness_type import HarnessType
 from imbue.chat.harnesses.signed_in import SignedIn
 from imbue.chat.server import create_application
 from imbue.chat.state import ChatAppState
+from imbue.chat.testing import FakePexpectProcess
 from imbue.chat.testing import build_test_state
-from imbue.chat.testing import seed_agent_state
-from imbue.chat.ws_broadcaster import WebSocketBroadcaster
 from imbue.mngr_codex.app_server_client import CodexModel
 from imbue.mngr_codex.app_server_client import ReasoningEffortOption
 
 
 @contextmanager
-def _client(auth_flows: AuthFlowService | None = None) -> Iterator[FlaskClient]:
+def _client(auth_flows: AuthFlowService | None = None) -> Generator[FlaskClient, None, None]:
     yield create_application(build_test_state(auth_flows=auth_flows)).test_client()
 
 
 @contextmanager
-def _client_for(state: ChatAppState) -> Iterator[FlaskClient]:
+def _client_for(state: ChatAppState) -> Generator[FlaskClient, None, None]:
     yield create_application(state).test_client()
 
 
@@ -56,7 +51,7 @@ def _signed_in_service(tmp_path: Path) -> AuthFlowService:
     return AuthFlowService.create(home=None, work_dir=tmp_path / "work", probe=lambda *_a: SignedIn.YES)
 
 
-# ----- the shapes the client reads ---------------------------------------------------------
+# the shapes the client reads
 
 
 def test_lanes_carry_every_key_the_chooser_reads() -> None:
@@ -79,7 +74,7 @@ def test_lanes_carry_every_key_the_chooser_reads() -> None:
         }
         assert lane["harness_label"], "the sign-in header has nothing to name the harness with"
         for method in lane["methods"]:
-            assert set(method) == {"id", "label", "description", "signup_url", "shape", "is_primary"}
+            assert set(method) == {"id", "label", "description", "signup_url", "note", "shape", "is_primary"}
         for key_provider in lane["key_providers"]:
             assert set(key_provider) == {"provider_id", "display", "env_var", "hint"}
 
@@ -103,7 +98,18 @@ def test_accounts_carry_every_key_the_picker_reads() -> None:
     (row,) = payload["accounts"]
     # `label` is the composed string for anything showing one; `provider` / `harness_label` /
     # `seq` are its parts, which the combo card renders at different sizes on one row.
-    assert set(row) == {"id", "lane", "harness", "provider", "harness_label", "seq", "name", "label"}
+    assert set(row) == {
+        "id",
+        "lane",
+        "harness",
+        "provider",
+        "harness_label",
+        "seq",
+        "name",
+        "label",
+        "reauth_method",
+        "signed_in_at",
+    }
     assert row["provider"] == "Anthropic"
     assert row["harness_label"] == "Claude Code"
     assert row["label"] == "Anthropic (Claude Code)"
@@ -208,7 +214,7 @@ def test_a_name_longer_than_a_row_can_show_is_refused() -> None:
     assert response.status_code == 400
 
 
-# ----- the status codes the client branches on ---------------------------------------------
+# the status codes the client branches on
 
 
 def test_an_unknown_lane_is_a_404_with_a_clean_message() -> None:
@@ -246,7 +252,7 @@ def test_deleting_an_unknown_account_is_a_404() -> None:
         assert client.delete("/api/accounts/nope").status_code == 404
 
 
-# ----- one full paste round trip through the routes ----------------------------------------
+# one full paste round trip through the routes
 
 
 def test_a_key_paste_mints_an_account_and_lists_it(tmp_path: Path) -> None:
@@ -321,34 +327,35 @@ def test_a_non_string_name_is_refused() -> None:
     assert response.status_code == 400
 
 
-# ----- what a new agent on an account could run on ------------------------------------------
+# what a new agent on an account could run on
 
 
-def test_account_model_options_offers_the_catalog_for_a_static_harness_and_a_codex_agents_last_set(
-    tmp_path: Path,
+def test_account_model_options_offers_the_catalog_for_a_static_harness_and_the_account_itself_for_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The switch dialog's picker for a successor that does not exist yet: a claude account offers its whole
-    catalog (``models`` null, no ``options``); a codex account with no agent yet offers nothing but the default
-    (``options`` empty); once a codex agent bound to it was offered a set, that set is the answer."""
+    """The switch dialog's picker for an account the chat is not on yet: a claude account offers its whole
+    catalog (``models`` and ``options`` both null, so the page renders the catalog); a codex account is asked
+    for its own, and answers from the sidecar a probe left when codex cannot be reached at all."""
     claude_id, _ = mint_account_dir()
     commit_account(claude_id, "anthropic", "Anthropic")
-    codex_id, _ = mint_account_dir()
+    codex_id, codex_dir = mint_account_dir()
     commit_account(codex_id, "openai", "OpenAI")
-    manager = AgentManager.build(WebSocketBroadcaster(), mngr_binary="/bin/true")
-    with _client_for(build_test_state(agent_manager=manager)) as client:
+    # No codex on PATH, so the account probe fails to spawn and the sidecar is the answer. Without
+    # this the test would shell out to whatever codex the image happens to carry, and ask the
+    # network.
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with _client_for(build_test_state()) as client:
         static = client.get(f"/api/accounts/{claude_id}/model-options")
         assert static.status_code == 200
         assert static.get_json() == {"models": None, "options": None}
 
+        # An account nothing has ever asked offers only the default, rather than another account's models.
         empty = client.get(f"/api/accounts/{codex_id}/model-options")
         assert empty.status_code == 200
         assert empty.get_json() == {"models": None, "options": []}
 
-        # A codex agent on the account whose sidecar holds the last ``model/list`` it was offered.
-        agent_id = f"agent-{uuid4().hex}"
-        seed_agent_state(manager, agent_id, name="Chat-2", labels={"account": codex_id}, harness=HarnessType.CODEX)
         write_codex_model_options(
-            get_codex_model_options_path(agent_state_dir(get_host_dir(), agent_id)),
+            codex_model_options_path(codex_dir),
             (
                 CodexModel(
                     id="gpt-6-astra",
@@ -367,3 +374,100 @@ def test_account_model_options_offers_the_catalog_for_a_static_harness_and_a_cod
         assert [option["id"] for option in offered.get_json()["options"]] == ["gpt-6-astra"]
 
         assert client.get("/api/accounts/acct-nope/model-options").status_code == 404
+
+
+# the relayed browser callback
+
+
+_VISITOR = '{"owner": false, "user_id": "u-1", "email": "visitor@example.com"}'
+
+
+def test_a_visitor_cannot_relay_a_sign_in_callback(tmp_path: Path) -> None:
+    with _client(_signed_in_service(tmp_path)) as client:
+        response = client.post(
+            "/api/accounts/flow/any/callback",
+            json={"path_and_query": "/callback?state=s"},
+            headers={"X-Imbue-Identity": _VISITOR},
+        )
+
+    assert response.status_code == 403
+    assert response.get_json() == {"detail": "Only the owner of this workspace can connect an AI account."}
+
+
+def test_a_callback_for_a_flow_that_is_not_running_is_a_conflict(tmp_path: Path) -> None:
+    with _client(_signed_in_service(tmp_path)) as client:
+        response = client.post(
+            "/api/accounts/flow/gone/callback",
+            json={"path_and_query": "/callback?state=s"},
+            headers={"X-Imbue-Identity": '{"owner": true}'},
+        )
+
+    assert response.status_code == 409
+
+
+def test_a_callback_needs_its_path_and_query(tmp_path: Path) -> None:
+    with _client(_signed_in_service(tmp_path)) as client:
+        response = client.post("/api/accounts/flow/any/callback", json={"path_and_query": 3})
+
+    assert response.status_code == 400
+
+
+def test_a_relayed_callback_answers_with_how_the_sign_in_ended(tmp_path: Path) -> None:
+    relay_url = (
+        "https://claude.ai/oauth/authorize?client_id=c"
+        "&redirect_uri=http%3A%2F%2Flocalhost%3A54871%2Fcallback&state=relay-state"
+    )
+    manual_url = "https://claude.ai/oauth/authorize?client_id=c&state=manual"
+
+    process = FakePexpectProcess([(0, manual_url)])
+
+    def spawner(*_args: object, env: dict[str, str], **_kwargs: object) -> FakePexpectProcess:
+        Path(env["MINDS_SIGNIN_URL_FILE"]).write_text(relay_url + "\n")
+        return process
+
+    def deny(_port: int, _path: str) -> None:
+        process.print_output("Login failed: No authorization code received\r\n")
+        process.exit(1)
+
+    service = AuthFlowService.create(
+        home=None,
+        work_dir=tmp_path / "work",
+        spawner=spawner,
+        probe=lambda *_a: SignedIn.YES,
+        fetch_callback=deny,
+    )
+    with _client(service) as client:
+        started = client.post("/api/accounts", json={"lane_id": "anthropic", "method_id": "subscription"}).get_json()
+        response = client.post(
+            f"/api/accounts/flow/{started['flow_id']}/callback",
+            json={"path_and_query": "/callback?error=access_denied&state=relay-state"},
+        )
+
+    assert started["relay_url"] == relay_url
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "state": "failed",
+        "detail": "Access wasn't approved on Claude's page.",
+        "account_id": None,
+        "provider_name": "Anthropic",
+    }
+
+
+def test_an_api_key_account_signs_in_again_with_a_key() -> None:
+    subscription_id, _ = mint_account_dir()
+    commit_account(subscription_id, "anthropic", "Anthropic")
+    key_id, key_dir = mint_account_dir()
+    commit_account(key_id, "anthropic", "Anthropic")
+    (key_dir / "settings.json").write_text('{"env": {"ANTHROPIC_API_KEY": "sk-ant-api03-key-5c1e"}}')
+    codex_key_id, codex_key_dir = mint_account_dir()
+    commit_account(codex_key_id, "openai", "OpenAI")
+    (codex_key_dir / "auth.json").write_text('{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-proj-7d2a"}')
+
+    with _client() as client:
+        rows = client.get("/api/accounts").get_json()["accounts"]
+
+    assert {row["id"]: row["reauth_method"] for row in rows} == {
+        subscription_id: "subscription",
+        key_id: "api_key",
+        codex_key_id: "api_key",
+    }

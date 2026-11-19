@@ -20,11 +20,13 @@ from typing import Any
 import pytest
 
 from imbue.chat.agent_discovery import AgentInfo
+from imbue.chat.harnesses.codex.account_models import AccountModelProbeError
 from imbue.chat.harnesses.codex.model import CODEX_CATALOG
 from imbue.chat.harnesses.codex.model import CODEX_STATE_RELATIVE_PATH
 from imbue.chat.harnesses.codex.model import CodexModelResolver
 from imbue.chat.harnesses.codex.model import _bind_root_thread
 from imbue.chat.harnesses.codex.model import _subscribe_root_thread
+from imbue.chat.harnesses.codex.model import codex_model_options_path
 from imbue.chat.harnesses.codex.model import codex_model_to_option
 from imbue.chat.harnesses.codex.model import codex_models_to_options
 from imbue.chat.harnesses.codex.model import get_codex_model_options_path
@@ -52,6 +54,7 @@ def _codex_model(
     *,
     tiers: tuple[str, ...] = (),
     hidden: bool = False,
+    default_effort: str | None = None,
 ) -> CodexModel:
     """A ``model/list`` entry for tests (id == model, given per-model efforts and service tiers).
 
@@ -64,6 +67,7 @@ def _codex_model(
             "hidden": hidden,
             "supportedReasoningEfforts": [{"reasoningEffort": level} for level in efforts],
             "serviceTiers": [{"id": tier} for tier in tiers],
+            "defaultReasoningEffort": default_effort,
         }
     )
 
@@ -106,6 +110,20 @@ def test_model_mapper_pulls_efforts_and_fast_per_model() -> None:
     assert plain_option.supports_fast is False
     hidden = _codex_model("gpt-secret", "Secret", ("medium",), hidden=True)
     assert codex_model_to_option(hidden).in_picker is False
+
+
+def test_a_models_default_effort_reaches_its_option_through_the_sidecar(tmp_path: Path) -> None:
+    # A thread that never had an effort picked records none, so the bar shows the model's default
+    # in its place. That default comes from model/list, so it must survive the sidecar the chip
+    # resolves from after a restart. A model that reports no default maps to None.
+    models = (
+        _codex_model("gpt-6-sol", "GPT-6-Sol", ("low", "medium", "high"), default_effort="medium"),
+        _codex_model("gpt-5.2", "GPT-5.2", ("low", "xhigh")),
+    )
+    path = get_codex_model_options_path(tmp_path)
+    write_codex_model_options(path, models)
+    options = codex_models_to_options(read_codex_model_options(path))
+    assert [option.default_effort for option in options] == ["medium", None]
 
 
 def test_state_relative_path_is_under_codex_home() -> None:
@@ -242,9 +260,7 @@ def test_list_offered_options_tolerates_a_daemon_failure(tmp_path: Path) -> None
     assert client.closed is True
 
 
-# =============================================================================
 # The raw model-options sidecar (offline-restart persistence)
-# =============================================================================
 
 
 def test_write_then_read_round_trips_the_raw_model_list(tmp_path: Path) -> None:
@@ -390,9 +406,7 @@ def test_switch_reports_failure_when_the_connection_cannot_be_opened(tmp_path: P
     assert result.detail is not None
 
 
-# =============================================================================
 # Root-thread binding for the short-lived switch connection
-# =============================================================================
 
 
 class _BindFakeClient:
@@ -446,9 +460,7 @@ def test_bind_raises_when_no_unambiguous_root(tmp_path: Path) -> None:
         _bind_root_thread(client, tmp_path)
 
 
-# =============================================================================
 # Root-thread SUBSCRIBING for the persistent live connection
-# =============================================================================
 #
 # The live-connection path must RESUME (thread/resume) rather than bind, because only a resume
 # subscribes the connection to the thread's turn/*/item/* event stream. Unlike the switch path
@@ -485,3 +497,46 @@ def test_subscribe_raises_when_no_unambiguous_root(tmp_path: Path) -> None:
     client = _BindFakeClient(loaded=("a", "b"))
     with pytest.raises(CodexAppServerError):
         _subscribe_root_thread(client, tmp_path)
+
+
+# what an ACCOUNT offers, asked of the account rather than of one of its agents
+
+
+def _refuse_to_probe(account_dir: Path) -> tuple[CodexModel, ...]:
+    """A probe that cannot reach codex at all -- absent, signed out, offline."""
+    raise AccountModelProbeError("codex is not installed")
+
+
+def test_an_accounts_models_are_probed_and_kept_for_when_the_probe_cannot_run(tmp_path: Path) -> None:
+    """The probe's answer is what the account offers, and it is written through: the switch dialog for an
+    account no agent has ever run on is exactly the case the sidecar cannot already cover."""
+    probed = (_codex_model("gpt-6-astra", "GPT-6 Astra", ("low", "high"), tiers=("priority",)),)
+    options = CodexModelResolver.list_account_options(tmp_path, probe=lambda account_dir: probed)
+    assert [option.id for option in options] == ["gpt-6-astra"]
+    assert options[0].supports_fast is True
+    # Kept raw, so a later change to the mapping needs no second probe.
+    assert read_codex_model_options(codex_model_options_path(tmp_path)) == probed
+
+
+def test_an_accounts_models_fall_back_to_the_sidecar_when_the_probe_fails(tmp_path: Path) -> None:
+    """Codex unreachable (absent, signed out, offline) leaves the last known set rather than an empty picker."""
+    kept = (_codex_model("gpt-5.5", "GPT-5.5", ("low",)),)
+    write_codex_model_options(codex_model_options_path(tmp_path), kept)
+    offered = CodexModelResolver.list_account_options(tmp_path, probe=_refuse_to_probe)
+    assert [option.id for option in offered] == ["gpt-5.5"]
+
+
+def test_an_account_with_no_probe_and_no_sidecar_offers_nothing(tmp_path: Path) -> None:
+    """Nothing known means the dialog offers only the default -- never another account's models, which the
+    destination may not be able to run at all."""
+    assert CodexModelResolver.list_account_options(tmp_path, probe=_refuse_to_probe) == ()
+
+
+def test_a_probe_that_answers_with_nothing_leaves_the_sidecar_both_kept_and_offered(tmp_path: Path) -> None:
+    """A daemon that came up but listed no models is not evidence the account has none, so that answer
+    neither overwrites what is known nor is shown to the user in place of it."""
+    kept = (_codex_model("gpt-5.5", "GPT-5.5", ("low",)),)
+    write_codex_model_options(codex_model_options_path(tmp_path), kept)
+    offered = CodexModelResolver.list_account_options(tmp_path, probe=lambda account_dir: ())
+    assert [option.id for option in offered] == ["gpt-5.5"]
+    assert read_codex_model_options(codex_model_options_path(tmp_path)) == kept

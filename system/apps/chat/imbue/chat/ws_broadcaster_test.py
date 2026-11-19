@@ -7,6 +7,7 @@ from imbue.chat.agent_manager import _ResolvedChat
 from imbue.chat.agent_manager import chat_snapshot_for_active_agent
 from imbue.chat.models import AgentStateItem
 from imbue.chat.models import ProvisionalChat
+from imbue.chat.models import ProvisionalChatAsShown
 from imbue.chat.models import ProvisionalChatPhase
 from imbue.chat.primitives import ChatId
 from imbue.chat.ws_broadcaster import WebSocketBroadcaster
@@ -67,13 +68,22 @@ def test_broadcast_chats_updated() -> None:
     agent = AgentStateItem(id="a1", name="agent-1", state="RUNNING", labels={}, work_dir=None)
     own_chat = _ResolvedChat(chat_id=ChatId("a1"), member_agent_ids=("a1",), active_agent_id="a1", record=None)
     snapshot = chat_snapshot_for_active_agent(
-        agent, own_chat, is_permission_pending=False, shoulder_tap_available=False
+        agent,
+        own_chat,
+        is_permission_pending=False,
+        shoulder_tap_available=False,
+        is_connecting=False,
+        is_resending_after_sign_in=False,
+        last_messaged_at=None,
+        background_tasks=(),
+        compaction_cause=None,
     )
-    broadcaster.broadcast_chats_updated([snapshot])
+    broadcaster.broadcast_chats_updated([snapshot], ChatId("a1"))
 
     msg = json.loads(_get_message(q))
     assert msg["type"] == "chats_updated"
     assert msg["chats"] == [snapshot.model_dump(mode="json")]
+    assert msg["main_chat_id"] == "a1"
     assert msg["chats"][0]["chat_id"] == "a1"
     assert msg["chats"][0]["active_agent"]["agent_id"] == "a1"
 
@@ -83,14 +93,17 @@ def test_broadcast_provisional_chat_created() -> None:
     q = broadcaster.register()
 
     broadcaster.broadcast_provisional_chat_created(
-        ProvisionalChat(chat_id=ChatId("a1"), name="test", phase=ProvisionalChatPhase.AWAITING_ACCOUNT)
+        ProvisionalChatAsShown(
+            chat=ProvisionalChat(chat_id=ChatId("a1"), name="test", phase=ProvisionalChatPhase.CREATING),
+            held_sends=(),
+        )
     )
 
     msg = json.loads(_get_message(q))
     assert msg["type"] == "provisional_chat_created"
     assert msg["chat_id"] == "a1"
     assert msg["name"] == "test"
-    assert msg["phase"] == "awaiting_account"
+    assert msg["phase"] == "creating"
     assert msg["error"] is None
 
 

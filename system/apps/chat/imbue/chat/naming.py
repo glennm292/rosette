@@ -1,6 +1,6 @@
 """How the workspace's objects get their names.
 
-The naming scheme mirrors how the minds app names hosts: every object wears a
+The naming scheme mirrors how the Imbue Studio app names hosts: every object wears a
 human-readable display name ("Chat 2"), and its true name -- the identifier
 embedded in tmux sessions, paths, and refs -- is a deterministic canonical form
 of that display name ("Chat-2"). The pair is established at create time and
@@ -9,14 +9,17 @@ kept matched on rename, so no surface ever shows a machine-minted coolname.
 For chat agents the display name lives on the mngr agent itself, as its
 ``display_name`` label, with the canonical form as the agent's mngr name.
 Display names are minted here, server-side, as the first free "Chat N", so two
-clients creating at the same time cannot both mint "Chat 1".
+clients creating at the same time cannot both mint "Chat 1". A chat still wearing
+its minted name (or a seeded chat still wearing its seed title) is given a
+descriptive one from its first message (``chat_naming.py``).
 """
 
+import re
 from collections.abc import Iterable
 from typing import Final
 
-from app_instances.primitives import canonical_name_from_title
-from app_instances.primitives import is_name_conflict as is_title_conflict
+from app_manifest.primitives import canonical_name_from_title
+from app_manifest.primitives import is_name_conflict as is_title_conflict
 
 from imbue.imbue_common.pure import pure
 
@@ -25,14 +28,16 @@ from imbue.imbue_common.pure import pure
 # so a name that said "Codex" would be wrong the moment it moved to claude.
 AUTO_NAME_WORD: Final[str] = "Chat"
 
+_MINTED_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(rf"{AUTO_NAME_WORD} [1-9][0-9]*")
+
 
 @pure
 def canonical_agent_name(name: str) -> str:
     """The true-name form of a human-readable chat name ("Chat 2" -> "Chat-2").
 
     The workspace app model's naming rule, shared with every app through the
-    instances library. It mirrors mngr's own canonicalization rather than
-    importing it: a workspace's vendored mngr may predate free-form names, and
+    manifest library. It mirrors mngr's own canonicalization rather than
+    importing it: a workspace's mngr may predate free-form names, and
     passing it a name it would reject fails the create outright. Sending the
     canonical name (plus the typed one as a ``display_name`` label) is accepted
     by every mngr version. Returns "" when nothing usable remains (e.g. the
@@ -69,6 +74,12 @@ def first_free_numbered_name(word: str, taken_names: Iterable[str]) -> str:
     while _canonical_name_key(f"{word} {n}") in taken_keys:
         n += 1
     return f"{word} {n}"
+
+
+@pure
+def is_minted_chat_name(name: str) -> bool:
+    """Whether ``name`` is exactly a name :func:`first_free_numbered_name` mints ("Chat 3", not "chat 3" or "Chat 3 notes")."""
+    return _MINTED_NAME_PATTERN.fullmatch(name) is not None
 
 
 @pure

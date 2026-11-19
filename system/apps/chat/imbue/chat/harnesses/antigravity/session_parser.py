@@ -27,9 +27,9 @@ from imbue.chat.harnesses.auth_errors import is_auth_error_text
 from imbue.chat.harnesses.message_display import stamp_user_message_display
 from imbue.chat.harnesses.tool_output import classify_tool_call_display
 from imbue.chat.harnesses.tool_output import error_snippet
-from imbue.chat.harnesses.tool_output import find_permission_request
 from imbue.chat.harnesses.tool_output import is_pure_tk_lifecycle_command
 from imbue.chat.harnesses.tool_output import is_tk_lifecycle_anywhere
+from imbue.chat.harnesses.tool_output import stamp_echoed_requests
 from imbue.chat.harnesses.tool_output import tk_stamp
 
 # "common" here means the normalized/common event *form*, matching the
@@ -144,7 +144,6 @@ def _tool_events(step: DecodedStep) -> list[dict[str, Any]]:
         # The structured facts lifted from the full output, which itself stays off the
         # event (the payload-free wire contract -- see ``harnesses/tool_output``).
         raw_output = step.tool_result_text
-        permission_request = find_permission_request(raw_output)
         result_event: dict[str, Any] = {
             "timestamp": step.created_at,
             "type": "tool_result",
@@ -156,8 +155,7 @@ def _tool_events(step: DecodedStep) -> list[dict[str, Any]]:
             "is_error": step.is_error_result,
             "message_uuid": result_event_id,
         }
-        if permission_request is not None:
-            result_event["permission_request"] = permission_request.details
+        stamp_echoed_requests(result_event, raw_output)
         snippet = error_snippet(raw_output) if step.is_error_result else ""
         if snippet:
             result_event["error_snippet"] = snippet
@@ -184,7 +182,8 @@ def parse_step(step: DecodedStep) -> list[dict[str, Any]]:
             return []
         return _user_message(step)
     if step.step_type_name == "PLANNER_RESPONSE":
-        # Assistant text is only shown once the step settles -- never a partial stream.
+        # Assistant text joins the transcript only once the step settles; until then the
+        # chat shows it as the reply draft (``planner_draft_text``).
         if not step.is_terminal:
             return []
         text = step.assistant_text or ""
@@ -203,6 +202,13 @@ def parse_step(step: DecodedStep) -> list[dict[str, Any]]:
         event["is_auth_error"] = is_auth_error_text(step.error_text)
         return [event]
     return []
+
+
+def planner_draft_text(step: DecodedStep) -> str | None:
+    """The text of a planner step agy is still writing, or None for any other step."""
+    if step.step_type_name != "PLANNER_RESPONSE" or step.is_terminal:
+        return None
+    return step.assistant_text or None
 
 
 def parse_step_detail(step: DecodedStep) -> dict[str, dict[str, Any]]:

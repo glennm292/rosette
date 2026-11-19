@@ -1,0 +1,931 @@
+/**
+ * The TypeScript mirrors of the shell's records (desktop-interface contracts.md sections 3 to
+ * 5, and the pinned-taskbar-entries plan): what ``GET /api/inventory`` (the desktops, the apps
+ * with each one's pin, and the clients with each one's entries), the placements routes (a
+ * client's stored window paths included), the client list, the ``apps_updated`` and
+ * ``desktops_updated`` pushes, the avatar catalog of ``GET /api/avatars``, and the
+ * ``avatar_status``, ``avatar_selection_changed``, ``client_entries_changed``, and
+ * ``presence_updated`` pushes carry, spelled as the wire spells them (``snake_case``), and the
+ * parsers that read a wire document into them. A document of the wrong shape is refused with
+ * ``WireShapeError`` rather than read as an empty one: an empty desktop list would be believed.
+ */
+
+export type WindowState = "NORMAL" | "SNAPPED_LEFT" | "SNAPPED_RIGHT" | "MAXIMIZED" | "FULLSCREEN";
+
+export const WINDOW_STATES: readonly WindowState[] = [
+  "NORMAL",
+  "SNAPPED_LEFT",
+  "SNAPPED_RIGHT",
+  "MAXIMIZED",
+  "FULLSCREEN",
+];
+
+export type ShortcutMode = "focus" | "new";
+
+export type IfPresent = "focus" | "new";
+
+export type WallpaperKind = "bundled" | "file";
+
+/** Whether a window's path and title are followed by every client, or kept by each client for itself. */
+export type LocationScope = "linked" | "independent";
+
+/** How a pinned entry is drawn: the plain icon-and-title entry, or the avatar the shell ships. */
+export type PinStyle = "plain" | "avatar";
+
+/** Where one client shows a pinned entry: in the taskbar, or floating above the windows. */
+export type EntryMode = "bar" | "floating";
+
+/** A window's rectangle in fractions of the backdrop, wholly inside the unit square. */
+export interface Frame {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+export interface GridCell {
+  readonly column: number;
+  readonly row: number;
+}
+
+export interface ShortcutTarget {
+  readonly kind: "launch";
+  readonly app: string;
+  readonly launch: string;
+}
+
+export interface DesktopShortcut {
+  readonly target: ShortcutTarget;
+  readonly mode: ShortcutMode;
+  readonly cell: GridCell;
+}
+
+export interface Wallpaper {
+  readonly kind: WallpaperKind;
+  readonly name: string;
+}
+
+export interface WindowRecord {
+  readonly id: string;
+  readonly app: string;
+  readonly path: string;
+  /** What the page last reported; "" means "show the app's display name". */
+  readonly title: string;
+  readonly opened_at: string;
+  /** The app's pinned window on this desktop: permanent, never closed. */
+  readonly is_pinned: boolean;
+  readonly scope: LocationScope;
+}
+
+export interface Desktop {
+  readonly id: string;
+  readonly name: string;
+  /** Kept in the record and drawn nowhere since the desktops phase (the multiplayer spec, S7). */
+  readonly color: string;
+  readonly glyph: number;
+  readonly wallpaper: Wallpaper | null;
+  /** The theme the desktop wears by its own choice (Desktop settings); null wears the workspace's default. */
+  readonly theme: string | null;
+  readonly shortcuts: readonly DesktopShortcut[];
+  readonly windows: readonly WindowRecord[];
+  /** Whose desktop it is by convention (the multiplayer spec, section 8.1): a participant key, or null for the
+   *  workspace owner's. */
+  readonly owner: string | null;
+}
+
+export interface Placement {
+  readonly window_id: string;
+  readonly frame: Frame;
+  readonly state: WindowState;
+  readonly is_minimized: boolean;
+  /** Whether the window is pulled out into a desktop window of the embedding chrome's own (the pull-out-window
+   *  spec): drawn as a ghost at its frame here, its page shown elsewhere. Orthogonal to the state; a file
+   *  without the key reads as attached. */
+  readonly is_detached: boolean;
+}
+
+/** One client's path and title for an independent window (pinned-taskbar-entries plan section 5.1). */
+export interface StoredWindowPath {
+  readonly path: string;
+  readonly title: string;
+}
+
+/** One client's layout of one desktop: the placements, back to front, the stamp of the last save, and the
+ *  client's stored paths for the desktop's independent windows, by window id. */
+export interface Layout {
+  readonly updated_at: string | null;
+  readonly placements: readonly Placement[];
+  readonly window_paths: Readonly<Record<string, StoredWindowPath>>;
+}
+
+export const EMPTY_LAYOUT: Layout = Object.freeze({
+  updated_at: null,
+  placements: Object.freeze([]),
+  window_paths: Object.freeze({}),
+});
+
+/** A client's backdrop area in CSS pixels: the box its frames are fractions of (the multiplayer spec, section
+ *  8.3). */
+export interface Viewport {
+  readonly width: number;
+  readonly height: number;
+}
+
+/** The desktop as its owner last arranged it: their client's layout, and the backdrop size that client reported
+ *  (null when none wrote a layout, or the one that did never reported a size), which a viewing window draws the
+ *  layout at. */
+export interface OwnerLayout {
+  readonly layout: Layout;
+  readonly viewport: Viewport | null;
+}
+
+/** How the shell runs a launch path: opens a window at the path, or posts to it for the path of the page to open
+ *  (post-launch-paths plan section 3.1). */
+export type LaunchPathMethod = "GET" | "POST";
+
+export interface LaunchPath {
+  readonly id: string;
+  readonly label: string;
+  readonly path: string;
+  readonly method: LaunchPathMethod;
+  /** The names of the params a caller may supply. */
+  readonly params: readonly string[];
+  /** The fixed name-value pairs the shell sends with every launch of the path. */
+  readonly presets: Readonly<Record<string, string>>;
+  /** The param the launcher fills with typed text, which makes this a free-text row; null for none. */
+  readonly text_param: string | null;
+  /** The param the shell fills with text to be drafted rather than sent (a free-text row too, and what the avatar
+   *  dialog's draft goes through); null for none. */
+  readonly draft_param: string | null;
+  /** The param the shell fills with a mention of the person whose tray entry was clicked (the multiplayer spec,
+   *  section 7.5); never a launcher row; null for none. */
+  readonly mention_param: string | null;
+  /** The params the shell fills with the name and display name of the app whose window's "Chat about this app"
+   *  button was pressed (the multiplayer spec, section 9.2); never a launcher row; null for none. */
+  readonly app_params: AppParams | null;
+}
+
+export interface AppParams {
+  readonly name: string;
+  readonly display_name: string;
+}
+
+export interface DefaultShortcut {
+  /** The launch path id the shortcut runs. */
+  readonly launch: string;
+  readonly mode: ShortcutMode;
+}
+
+/** An app's pinned taskbar entry, as its manifest declares it (pinned-taskbar-entries plan section 3.1). */
+export interface AppPin {
+  /** The home path: where the pinned window opens. */
+  readonly path: string;
+  readonly style: PinStyle;
+  readonly scope: LocationScope;
+  readonly default_mode: EntryMode;
+}
+
+/** One message an app registered for (contracts.md section 2): its type, and either the route the shell posts it to
+ *  or the page template the shell shows for it (``null`` for the form it does not use). */
+export interface MessageHandler {
+  readonly type: string;
+  readonly path: string | null;
+  readonly show: string | null;
+}
+
+/** One registered app as the shell lists it (contracts.md section 5.5). */
+export interface AppRecord {
+  readonly name: string;
+  readonly display_name: string;
+  /** The app's own icon as SVG markup, or "" when it registered none. */
+  readonly icon: string;
+  /** The unguessable origin label its public origin uses ("" on a legacy row). */
+  readonly label: string;
+  readonly url: string;
+  readonly internal: boolean;
+  readonly program: string;
+  readonly critical: boolean;
+  /** Whether the shell stops the app's program once no window shows it (the stop-when-no-windows spec). */
+  readonly stop_when_no_windows: boolean;
+  /** Whether the app's pages listen to the microphone, which the shell then delegates to their frames. */
+  readonly uses_microphone: boolean;
+  /** The app's launch paths; the shell synthesizes ``open`` at ``/`` for an app declaring none. */
+  readonly launch_paths: readonly LaunchPath[];
+  /** The shortcuts a new desktop is seeded with, as the app declares them; none for an app that leaves the choice to
+   *  the shell. */
+  readonly default_shortcuts: readonly DefaultShortcut[];
+  readonly launcher_rank: number | null;
+  readonly pin: AppPin | null;
+  /** The messages the app takes, from the Imbue Studio chrome or from other apps' pages, which the shell relays. */
+  readonly message_handlers: readonly MessageHandler[];
+  readonly is_running: boolean;
+  /** The app's address on the domain the workspace was last shared under, or null when it never was. */
+  readonly share_url: string | null;
+  /** Where the app's Theming submenu stands (docs/system/themeable-apps.md): on or off for a themeable app,
+   *  unthemed for an app that can be made themeable, null for an app that wears the theme itself or is not themed. */
+  readonly theming: AppTheming | null;
+}
+
+export type AppTheming = "on" | "off" | "unthemed";
+
+const APP_THEMINGS: readonly AppTheming[] = ["on", "off", "unthemed"];
+
+function parseAppTheming(raw: unknown): AppTheming | null {
+  return APP_THEMINGS.find((theming) => theming === raw) ?? null;
+}
+
+/** Where a client keeps a floating entry: the top-left corner of its box, in fractions of the backdrop. */
+export interface FloatingPosition {
+  readonly x: number;
+  readonly y: number;
+}
+
+/** How one client shows one pinned entry (pinned-taskbar-entries plan section 3.4). */
+export interface EntryPresentation {
+  readonly mode: EntryMode;
+  readonly style: PinStyle;
+  readonly position: FloatingPosition | null;
+  /** Whether this client lists the pinned window in its taskbar; false after the client closed it. */
+  readonly is_window_shown: boolean;
+}
+
+export interface ClientRecord {
+  readonly id: string;
+  readonly active_desktop: string | null;
+  readonly last_seen: string;
+  readonly is_connected: boolean;
+  /** The client's presentation of each pinned entry, by app name. */
+  readonly entries: Readonly<Record<string, EntryPresentation>>;
+  /** What the client's phone layout has shown (plan-phone-interface.md), most recent last: window ids, and
+   *  ``SHOWN_HOME`` for the home grid. */
+  readonly shown_history: readonly string[];
+  /** Counts the moves of the client's stored desktop and the reports the shell redirected off a deleted desktop:
+   *  orders what a window hears of its desktop. */
+  readonly desktop_revision: number;
+  /** Who the client last arrived as (the multiplayer spec's participant key); null for a record from before the
+   *  key was kept. */
+  readonly participant: string | null;
+  /** The windows of its active desktop its layout does not minimize, top of the stack first: what the client is
+   *  looking at. */
+  readonly shown: readonly string[];
+  /** The backdrop size the client's desktop layout last reported; null for one that never has (a phone, a
+   *  pulled-out window, or an older shell). */
+  readonly viewport: Viewport | null;
+}
+
+/** The ``shown_history`` entry that stands for the phone's home grid rather than a window. */
+export const SHOWN_HOME = "home";
+
+/** What the shell answers when this client's page arrives (contracts.md section 5.5): where it lands, the desktop
+ *  seeded for a first-time user, and the name of the user's earlier desktop when it had been deleted meanwhile. */
+export interface ClientArrival {
+  readonly desktop_id: string | null;
+  readonly created_desktop: Desktop | null;
+  readonly replaced_desktop_name: string | null;
+}
+
+/** One app's part of the answer to a message every app took (contracts.md section 5.6), as far as a page reads it:
+ *  for a page shown, whether the client has only pop-outs open, so the page waits on its desktop for a desktop
+ *  window (false for a posted message). */
+export interface MessageDelivery {
+  readonly app: string;
+  readonly has_no_desktop_window: boolean;
+}
+
+/** What the shell answers a message every app took. */
+export interface MessageRelay {
+  readonly deliveries: readonly MessageDelivery[];
+}
+
+export interface WallpaperListing {
+  readonly kind: WallpaperKind;
+  readonly name: string;
+  readonly url: string;
+}
+
+/** What a shell page reads once it has arrived (contracts.md section 5.5): every desktop, every registered app,
+ *  and every known client, in one answer, so the page knows the apps before it draws a shortcut. The document's
+ *  ``is_preview`` and each client's ``shown`` are an agent's reading of it and are not kept here. */
+export interface Inventory {
+  readonly desktops: readonly Desktop[];
+  readonly apps: readonly AppRecord[];
+  readonly clients: readonly ClientRecord[];
+  /** What the workspace is called. */
+  readonly workspace_name: string;
+}
+
+/** One connected user as the shell serializes it (one entry per user, however many tabs): the identity record
+ * with the account's profile (name and profile picture, from imbue_cloud) beside it. */
+export interface PresentUser {
+  readonly user_id: string;
+  readonly email: string;
+  readonly display_name: string | null;
+  readonly profile_picture_url: string | null;
+  readonly owner: boolean;
+  readonly first_seen: string;
+  readonly last_seen: string;
+}
+
+/** What a roster entry is (the multiplayer spec, section 4.1). */
+export type ParticipantKind = "person" | "invited" | "visiting_agent" | "workspace_agent";
+
+/** One entry of the roster (the multiplayer spec, section 4.2): everyone who may be here, as the shell lists them. */
+export interface RosterParticipant {
+  readonly key: string;
+  readonly kind: ParticipantKind;
+  readonly display_name: string;
+  readonly profile_picture_url: string | null;
+  readonly email: string | null;
+  /** What they are mentioned by, without the ``@``. */
+  readonly handle: string;
+  /** The colour they are drawn in, as ``#RRGGBB``. */
+  readonly color: string;
+  readonly is_owner: boolean;
+  readonly is_connected: boolean;
+  /** When they were last here (ISO 8601), when ever. */
+  readonly last_seen: string | null;
+  /** When their newest page last saw keyboard or pointer input (ISO 8601), when it reports it. */
+  readonly last_input_at: string | null;
+  /** Whether a domain grant admits them rather than a grant naming them (the multiplayer spec, section 4.2). */
+  readonly is_admitted_by_domain: boolean;
+}
+
+/** What a chat is doing, as the chat app reports it for the agent's card (the multiplayer spec, section 6.4). */
+export type ChatActivityStatus = "working" | "background" | "idle" | "attention" | "stopped" | "error";
+
+export interface ChatActivity {
+  readonly chat_id: string;
+  readonly title: string;
+  readonly status: ChatActivityStatus;
+  readonly kind: "agent" | "room";
+}
+
+/** What a ``bubble`` push carries: a message somebody sent, or a chat's notification to the user. */
+export const BUBBLE_KINDS = ["message", "notification"] as const;
+export type BubbleKind = (typeof BUBBLE_KINDS)[number];
+
+/** A ``bubble`` push as the shell sends it (the multiplayer spec, section 6.5): what somebody just said, or what a
+ *  chat just notified the user of. */
+export interface BubbleWire {
+  readonly speaker: string;
+  readonly chat_id: string;
+  readonly chat_title: string;
+  readonly text: string;
+  readonly message_id: string;
+  readonly mentions: readonly string[];
+  readonly kind: BubbleKind;
+}
+
+/** What the avatar's image says about the machine (pinned-taskbar-entries plan section 4.6). */
+export type AvatarMood = "idle" | "working";
+
+export interface AvatarStatus {
+  readonly mood: AvatarMood;
+  /** Whether the status may be out of date: the events it is read from are old, or absent. */
+  readonly is_stale: boolean;
+}
+
+/** The update notice as the shell sends it (``GET /api/updates/pending`` and ``update_notice_changed``): the
+ *  rollback point the last update-app careful-flow apply kept, or null once it is cleared. */
+export interface UpdateNoticeWire {
+  readonly merge_sha: string;
+  readonly applied_at: number;
+  readonly driven_by: string;
+  readonly apps: readonly string[];
+  readonly programs: readonly string[];
+  readonly needs_system_services_restart: boolean;
+  readonly progress: string | null;
+  readonly outcome: string | null;
+}
+
+/** One design as ``GET /api/avatars`` lists it; ``source_path`` is null for a bundled one. */
+export interface AvatarDesign {
+  readonly id: string;
+  readonly label: string;
+  readonly source_path: string | null;
+}
+
+/** The whole of ``GET /api/avatars``: the designs on offer, the workspace's choice, and the fallback. */
+export interface AvatarCatalog {
+  readonly designs: readonly AvatarDesign[];
+  readonly selected: string;
+  readonly default: string;
+}
+
+/** Raised when a wire document does not have the shape the contract gives it. */
+export class WireShapeError extends Error {}
+
+type Raw = Record<string, unknown>;
+
+function asObject(value: unknown, what: string): Raw {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new WireShapeError(`${what} is not an object`);
+  }
+  return value as Raw;
+}
+
+function asArray(value: unknown, what: string): unknown[] {
+  if (!Array.isArray(value)) throw new WireShapeError(`${what} is not an array`);
+  return value;
+}
+
+function asString(value: unknown, what: string): string {
+  if (typeof value !== "string") throw new WireShapeError(`${what} is not a string`);
+  return value;
+}
+
+function asOptionalString(value: unknown, what: string): string | null {
+  if (value === null || value === undefined) return null;
+  return asString(value, what);
+}
+
+function asNumber(value: unknown, what: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new WireShapeError(`${what} is not a number`);
+  return value;
+}
+
+function asBoolean(value: unknown, what: string): boolean {
+  if (typeof value !== "boolean") throw new WireShapeError(`${what} is not a boolean`);
+  return value;
+}
+
+function asOneOf<T extends string>(value: unknown, allowed: readonly T[], what: string): T {
+  if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) {
+    throw new WireShapeError(`${what} is not one of ${allowed.join(", ")}: ${JSON.stringify(value)}`);
+  }
+  return value as T;
+}
+
+export function parseFrame(raw: unknown): Frame {
+  const record = asObject(raw, "frame");
+  return {
+    x: asNumber(record.x, "frame.x"),
+    y: asNumber(record.y, "frame.y"),
+    width: asNumber(record.width, "frame.width"),
+    height: asNumber(record.height, "frame.height"),
+  };
+}
+
+export function parseGridCell(raw: unknown): GridCell {
+  const record = asObject(raw, "cell");
+  return { column: asNumber(record.column, "cell.column"), row: asNumber(record.row, "cell.row") };
+}
+
+function parseShortcut(raw: unknown): DesktopShortcut {
+  const record = asObject(raw, "shortcut");
+  const target = asObject(record.target, "shortcut.target");
+  return {
+    target: {
+      kind: "launch",
+      app: asString(target.app, "shortcut.target.app"),
+      launch: asString(target.launch, "shortcut.target.launch"),
+    },
+    mode: asOneOf(record.mode, ["focus", "new"], "shortcut.mode"),
+    cell: parseGridCell(record.cell),
+  };
+}
+
+export function parseWallpaper(raw: unknown): Wallpaper | null {
+  if (raw === null || raw === undefined) return null;
+  const record = asObject(raw, "wallpaper");
+  return {
+    kind: asOneOf(record.kind, ["bundled", "file"], "wallpaper.kind"),
+    name: asString(record.name, "wallpaper.name"),
+  };
+}
+
+export function parseWindow(raw: unknown): WindowRecord {
+  const record = asObject(raw, "window");
+  return {
+    id: asString(record.id, "window.id"),
+    app: asString(record.app, "window.app"),
+    path: asString(record.path, "window.path"),
+    title: asString(record.title, "window.title"),
+    opened_at: asString(record.opened_at, "window.opened_at"),
+    is_pinned: record.is_pinned === undefined ? false : asBoolean(record.is_pinned, "window.is_pinned"),
+    scope: record.scope === undefined ? "linked" : asOneOf(record.scope, ["linked", "independent"], "window.scope"),
+  };
+}
+
+export function parseDesktop(raw: unknown): Desktop {
+  const record = asObject(raw, "desktop");
+  return {
+    id: asString(record.id, "desktop.id"),
+    name: asString(record.name, "desktop.name"),
+    color: asString(record.color, "desktop.color"),
+    glyph: asNumber(record.glyph, "desktop.glyph"),
+    wallpaper: parseWallpaper(record.wallpaper),
+    theme: asOptionalString(record.theme, "desktop.theme"),
+    shortcuts: asArray(record.shortcuts, "desktop.shortcuts").map(parseShortcut),
+    windows: asArray(record.windows, "desktop.windows").map(parseWindow),
+    owner: asOptionalString(record.owner, "desktop.owner"),
+  };
+}
+
+export function parseDesktops(raw: unknown): Desktop[] {
+  return asArray(raw, "desktops").map(parseDesktop);
+}
+
+export function parsePlacement(raw: unknown): Placement {
+  const record = asObject(raw, "placement");
+  return {
+    window_id: asString(record.window_id, "placement.window_id"),
+    frame: parseFrame(record.frame),
+    state: asOneOf(record.state, WINDOW_STATES, "placement.state"),
+    is_minimized: asBoolean(record.is_minimized, "placement.is_minimized"),
+    is_detached: record.is_detached === undefined ? false : asBoolean(record.is_detached, "placement.is_detached"),
+  };
+}
+
+function parseStoredWindowPath(raw: unknown): StoredWindowPath {
+  const record = asObject(raw, "window path");
+  return { path: asString(record.path, "window_path.path"), title: asString(record.title, "window_path.title") };
+}
+
+function parseWindowPaths(raw: unknown): Record<string, StoredWindowPath> {
+  if (raw === undefined) return {};
+  const record = asObject(raw, "layout.window_paths");
+  return Object.fromEntries(
+    Object.entries(record).map(([windowId, stored]) => [windowId, parseStoredWindowPath(stored)]),
+  );
+}
+
+export function parseLayout(raw: unknown): Layout {
+  const record = asObject(raw, "layout");
+  return {
+    updated_at: asOptionalString(record.updated_at, "layout.updated_at"),
+    placements: asArray(record.placements, "layout.placements").map(parsePlacement),
+    window_paths: parseWindowPaths(record.window_paths),
+  };
+}
+
+/** A viewport as a client record or the owner-layout answer carries it; absent (an older shell) reads as none. */
+function parseViewport(raw: unknown): Viewport | null {
+  if (raw === undefined || raw === null) return null;
+  const record = asObject(raw, "viewport");
+  return { width: asNumber(record.width, "viewport.width"), height: asNumber(record.height, "viewport.height") };
+}
+
+/** The ``?of=owner`` placements answer: a layout with the chosen client's viewport beside it. */
+export function parseOwnerLayout(raw: unknown): OwnerLayout {
+  return { layout: parseLayout(raw), viewport: parseViewport(asObject(raw, "layout").viewport) };
+}
+
+function parsePresets(raw: unknown): Record<string, string> {
+  if (raw === undefined || raw === null) return {};
+  const record = asObject(raw, "launch_path.presets");
+  return Object.fromEntries(
+    Object.entries(record).map(([name, value]) => [name, asString(value, `launch_path.presets.${name}`)]),
+  );
+}
+
+function parseLaunchPath(raw: unknown): LaunchPath {
+  const record = asObject(raw, "launch path");
+  return {
+    id: asString(record.id, "launch_path.id"),
+    label: asString(record.label, "launch_path.label"),
+    path: asString(record.path, "launch_path.path"),
+    method: record.method === undefined ? "GET" : asOneOf(record.method, ["GET", "POST"], "launch_path.method"),
+    params: asArray(record.params ?? [], "launch_path.params").map((param) => asString(param, "launch_path.param")),
+    presets: parsePresets(record.presets),
+    text_param: asOptionalString(record.text_param, "launch_path.text_param"),
+    draft_param: asOptionalString(record.draft_param, "launch_path.draft_param"),
+    mention_param: asOptionalString(record.mention_param, "launch_path.mention_param"),
+    app_params: parseAppParams(record.app_params),
+  };
+}
+
+function parseAppParams(raw: unknown): AppParams | null {
+  if (raw === undefined || raw === null) return null;
+  const record = asObject(raw, "launch_path.app_params");
+  return {
+    name: asString(record.name, "launch_path.app_params.name"),
+    display_name: asString(record.display_name, "launch_path.app_params.display_name"),
+  };
+}
+
+function parseDefaultShortcut(raw: unknown): DefaultShortcut {
+  const record = asObject(raw, "default_shortcut");
+  return {
+    launch: asString(record.launch, "default_shortcut.launch"),
+    mode: asOneOf(record.mode, ["focus", "new"], "default_shortcut.mode"),
+  };
+}
+
+function parsePin(raw: unknown): AppPin | null {
+  if (raw === null || raw === undefined) return null;
+  const record = asObject(raw, "pin");
+  return {
+    path: asString(record.path, "pin.path"),
+    style: asOneOf(record.style, ["plain", "avatar"], "pin.style"),
+    scope: asOneOf(record.scope, ["linked", "independent"], "pin.scope"),
+    default_mode: asOneOf(record.default_mode, ["bar", "floating"], "pin.default_mode"),
+  };
+}
+
+function parseMessageHandler(raw: unknown): MessageHandler {
+  const record = asObject(raw, "message handler");
+  return {
+    type: asString(record.type, "message_handler.type"),
+    path: record.path == null ? null : asString(record.path, "message_handler.path"),
+    show: record.show == null ? null : asString(record.show, "message_handler.show"),
+  };
+}
+
+export function parseAppRecord(raw: unknown): AppRecord {
+  const record = asObject(raw, "app");
+  const name = asString(record.name, "app.name");
+  const rank = record.launcher_rank;
+  return {
+    name,
+    display_name: typeof record.display_name === "string" && record.display_name !== "" ? record.display_name : name,
+    icon: typeof record.icon === "string" ? record.icon : "",
+    label: typeof record.label === "string" ? record.label : "",
+    url: asString(record.url, "app.url"),
+    internal: record.internal === true,
+    program: typeof record.program === "string" ? record.program : "",
+    critical: record.critical === true,
+    stop_when_no_windows: record.stop_when_no_windows === true,
+    uses_microphone: record.uses_microphone === true,
+    launch_paths: asArray(record.launch_paths ?? [], "app.launch_paths").map(parseLaunchPath),
+    default_shortcuts: asArray(record.default_shortcuts ?? [], "app.default_shortcuts").map(parseDefaultShortcut),
+    launcher_rank: typeof rank === "number" && Number.isFinite(rank) ? rank : null,
+    pin: parsePin(record.pin),
+    message_handlers: asArray(record.message_handlers ?? [], "app.message_handlers").map(parseMessageHandler),
+    is_running: record.is_running === true,
+    share_url: typeof record.share_url === "string" && record.share_url !== "" ? record.share_url : null,
+    theming: parseAppTheming(record.theming),
+  };
+}
+
+export function parseAppRecords(raw: unknown): AppRecord[] {
+  return asArray(raw, "apps").map(parseAppRecord);
+}
+
+export function parseClientRecords(raw: unknown): ClientRecord[] {
+  return asArray(raw, "clients").map(parseClientRecord);
+}
+
+function parseFloatingPosition(raw: unknown): FloatingPosition | null {
+  if (raw === null || raw === undefined) return null;
+  const record = asObject(raw, "position");
+  return { x: asNumber(record.x, "position.x"), y: asNumber(record.y, "position.y") };
+}
+
+export function parseEntryPresentation(raw: unknown): EntryPresentation {
+  const record = asObject(raw, "entry");
+  return {
+    mode: asOneOf(record.mode, ["bar", "floating"], "entry.mode"),
+    style: asOneOf(record.style, ["plain", "avatar"], "entry.style"),
+    position: parseFloatingPosition(record.position),
+    is_window_shown: record.is_window_shown !== false,
+  };
+}
+
+/** The ``entries`` map of a client record or a ``client_entries_changed`` message; absent reads as none. */
+export function parseEntries(raw: unknown): Record<string, EntryPresentation> {
+  if (raw === undefined) return {};
+  const record = asObject(raw, "entries");
+  return Object.fromEntries(Object.entries(record).map(([app, entry]) => [app, parseEntryPresentation(entry)]));
+}
+
+export function parseClientRecord(raw: unknown): ClientRecord {
+  const record = asObject(raw, "client");
+  return {
+    id: asString(record.id, "client.id"),
+    active_desktop: asOptionalString(record.active_desktop, "client.active_desktop"),
+    last_seen: asString(record.last_seen, "client.last_seen"),
+    is_connected: record.is_connected === true,
+    entries: parseEntries(record.entries),
+    shown_history: asArray(record.shown_history ?? [], "client.shown_history").map((entry, index) =>
+      asString(entry, `client.shown_history[${index}]`),
+    ),
+    desktop_revision: asNumber(record.desktop_revision ?? 0, "client.desktop_revision"),
+    participant: asOptionalString(record.participant, "client.participant"),
+    shown: asArray(record.shown ?? [], "client.shown").map((entry, index) =>
+      asString(entry, `client.shown[${index}]`),
+    ),
+    viewport: parseViewport(record.viewport),
+  };
+}
+
+export function parseAvatarStatus(raw: unknown): AvatarStatus {
+  const record = asObject(raw, "avatar status");
+  return {
+    mood: asOneOf(record.mood, ["idle", "working"], "avatar status.mood"),
+    is_stale: asBoolean(record.is_stale, "avatar status.is_stale"),
+  };
+}
+
+/** The design an ``avatar_selection_changed`` message names. */
+export function parseAvatarSelectionChanged(raw: unknown): string {
+  const record = asObject(raw, "avatar selection");
+  return asString(record.design, "avatar selection.design");
+}
+
+export function parseUpdateNoticeChanged(raw: unknown): UpdateNoticeWire | null {
+  const record = asObject(raw, "update notice change");
+  if (record.notice === null || record.notice === undefined) return null;
+  const notice = asObject(record.notice, "update notice");
+  return {
+    merge_sha: asString(notice.merge_sha, "update notice.merge_sha"),
+    applied_at: asNumber(notice.applied_at, "update notice.applied_at"),
+    driven_by: asString(notice.driven_by, "update notice.driven_by"),
+    apps: asArray(notice.apps, "update notice.apps").map((app, index) =>
+      asString(app, `update notice.apps[${index}]`),
+    ),
+    programs: asArray(notice.programs, "update notice.programs").map((program, index) =>
+      asString(program, `update notice.programs[${index}]`),
+    ),
+    needs_system_services_restart: asBoolean(
+      notice.needs_system_services_restart,
+      "update notice.needs_system_services_restart",
+    ),
+    progress: asOptionalString(notice.progress, "update notice.progress"),
+    outcome: asOptionalString(notice.outcome, "update notice.outcome"),
+  };
+}
+
+export function parseAvatarDesign(raw: unknown): AvatarDesign {
+  const record = asObject(raw, "avatar design");
+  return {
+    id: asString(record.id, "avatar design.id"),
+    label: asString(record.label, "avatar design.label"),
+    source_path: asOptionalString(record.source_path, "avatar design.source_path"),
+  };
+}
+
+export function parseAvatarCatalog(raw: unknown): AvatarCatalog {
+  const record = asObject(raw, "avatar catalog");
+  return {
+    designs: asArray(record.designs, "avatar catalog.designs").map(parseAvatarDesign),
+    selected: asString(record.selected, "avatar catalog.selected"),
+    default: asString(record.default, "avatar catalog.default"),
+  };
+}
+
+export function parseClientArrival(raw: unknown): ClientArrival {
+  const record = asObject(raw, "arrival");
+  return {
+    desktop_id: asOptionalString(record.desktop_id, "arrival.desktop_id"),
+    created_desktop:
+      record.created_desktop === null || record.created_desktop === undefined
+        ? null
+        : parseDesktop(record.created_desktop),
+    replaced_desktop_name: asOptionalString(record.replaced_desktop_name, "arrival.replaced_desktop_name"),
+  };
+}
+
+export function parseInventory(raw: unknown): Inventory {
+  const record = asObject(raw, "inventory");
+  return {
+    desktops: parseDesktops(record.desktops),
+    apps: parseAppRecords(record.apps),
+    clients: parseClientRecords(record.clients),
+    workspace_name: asString(record.workspace_name ?? "", "inventory.workspace_name"),
+  };
+}
+
+export function parseMessageRelay(raw: unknown): MessageRelay {
+  const record = asObject(raw, "message relay");
+  return { deliveries: asArray(record.deliveries, "message relay.deliveries").map(parseMessageDelivery) };
+}
+
+function parseMessageDelivery(raw: unknown): MessageDelivery {
+  const record = asObject(raw, "message delivery");
+  return {
+    app: asString(record.app, "message delivery.app"),
+    has_no_desktop_window: asBoolean(record.has_no_desktop_window ?? false, "message delivery.has_no_desktop_window"),
+  };
+}
+
+export function parseWallpaperListings(raw: unknown): WallpaperListing[] {
+  return asArray(raw, "wallpapers").map(parseWallpaperListing);
+}
+
+export function parseWallpaperListing(raw: unknown): WallpaperListing {
+  const record = asObject(raw, "wallpaper listing");
+  return {
+    kind: asOneOf(record.kind, ["bundled", "file"], "wallpaper.kind"),
+    name: asString(record.name, "wallpaper.name"),
+    url: asString(record.url, "wallpaper.url"),
+  };
+}
+
+const PARTICIPANT_KINDS: readonly ParticipantKind[] = ["person", "invited", "visiting_agent", "workspace_agent"];
+const CHAT_ACTIVITY_STATUSES: readonly ChatActivityStatus[] = [
+  "working",
+  "background",
+  "idle",
+  "attention",
+  "stopped",
+  "error",
+];
+
+function parseRosterParticipant(raw: unknown): RosterParticipant {
+  const record = asObject(raw, "participant");
+  return {
+    key: asString(record.key, "participant.key"),
+    kind: asOneOf(record.kind, PARTICIPANT_KINDS, "participant.kind"),
+    display_name: asString(record.display_name, "participant.display_name"),
+    profile_picture_url: asOptionalString(record.profile_picture_url, "participant.profile_picture_url"),
+    email: asOptionalString(record.email, "participant.email"),
+    handle: asString(record.handle, "participant.handle"),
+    color: asString(record.color, "participant.color"),
+    is_owner: asBoolean(record.is_owner, "participant.is_owner"),
+    is_connected: asBoolean(record.is_connected, "participant.is_connected"),
+    last_seen: asOptionalString(record.last_seen, "participant.last_seen"),
+    last_input_at: asOptionalString(record.last_input_at, "participant.last_input_at"),
+    is_admitted_by_domain: asBoolean(record.is_admitted_by_domain, "participant.is_admitted_by_domain"),
+  };
+}
+
+/** The ``roster_updated`` push's participants, in roster order. */
+export function parseRoster(raw: unknown): RosterParticipant[] {
+  return asArray(raw, "participants").map(parseRosterParticipant);
+}
+
+function parseChatActivity(raw: unknown): ChatActivity {
+  const record = asObject(raw, "chat activity");
+  return {
+    chat_id: asString(record.chat_id, "chat.chat_id"),
+    title: asString(record.title, "chat.title"),
+    status: asOneOf(record.status, CHAT_ACTIVITY_STATUSES, "chat.status"),
+    kind: asOneOf(record.kind, ["agent", "room"], "chat.kind"),
+  };
+}
+
+/** The ``chats_activity`` push's chats, in the chat app's order. */
+export function parseChatsActivity(raw: unknown): ChatActivity[] {
+  return asArray(raw, "chats").map(parseChatActivity);
+}
+
+/** A ``bubble`` push. */
+export function parseBubble(raw: unknown): BubbleWire {
+  const record = asObject(raw, "bubble");
+  return {
+    speaker: asString(record.speaker, "bubble.speaker"),
+    chat_id: asString(record.chat_id, "bubble.chat_id"),
+    chat_title: asString(record.chat_title, "bubble.chat_title"),
+    text: asString(record.text, "bubble.text"),
+    message_id: asString(record.message_id, "bubble.message_id"),
+    mentions: asArray(record.mentions ?? [], "bubble.mentions").map((mention, index) =>
+      asString(mention, `bubble.mentions[${index}]`),
+    ),
+    kind: asOneOf(record.kind, BUBBLE_KINDS, "bubble.kind"),
+  };
+}
+
+/** The ``users`` of a ``presence_updated`` message or of ``GET /api/presence``. */
+export function parsePresentUsers(raw: unknown): PresentUser[] {
+  return asArray(raw, "users").map(parsePresentUser);
+}
+
+export function parsePresentUser(raw: unknown): PresentUser {
+  const record = asObject(raw, "user");
+  return {
+    user_id: asString(record.user_id, "user.user_id"),
+    email: asString(record.email, "user.email"),
+    display_name: asOptionalString(record.display_name, "user.display_name"),
+    profile_picture_url: asOptionalString(record.profile_picture_url, "user.profile_picture_url"),
+    owner: asBoolean(record.owner, "user.owner"),
+    first_seen: asString(record.first_seen, "user.first_seen"),
+    last_seen: asString(record.last_seen, "user.last_seen"),
+  };
+}
+
+/** Whether two cells are the same cell. */
+export function isSameCell(first: GridCell, second: GridCell): boolean {
+  return first.column === second.column && first.row === second.row;
+}
+
+/** Whether two placements of the same window say the same thing (frame, state, minimized). */
+export function isSamePlacement(first: Placement, second: Placement): boolean {
+  return (
+    first.window_id === second.window_id &&
+    first.frame.x === second.frame.x &&
+    first.frame.y === second.frame.y &&
+    first.frame.width === second.frame.width &&
+    first.frame.height === second.frame.height &&
+    first.state === second.state &&
+    first.is_minimized === second.is_minimized &&
+    first.is_detached === second.is_detached
+  );
+}
+
+/** Whether two layouts hold the same stored paths and titles for the same windows. */
+export function isSameWindowPaths(
+  first: Readonly<Record<string, StoredWindowPath>>,
+  second: Readonly<Record<string, StoredWindowPath>>,
+): boolean {
+  const firstIds = Object.keys(first);
+  if (firstIds.length !== Object.keys(second).length) return false;
+  return firstIds.every(
+    (windowId) => second[windowId]?.path === first[windowId].path && second[windowId]?.title === first[windowId].title,
+  );
+}
+
+/** The key a shortcut is unique under on a desktop, and the spelling of ``data-shortcut``. */
+export function shortcutKey(app: string, launch: string): string {
+  return `${app}:${launch}`;
+}

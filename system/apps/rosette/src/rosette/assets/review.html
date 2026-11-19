@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rosette -- Review</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=EB+Garamond:ital,wght@0,400;0,500;1,400;1,500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --page: #fcfbf8;
+  --ink: #1b2430;
+  --ink-soft: #66707f;
+  --ink-faint: #9aa3ae;
+  --rule: #cbd8e4;
+  --pen: #c8362b;
+  --pen-faint: rgba(200, 54, 43, .3);
+  --ok: #3f7d58;
+  --serif: "EB Garamond", "Iowan Old Style", Palatino, Georgia, serif;
+  --sans: "Archivo", "Helvetica Neue", Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+}
+
+body {
+  font-family: var(--serif);
+  font-size: 19px;
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+  padding-bottom: 18vh;
+}
+
+/* ---- header ------------------------------------------------------- */
+
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.15rem 2rem .9rem;
+  background: var(--page);
+}
+
+.masthead::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  height: 20px;
+  background: linear-gradient(var(--page), rgba(252, 251, 248, 0));
+  pointer-events: none;
+}
+
+.title {
+  display: flex;
+  align-items: baseline;
+  gap: .6rem;
+}
+
+.masthead h1 {
+  margin: 0;
+  font-family: var(--serif);
+  font-style: italic;
+  font-weight: 500;
+  font-size: 1.32rem;
+  letter-spacing: .005em;
+}
+
+.sitting {
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  border-radius: 0;
+  padding: .1rem 1.1rem .1rem .2rem;
+  cursor: pointer;
+  max-width: 34ch;
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink-faint) 50%),
+                    linear-gradient(135deg, var(--ink-faint) 50%, transparent 50%);
+  background-position: right .45rem center, right .2rem center;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+
+.sitting:hover { border-bottom-color: var(--ink-faint); }
+
+.sitting:focus {
+  outline: none;
+  color: var(--ink);
+  border-bottom-color: var(--pen);
+}
+
+.tools {
+  display: flex;
+  align-items: baseline;
+  gap: .9rem;
+}
+
+.tool {
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--ink-faint);
+  background: none;
+  border: 0;
+  padding: .1rem 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.tool:hover { color: var(--pen); }
+.tool.is-on { color: var(--pen); }
+
+a.tool { text-decoration: underline; }
+
+/* ---- the sitting --------------------------------------------------- */
+
+main { padding: 0 2rem; }
+
+.when {
+  font-family: var(--sans);
+  font-size: .78rem;
+  color: var(--ink-faint);
+  margin: .2rem 0 2.1rem;
+}
+
+/* Same two columns as the notebook, so a line sits where the eye expects it:
+   what the student wrote on the left, what came back on the right. */
+.entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0;
+  padding: .45rem 0;
+  border-bottom: 1px solid rgba(203, 216, 228, .45);
+}
+
+.entry:last-child { border-bottom: none; }
+
+.wrote { padding-right: .95rem; }
+
+.came-back {
+  padding-left: .95rem;
+  border-left: 1.5px solid var(--pen-faint);
+}
+
+.wrote p, .came-back p { margin: 0; }
+
+.phrase { font-size: 1.05rem; }
+
+.meaning { font-size: 1.05rem; font-style: italic; }
+
+.note {
+  font-family: var(--sans);
+  font-size: .8rem;
+  line-height: 1.55;
+  color: var(--ink-soft);
+  margin: .3rem 0 0;
+  max-width: 48ch;
+}
+
+.wrong {
+  color: var(--pen);
+  text-decoration: line-through;
+  text-decoration-thickness: 1.5px;
+  text-decoration-color: var(--pen);
+}
+
+.right { color: var(--pen); font-weight: 500; }
+
+.verdict {
+  font-family: var(--sans);
+  font-size: .8rem;
+  font-weight: 500;
+  color: var(--pen);
+  margin: 0 0 .28rem;
+}
+
+.verdict.ok { color: var(--ok); }
+
+.reply {
+  font-family: var(--sans);
+  font-size: .88rem;
+  line-height: 1.6;
+  max-width: 62ch;
+}
+
+/* ---- covering the meanings ----------------------------------------- */
+
+/* Reviewing a list you can already read teaches nothing, so the meanings can
+   be covered and then turned over one at a time, the way a card is. Only the
+   looked-up words are covered: a correction read back is the point of it. */
+.is-covered .entry.is-lookup .came-back > * { visibility: hidden; }
+
+.is-covered .entry.is-lookup .came-back {
+  cursor: pointer;
+  background: repeating-linear-gradient(
+    -45deg, transparent, transparent 5px,
+    rgba(203, 216, 228, .32) 5px, rgba(203, 216, 228, .32) 6px);
+}
+
+.is-covered .entry.is-lookup.is-turned .came-back > * { visibility: visible; }
+.is-covered .entry.is-lookup.is-turned .came-back { background: none; }
+
+/* ---- the reply underneath ------------------------------------------ */
+
+.at {
+  font-family: var(--sans);
+  font-size: .7rem;
+  color: var(--ink-faint);
+  background: none;
+  border: 0;
+  padding: 0;
+  margin-top: .3rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+
+.entry:hover .at, .at:focus-visible { opacity: 1; }
+
+.raw {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .72rem;
+  line-height: 1.5;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: .4rem 0 0;
+  padding: .5rem .7rem;
+  background: rgba(203, 216, 228, .18);
+  max-height: 16rem;
+  overflow: auto;
+}
+
+.raw[hidden] { display: none; }
+
+.empty {
+  font-family: var(--sans);
+  font-size: .85rem;
+  color: var(--ink-faint);
+  margin: 2rem 0;
+}
+
+@media (max-width: 720px) {
+  .entry { grid-template-columns: 1fr; }
+  .came-back { padding-left: 0; border-left: 0; margin-top: .25rem; }
+  .wrote { padding-right: 0; }
+}
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="title">
+    <h1>Rosette</h1>
+    <select class="sitting" id="sitting" aria-label="Which sitting to review"></select>
+  </div>
+  <div class="tools">
+    <button type="button" class="tool" id="cover">Cover the meanings</button>
+    <a class="tool" href="/">Back to the notebook</a>
+  </div>
+</header>
+
+<main>
+  <p class="when" id="when"></p>
+  <div id="lines"></div>
+</main>
+
+<script>
+"use strict";
+
+const sittingElement = document.getElementById("sitting");
+const whenElement = document.getElementById("when");
+const linesElement = document.getElementById("lines");
+const coverElement = document.getElementById("cover");
+
+let sessions = [];
+
+function escapeText(text) {
+  const holder = document.createElement("div");
+  holder.appendChild(document.createTextNode(text === null || text === undefined ? "" : text));
+  return holder.innerHTML;
+}
+
+// Times are stored in UTC; everything shown is in the reader's own clock, so
+// an evening's work reads as the evening it was.
+function asDate(iso) {
+  return new Date(iso);
+}
+
+function dayLabel(iso) {
+  return asDate(iso).toLocaleDateString(undefined, {
+    weekday: "long", month: "long", day: "numeric",
+  });
+}
+
+function timeLabel(iso) {
+  return asDate(iso).toLocaleTimeString(undefined, {hour: "numeric", minute: "2-digit"});
+}
+
+function countLabel(count, one, many) {
+  return count + " " + (count === 1 ? one : many);
+}
+
+// Short, because this one has to fit in the box: the long form is in the line
+// under the header, where there is room for it.
+function sittingLabel(session) {
+  const when = asDate(session.started_at).toLocaleDateString(undefined, {
+    weekday: "short", month: "short", day: "numeric",
+  });
+  return when + ", " + timeLabel(session.started_at) +
+    " -- " + countLabel(session.line_count, "line", "lines");
+}
+
+// The corrected line, run by run, with the same markup the notebook uses.
+function renderSegments(segments) {
+  return segments.map((segment, index) => {
+    if (segment.kind === "wrong") return '<span class="wrong">' + escapeText(segment.text) + "</span>";
+    if (segment.kind === "right") {
+      // A replacement lands straight after the text it replaces, so it needs a
+      // real space to read -- and to copy -- as a separate word.
+      const isAfterWrong = index > 0 && segments[index - 1].kind === "wrong";
+      return (isAfterWrong ? " " : "") + '<span class="right">' + escapeText(segment.text) + "</span>";
+    }
+    return escapeText(segment.text);
+  }).join("");
+}
+
+function cameBackHtml(row) {
+  const analysis = row.analysis || {};
+  const parts = [];
+  if (analysis.mode === "gloss" && analysis.english) {
+    parts.push('<p class="meaning">' + escapeText(analysis.english) + "</p>");
+  } else if (analysis.mode === "translate" && analysis.italian) {
+    parts.push('<p class="phrase">' + escapeText(analysis.italian) + "</p>");
+  } else if (analysis.mode === "answer" && analysis.answer) {
+    parts.push('<p class="reply">' + escapeText(analysis.answer) + "</p>");
+  } else if (analysis.mode === "assess") {
+    if (analysis.verdict === "correct") {
+      parts.push('<p class="verdict ok">All correct.</p>');
+    } else if (analysis.verdict === "fix") {
+      const fixCount = (analysis.segments || []).filter(s => s.kind === "right").length;
+      parts.push('<p class="verdict">' + countLabel(fixCount, "fix", "fixes") + ".</p>");
+      parts.push('<p class="phrase">' + renderSegments(analysis.segments || []) + "</p>");
+    }
+  }
+  if (analysis.note) parts.push('<p class="note">' + escapeText(analysis.note) + "</p>");
+  return parts.join("");
+}
+
+function buildEntry(row) {
+  const entry = document.createElement("div");
+  const mode = (row.analysis || {}).mode;
+  // A looked-up word is the only kind worth covering to test yourself on; a
+  // correction or an answer has nothing to recall.
+  entry.className = mode === "gloss" || mode === "translate" ? "entry is-lookup" : "entry";
+
+  const wrote = document.createElement("div");
+  wrote.className = "wrote";
+  const phrase = document.createElement("p");
+  phrase.className = "phrase";
+  phrase.textContent = row.text.trim();
+  wrote.appendChild(phrase);
+
+  // The model's own reply, kept behind the time it arrived: always reachable,
+  // never in the way of reading the list.
+  if (row.raw_response) {
+    const at = document.createElement("button");
+    at.type = "button";
+    at.className = "at";
+    at.textContent = timeLabel(row.created_at);
+    const raw = document.createElement("pre");
+    raw.className = "raw";
+    raw.hidden = true;
+    raw.textContent = prettyRaw(row.raw_response);
+    at.addEventListener("click", () => { raw.hidden = !raw.hidden; });
+    wrote.appendChild(at);
+    wrote.appendChild(raw);
+  }
+
+  const cameBack = document.createElement("div");
+  cameBack.className = "came-back";
+  cameBack.innerHTML = cameBackHtml(row);
+
+  entry.appendChild(wrote);
+  entry.appendChild(cameBack);
+  return entry;
+}
+
+function prettyRaw(raw) {
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch (error) {
+    // Not JSON after all -- better the reply as it came than nothing.
+    return raw;
+  }
+}
+
+function paintSession(session) {
+  const held = [
+    countLabel(session.looked_up_count, "word or phrase looked up", "words and phrases looked up"),
+    session.checked_count ? countLabel(session.checked_count, "line checked", "lines checked") : "",
+    session.asked_count ? countLabel(session.asked_count, "question asked", "questions asked") : "",
+  ].filter(Boolean);
+  whenElement.textContent =
+    dayLabel(session.started_at) + ", " + timeLabel(session.started_at) +
+    " to " + timeLabel(session.ended_at) + " -- " + held.join(", ");
+
+  // One list, in the order it was written: a sitting is usually one passage
+  // worked through from the top, and sorting it by what was asked of each line
+  // takes that away.
+  linesElement.replaceChildren(...session.rows.map(buildEntry));
+}
+
+function showNothingYet() {
+  whenElement.textContent = "";
+  const nothing = document.createElement("p");
+  nothing.className = "empty";
+  nothing.textContent = "Nothing to review yet. Write a few lines in the notebook first.";
+  linesElement.replaceChildren(nothing);
+}
+
+sittingElement.addEventListener("change", () => {
+  const session = sessions.find(s => s.session_id === sittingElement.value);
+  if (session) paintSession(session);
+});
+
+coverElement.addEventListener("click", () => {
+  const covered = document.body.classList.toggle("is-covered");
+  coverElement.classList.toggle("is-on", covered);
+  coverElement.textContent = covered ? "Show the meanings" : "Cover the meanings";
+  for (const entry of document.querySelectorAll(".entry.is-turned")) {
+    entry.classList.remove("is-turned");
+  }
+});
+
+// While the meanings are covered, a click turns one over -- and only that one.
+linesElement.addEventListener("click", event => {
+  if (!document.body.classList.contains("is-covered")) return;
+  const cameBack = event.target.closest ? event.target.closest(".came-back") : null;
+  const entry = cameBack ? cameBack.closest(".entry.is-lookup") : null;
+  if (!entry) return;
+  entry.classList.toggle("is-turned");
+});
+
+async function start() {
+  let payload = {sessions: []};
+  try {
+    const response = await fetch("/api/sessions");
+    if (response.ok) payload = await response.json();
+  } catch (error) {
+    showNothingYet();
+    return;
+  }
+  sessions = payload.sessions || [];
+  if (sessions.length === 0) {
+    showNothingYet();
+    sittingElement.hidden = true;
+    return;
+  }
+  for (const session of sessions) {
+    const option = document.createElement("option");
+    option.value = session.session_id;
+    option.textContent = sittingLabel(session);
+    sittingElement.appendChild(option);
+  }
+  // The newest sitting is the one being reviewed almost every time.
+  sittingElement.value = sessions[0].session_id;
+  paintSession(sessions[0]);
+}
+
+start();
+
+if (window.parent !== window) {
+  window.parent.postMessage({type: "shell:location", path: location.pathname + location.search}, "*");
+}
+</script>
+</body>
+</html>

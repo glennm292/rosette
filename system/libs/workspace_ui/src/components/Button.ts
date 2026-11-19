@@ -29,6 +29,10 @@ export interface ButtonOptions {
   /** Accent-tint pressed look; an icon ghost with `selected` is the on/off
    *  toggle recipe. */
   selected?: boolean;
+  /** The neutral pressed look (the fill-active tint in the text colour), for
+   *  an on/off control whose "on" should not read as the accent: the
+   *  composer's mic while it listens. Wins over `selected`. */
+  pressed?: boolean;
   /** Non-interactive without `disabled`: resting look, default cursor, no
    *  hover/press. The element stays enabled so a hover tooltip can explain
    *  why; the component marks it aria-disabled for assistive tech. */
@@ -51,7 +55,7 @@ const BTN_BASE =
   `${TEXT_BODY_SIZE} leading-none whitespace-nowrap border ` +
   "transition-[color,background-color,border-color] duration-(--dur-base) ease-[ease] " +
   "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent " +
-  "disabled:opacity-50 disabled:cursor-not-allowed " +
+  "disabled:opacity-40 disabled:cursor-not-allowed " +
   "not-disabled:not-aria-disabled:active:translate-y-px";
 
 // Cursor and the aria-disabled treatment, resolved in the builder: an
@@ -60,7 +64,7 @@ const BTN_BASE =
 // deliberately and explained by a tooltip, not a fault to grey out. The
 // variants' hover tints are guarded off aria-disabled below, so marking the
 // element silences them at runtime either way.
-const BTN_INTERACTIVE = "cursor-pointer aria-disabled:opacity-50 aria-disabled:cursor-not-allowed";
+const BTN_INTERACTIVE = "cursor-pointer aria-disabled:opacity-40 aria-disabled:cursor-not-allowed";
 const BTN_READONLY = "cursor-default";
 
 const BTN_VARIANTS: Record<ButtonVariant, string> = {
@@ -95,6 +99,8 @@ const BTN_VARIANTS: Record<ButtonVariant, string> = {
 // outline reads as a frame around the control (most visibly on the modal's
 // inline illustration), and ghost <-> selected keeps identical geometry.
 export const BTN_SELECTED = "bg-accent-light text-accent border-transparent";
+// The neutral counterpart: the ghost variant's own pressed tint, held.
+export const BTN_PRESSED = "bg-fill-active text-primary border-transparent";
 
 export function buttonClass(variant: ButtonVariant = "secondary", options: ButtonOptions = {}): string {
   const {
@@ -103,6 +109,7 @@ export function buttonClass(variant: ButtonVariant = "secondary", options: Butto
     icon = false,
     round = false,
     selected = false,
+    pressed = false,
     readonly = false,
     quiet = false,
     block = false,
@@ -130,23 +137,56 @@ export function buttonClass(variant: ButtonVariant = "secondary", options: Butto
     size,
     quiet ? "font-normal" : "font-medium",
     round ? "rounded-full" : "rounded-md",
-    selected ? BTN_SELECTED : BTN_VARIANTS[variant],
+    pressed ? BTN_PRESSED : selected ? BTN_SELECTED : BTN_VARIANTS[variant],
   ];
   if (block) parts.push("w-full");
   if (extra !== "") parts.push(extra);
   return parts.join(" ");
 }
 
+/** The contract part a button is (docs/system/blueprint/workspace-themes/, section 4.2), for an element that
+ *  takes `buttonClass()` without being a `Button`. */
+export function buttonPartAttrs(
+  variant: ButtonVariant,
+  isIcon: boolean,
+): { readonly "data-part": "button"; readonly "data-variant": ButtonVariant; readonly "data-shape": "icon" | "text" } {
+  return { "data-part": "button", "data-variant": variant, "data-shape": isIcon ? "icon" : "text" };
+}
+
 interface ButtonAttrs extends m.Attributes, ButtonOptions {
   variant?: ButtonVariant;
 }
 
-const OWN_KEYS = ["variant", "sm", "xs", "icon", "round", "selected", "readonly", "quiet", "block", "extra"] as const;
+const OWN_KEYS = [
+  "variant",
+  "sm",
+  "xs",
+  "icon",
+  "round",
+  "selected",
+  "pressed",
+  "readonly",
+  "quiet",
+  "block",
+  "extra",
+] as const;
 
 export function Button(): m.Component<ButtonAttrs> {
   return {
     view(vnode) {
-      const { variant = "secondary", sm, xs, icon, round, selected, readonly, quiet, block, extra } = vnode.attrs;
+      const {
+        variant = "secondary",
+        sm,
+        xs,
+        icon,
+        round,
+        selected,
+        pressed,
+        readonly,
+        quiet,
+        block,
+        extra,
+      } = vnode.attrs;
       // The passthrough spread comes after `type` (so a caller can still opt
       // into type="submit" if a form ever appears) and after the readonly
       // aria-disabled default (so an explicit caller value wins).
@@ -154,7 +194,8 @@ export function Button(): m.Component<ButtonAttrs> {
         "button",
         {
           type: "button",
-          class: buttonClass(variant, { sm, xs, icon, round, selected, readonly, quiet, block, extra }),
+          class: buttonClass(variant, { sm, xs, icon, round, selected, pressed, readonly, quiet, block, extra }),
+          ...buttonPartAttrs(variant, icon === true),
           ...(readonly === true ? { "aria-disabled": "true" } : null),
           ...splitAttrs(vnode.attrs, OWN_KEYS),
         },

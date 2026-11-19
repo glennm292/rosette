@@ -1,7 +1,6 @@
 """The chat record store: round trips, the version guard, and the per-record skip on a bad file."""
 
 import json
-import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -148,6 +147,19 @@ def test_a_records_rebind_names_its_running_agent_and_never_sits_beside_a_handof
         ChatRecord(chat_id=ChatId(first), agents=(archived_first, live_second), handoff=handoff, rebind=rebind)
 
 
+def test_a_switch_lists_its_confirming_message_until_it_fails_to_deliver_it() -> None:
+    rebind = make_chat_rebind_record(agent_id=_agent_id())
+    assert rebind.is_trigger_listed()
+    delivered = rebind.with_oldest_held_send_delivered()
+    assert delivered.is_trigger_listed()
+    assert not delivered.without_delivered_send(rebind.trigger_message_id).is_trigger_listed()
+
+    # A handoff whose prompt carries the confirming message takes it off the held list without delivering it.
+    handoff = make_chat_handoff_record(retiring_seq=1, next_agent_id=_agent_id(), held_sends=())
+    assert not handoff.is_trigger_listed()
+    assert handoff.model_copy_update(to_update(handoff.field_ref().prompt, "Carry on")).is_trigger_listed()
+
+
 def test_a_file_store_round_trips_a_record_and_deletes_its_folder(tmp_path: Path) -> None:
     store = FileChatRecordStore(root=tmp_path / "chats")
     first, second = _agent_id(), _agent_id()
@@ -170,7 +182,24 @@ def test_a_file_store_round_trips_a_record_and_deletes_its_folder(tmp_path: Path
     store.delete(ChatId(second))
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root removes a folder whatever its parent's mode says")
+def test_a_record_carries_whether_its_seed_is_pending_and_an_older_file_reads_it_as_delivered(tmp_path: Path) -> None:
+    store = FileChatRecordStore(root=tmp_path / "chats")
+    first, second = _agent_id(), _agent_id()
+    pending = two_member_record(first, second).model_copy_update(
+        to_update(two_member_record(first, second).field_ref().is_seed_pending, True)
+    )
+    store.write(pending)
+    read_back = store.read(ChatId(first))
+    assert read_back == pending
+    assert read_back is not None and read_back.is_seed_pending is True
+
+    older = two_member_record(first, second).model_dump(mode="json")
+    del older["is_seed_pending"]
+    (tmp_path / "chats" / first / "record.json").write_text(json.dumps(older))
+    read_older = store.read(ChatId(first))
+    assert read_older is not None and read_older.is_seed_pending is False
+
+
 def test_a_file_store_raises_when_a_record_cannot_be_removed(tmp_path: Path) -> None:
     """A delete that leaves the record on disk must not look like a delete: the next build would
     read the record back and resurrect a destroyed chat."""
@@ -179,15 +208,45 @@ def test_a_file_store_raises_when_a_record_cannot_be_removed(tmp_path: Path) -> 
     first = _agent_id()
     store.write(two_member_record(first, _agent_id()))
 
-    # Nothing inside a read-only folder can be unlinked, so the record file stays where it is.
+    # A folder that is a symlink cannot be removed as a tree, whoever asks (root included).
     chat_dir = root / first
-    chat_dir.chmod(0o555)
-    try:
-        with pytest.raises(ChatRecordError, match="could not be removed"):
-            store.delete(ChatId(first))
-    finally:
-        chat_dir.chmod(0o755)
+    moved_chat_dir = tmp_path / "moved"
+    chat_dir.rename(moved_chat_dir)
+    chat_dir.symlink_to(moved_chat_dir, target_is_directory=True)
+
+    with pytest.raises(ChatRecordError, match="could not be removed"):
+        store.delete(ChatId(first))
     assert store.read(ChatId(first)) is not None
+
+
+def test_a_rebind_written_under_the_claude_named_sessions_field_reads_and_is_rewritten_harness_neutral(
+    tmp_path: Path,
+) -> None:
+    """A rebind a chat app from before the binding refactor left unfinished names its sessions dir
+    ``claude_sessions_config_dir``; the resumed rebind must still find the files, and its next write
+    uses the new name."""
+    store = FileChatRecordStore(root=tmp_path / "chats")
+    agent_id = _agent_id()
+    store.write(
+        ChatRecord(
+            chat_id=ChatId(agent_id),
+            agents=(make_chat_agent_entry(1, agent_id, is_archived=False),),
+            rebind=make_chat_rebind_record(agent_id=agent_id),
+        )
+    )
+    record_path = tmp_path / "chats" / agent_id / "record.json"
+    older = json.loads(record_path.read_text())
+    older["rebind"].pop("sessions_dir")
+    older["rebind"]["claude_sessions_config_dir"] = "/home/user/.minds/accounts/acct-anthropic"
+    record_path.write_text(json.dumps(older))
+
+    read_back = store.read(ChatId(agent_id))
+    assert read_back is not None and read_back.rebind is not None
+    assert read_back.rebind.sessions_dir == "/home/user/.minds/accounts/acct-anthropic"
+    store.write(read_back)
+    rewritten = json.loads(record_path.read_text())["rebind"]
+    assert rewritten["sessions_dir"] == "/home/user/.minds/accounts/acct-anthropic"
+    assert "claude_sessions_config_dir" not in rewritten
 
 
 def test_a_file_store_refuses_a_record_from_a_newer_build(tmp_path: Path) -> None:

@@ -14,17 +14,20 @@ exists; you are not redesigning it, just repairing it.
   answer is not in your task file or the repo.
 - Terminal statuses: `done`, `stuck`.
 
-**System-interface exception.** When the creation is the system interface, emit
-**no `final-creation` gate**: user approval happens through the lead's pre-merge
-live preview, not a worker gate. Run Stages 1-5 as written, then -- once the fix
-is implemented and verified per `type-system-interface.md` -- report `done`
-with a body that summarizes the work so the lead can frame the preview:
+**Critical-app exception.** When the creation is a critical app (the shell, the
+chat, the terminal, or an app whose manifest says so; see `type-app.md`,
+"Critical apps"), emit **no `final-creation` gate**: user approval happens
+through the lead's live preview, not a worker gate. Run Stages 1-5 as written,
+then -- once the fix is implemented and verified per `type-app.md` -- report
+`done` with a body that summarizes the work so the lead can frame the preview:
 
 ```
-Fixed the system interface on branch `<branch>`. Ready to preview.
+Fixed <app> on branch `<branch>`. Ready to preview.
 - Change: <one-sentence (root cause + fix)>
 - Frontend / backend: <which, and the files touched>
-- Tests run: <backend pytest / frontend lint+test / Playwright -- all pass>
+- Tests run: <the test gate's commands (select-tests) and Playwright -- all pass>
+- Undeclared couplings: <none, or each built-in suite select-tests missed, and the path it observes>
+- Flaky tests: <none, or each test that failed in the gate and passed when rerun alone>
 - Screenshots reviewed: <pages/states you eyeballed>
 ```
 
@@ -46,6 +49,9 @@ Fixed the system interface on branch `<branch>`. Ready to preview.
   touching anything.
 - If you cannot identify a root cause confidently, emit a `stuck` report
   describing what you observed. Don't apply a speculative fix.
+- If an earlier change introduced the break, note that commit: once your fix
+  has its test, check whether the gate would have caught it, per
+  `harden-creation.md` ("A regression the gate let through").
 
 ## Stage 3: Apply the minimal fix
 
@@ -82,6 +88,8 @@ Fixed `<name>`:
 - Scenarios run: <list, all pass>
 - References registered: <none, or one path per line>
 - Outside footprint: <none, or one path per line with why it changed>
+- Undeclared couplings: <none, or each built-in suite select-tests missed, and the path it observes>
+- Flaky tests: <none, or each test that failed in the gate and passed when rerun alone>
 ```
 
 **App or service:**
@@ -93,10 +101,18 @@ Fixed app or service `<name>`:
 - Scenarios / tests run: <list, all pass>
 - References registered: <none, or one path per line>
 - Outside footprint: <none, or one path per line with why it changed>
+- Undeclared couplings: <none, or each built-in suite select-tests missed, and the path it observes>
+- Flaky tests: <none, or each test that failed in the gate and passed when rerun alone>
 ```
 
-The last two lines come from the scope file (`harden-creation.md`); a
-creation with no footprint writes `none` for both.
+The `References registered` and `Outside footprint` lines come from the scope
+file (`harden-creation.md`).
+
+In a pass over several creations, write one block per creation, in the order
+the task lists them; the lines about the pass as a whole (the scenarios and tests
+run, `Outside footprint`, which the scope file judges against every creation at
+once, `Undeclared couplings`, `Flaky tests`) may instead come once, after the
+last block.
 
 Push it and stop. On approval, commit on your branch and emit a `name: done`
 terminal report.

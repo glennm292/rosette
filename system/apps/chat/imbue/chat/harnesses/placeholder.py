@@ -42,7 +42,7 @@ from imbue.chat.harnesses.session_watcher import TranscriptLoader
 class PlaceholderSessionWatcher(AgentSessionWatcher, TranscriptLoader):
     """A watcher that watches nothing and reports an empty transcript.
 
-    Every read returns the empty answer for its shape, so the chat tab renders as a
+    Every read returns the empty answer for its shape, so the chat page renders as a
     blank conversation rather than erroring. ``on_events`` is retained but never
     called -- there is no source to call it from. As a loader (an archived segment of a
     chat) it is the same empty transcript.
@@ -127,9 +127,7 @@ class PlaceholderModelResolver(HarnessModelResolver):
         return SwitchResult(ok=False, detail="Model switching is not available for this harness yet.")
 
 
-# An empty catalog. ``registry.get_catalog`` deliberately does NOT cache an empty result, so
-# swapping a harness onto a real ``catalog_factory`` needs no cache invalidation.
-# ``switch_mode`` is inert with no options to click; LIST is the honest presentation of an
+# An empty catalog. ``switch_mode`` is inert with no options to click; LIST is the honest presentation of an
 # empty set (SEARCH would render a search box over nothing).
 EMPTY_CATALOG: Final[HarnessCatalog] = HarnessCatalog(
     options=(),

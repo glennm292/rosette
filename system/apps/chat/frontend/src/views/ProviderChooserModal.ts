@@ -10,11 +10,17 @@
  * What each mode renders:
  *
  *   chooser    the lane rows
- *   menu       a lane's primary method, plus "Other ways to sign in" under it
+ *   relay      "Finish in your browser": the desktop app opened the page and relays its callback
+ *   menu       a lane's method, plus "Other ways to sign in" under it
  *   steps      one browser method, as the numbered 1-2 sequence
  *   apiKey     one paste method: pick a provider, paste the key
  *   verifying  the spinner screen
- *   success    the check screen, with a Done footer
+ *   success    a sign-in that has something to say about itself, with a Done footer
+ *
+ * A browser sign-in first goes to the minds desktop app, which opens the page and relays the
+ * provider's callback into this workspace. When no desktop app answers, the chooser falls back to
+ * a way in that needs no relay. Those ways stay one click away while the browser is out, and after
+ * a sign-in fails, so a browser that never comes back is never a dead end.
  *
  * Two shapes worth knowing about:
  *
@@ -29,44 +35,61 @@
  */
 
 import m from "mithril";
+import { peopleGlyph } from "../glyphs";
 
-import { Button, buttonClass } from "@imbue/workspace-ui/src/components/Button";
-import { icon, loginSpinnerIcon, warningIcon } from "@imbue/workspace-ui/src/components/icons";
+import { Button, buttonClass, buttonPartAttrs } from "@imbue/workspace-ui/src/components/Button";
+import { icon, spinnerIcon, warningIcon } from "@imbue/workspace-ui/src/components/icons";
 import { inputClass } from "@imbue/workspace-ui/src/components/Input";
 import { MODAL_OVERLAY_CLASS } from "@imbue/workspace-ui/src/components/Modal";
 import { backdropDismissAttrs } from "@imbue/workspace-ui/src/components/modalBackdrop";
+import { Dropdown } from "@imbue/workspace-ui/src/components/dropdown";
+import { renderMarkdown } from "../markdown";
 import { providerMark } from "./providerMarks";
 import { removeAccountDialog } from "./removeAccountDialog";
 import * as css from "./providerSignInStyles";
-import type { Lane, LaneMethod } from "../models/Providers";
+import type { Lane, LaneMethod, UnpickableReason } from "../models/Providers";
 import {
   abortFlow,
   areLanesLoaded,
   clearFlow,
   deleteAccount,
   getAccounts,
-  getBrokenAccountId,
   getFlow,
   getLanes,
+  getUnpickableAccount,
   isPickingAccount,
-  loadAccounts,
+  isRoomChoiceOffered,
+  pickRoom,
+  loadLanesAndAccountsWithRetry,
   pickAccount,
   takeChooserAccountId,
-  loadLanes,
   startFlow,
   submitCode,
   submitKey,
 } from "../models/Providers";
+import { FIELD_PART, partAttrs } from "@imbue/workspace-ui/src/themes/parts";
+import { requestProviderRelay } from "../models/providerRelay";
 
 export interface ProviderChooserModalAttrs {
   onDismiss: () => void;
 }
 
-type Mode = "chooser" | "menu" | "steps" | "apiKey";
+type Mode = "chooser" | "relay" | "menu" | "steps" | "apiKey";
+
+/** The paste step's label: a relayed sign-in finishes by itself, and neither side can tell in
+ *  advance whether the browser will end on a code instead. */
+export const PASTE_STEP_LABEL = "If the page shows a code, paste it here";
 
 /** The chooser's last scroll offset, so a drill-in and back lands where you were. The
  *  chooser's DOM unmounts while a sign-in is up, so this outlives it at module scope. */
 let savedScroll = 0;
+
+/** The word beside an account the chooser refuses, and the style it reads in: only the one the
+ *  caller is leaving because it failed is bad news. */
+const UNPICKABLE_NOTES: Record<UnpickableReason, { text: string; class: string }> = {
+  failing: { text: "Not working", class: css.ACCOUNT_FAILING_NOTE },
+  current: { text: "Current", class: css.ACCOUNT_NEUTRAL_NOTE },
+};
 
 export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
   let mode: Mode = "chooser";
@@ -85,19 +108,23 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
   let activeStep: 1 | 2 = 1;
   let copied: "" | "link" | "code" = "";
   let copyFailed = false;
-  // The provider dropdown's open state and where to pin it. It is rendered into the overlay
-  // rather than inline because the panel is overflow-hidden -- an in-panel popover of 28
-  // rows would simply be clipped, hence the portal.
-  let keyMenuOpen = false;
-  let keyMenuAnchor: DOMRect | null = null;
   // Set once a credential has been handed over and we are waiting on the verdict. The
   // request itself returns long before the answer does -- the server hands the code to the
   // CLI and the harness's own probe decides, which the client learns from a later poll --
   // so `busy` alone leaves a gap where the flow is still pending and nothing marks it. That
   // gap rendered the menu again, which read as being bounced back to the start.
   let awaitingVerdict = false;
+  // The page is being handed to the desktop app, which has yet to answer.
+  let isOpeningBrowser = false;
+  // Set once no desktop app answered a relay, so this chooser stops offering sign-ins that need one.
+  let isRelayUnavailable = false;
   // Bumped by every `begin`, so a request that has been superseded can tell and stand down.
   let generation = 0;
+  // Bumped by every ask to the desktop app. The ack has one slot, so a newer ask settles an older
+  // one as false, which is not the desktop app's answer.
+  let relayAsk = 0;
+  // Why the chooser moved the user to another way of signing in, shown above it.
+  let notice: string | null = null;
 
   function reset(): void {
     mode = "chooser";
@@ -114,8 +141,8 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
     copied = "";
     copyFailed = false;
     awaitingVerdict = false;
-    keyMenuOpen = false;
-    keyMenuAnchor = null;
+    isOpeningBrowser = false;
+    notice = null;
     clearFlow();
   }
 
@@ -123,11 +150,35 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
     return candidate.shape === "paste";
   }
 
+  /** A lane's methods this page can offer: a browser-only sign-in needs a relay. */
+  function offeredMethods(candidate: Lane): LaneMethod[] {
+    return candidate.methods.filter((each) => !(isRelayUnavailable && each.shape === "browser"));
+  }
+
+  /** The way into a lane that needs no relay and no pasted key, for a browser-only sign-in that
+   *  nothing will relay; null when the lane has none. */
+  function relaylessFallback(candidate: Lane): LaneMethod | null {
+    return offeredMethods(candidate).find((each) => each.shape !== "browser" && !isPaste(each)) ?? null;
+  }
+
+  /** Hand a started flow's page to the desktop app; whether it is relaying, or null when a newer
+   *  ask took its place before it was answered. */
+  async function relay(url: string, flowId: string): Promise<boolean | null> {
+    relayAsk += 1;
+    const ask = relayAsk;
+    const isRelaying = await requestProviderRelay(url, flowId);
+    if (ask !== relayAsk) return null;
+    if (!isRelaying) isRelayUnavailable = true;
+    return isRelaying;
+  }
+
   async function copyToClipboard(value: string, kind: "link" | "code"): Promise<void> {
     try {
       await navigator.clipboard.writeText(value);
       copied = kind;
       copyFailed = false;
+      // Copying the link is taking step 1, so the highlight moves on to the code.
+      if (kind === "link") activeStep = 2;
     } catch {
       // Insecure context or a denied permission -- reveal the raw value instead, so the
       // user is never left without a way to reach the page by hand.
@@ -140,9 +191,13 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
   /** Open a lane's method. `fromChooser` decides where back goes. */
   async function begin(
     chosen: Lane,
-    chosenMethod: LaneMethod,
-    options: { fromChooser: boolean; accountId?: string },
+    requested: LaneMethod,
+    options: { fromChooser: boolean; accountId?: string; notice?: string; isRelaySkipped?: boolean },
   ): Promise<void> {
+    // A browser-only sign-in nothing will relay would only be started to be thrown away for the
+    // fallback below, so it goes straight to that.
+    const chosenMethod =
+      requested.shape === "browser" && isRelayUnavailable ? (relaylessFallback(chosen) ?? requested) : requested;
     lane = chosen;
     method = chosenMethod;
     cameFromChooser = options.fromChooser;
@@ -155,6 +210,8 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
     keyInput = "";
     awaitingVerdict = false;
     reauthAccountId = options.accountId ?? null;
+    isOpeningBrowser = false;
+    notice = options.notice ?? null;
     keyProvider = chosen.key_providers.length === 1 ? chosen.key_providers[0].provider_id : null;
     // A terminal lane spends seconds spawning a CLI and scraping its first screen, so it
     // gets the waiting screen. A paste lane has nothing to wait for -- minting a folder
@@ -169,8 +226,23 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
     generation += 1;
     const attempt = generation;
     m.redraw();
+    let fallback: LaneMethod | null = null;
     try {
       await startFlow(chosen.id, chosenMethod.id, options.accountId);
+      if (attempt !== generation) return;
+      const started = getFlow();
+      if (started !== null && started.relay_url !== null && !isRelayUnavailable && !options.isRelaySkipped) {
+        isOpeningBrowser = true;
+        m.redraw();
+        const isRelaying = await relay(started.relay_url, started.flow_id);
+        if (attempt !== generation) return;
+        isOpeningBrowser = false;
+        if (isRelaying === true) mode = "relay";
+      }
+      if (mode !== "relay" && chosenMethod.shape === "browser") {
+        // This sign-in cannot finish without the relay, so it gives way to one that can.
+        fallback = relaylessFallback(chosen);
+      }
     } catch (e) {
       if (attempt !== generation) return;
       error = errorText(e);
@@ -179,6 +251,9 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
         busy = false;
         m.redraw();
       }
+    }
+    if (fallback !== null && attempt === generation) {
+      await begin(chosen, fallback, options);
     }
   }
 
@@ -204,7 +279,7 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
   /** Back: a deep screen returns to the menu, an entry screen to the chooser. */
   function back(): void {
     abortFlow();
-    if (mode === "menu" || cameFromChooser || lane === null) {
+    if (mode === "menu" || mode === "relay" || cameFromChooser || lane === null) {
       reset();
       m.redraw();
       return;
@@ -216,6 +291,29 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
     // sign-in, gets a second row for the same provider, and the account they were trying to
     // revive is still dead along with every chat bound to it.
     void begin(owner, primary, { fromChooser: true, accountId: reauthAccountId ?? undefined });
+  }
+
+  /** Offer this lane's ways in that need no relay: the code steps for the live Claude sign-in,
+   *  whose pasted code the CLI still takes, or a fresh sign-in that is not handed to the desktop app. */
+  function signInAnotherWay(current: Lane, why: string | null = null): void {
+    const flow = getFlow();
+    if (flow !== null && flow.status.state === "pending" && flow.shape === "url_then_code") {
+      mode = "menu";
+      notice = why;
+      m.redraw();
+      return;
+    }
+    const manual = relaylessFallback(current) ?? current.methods[0];
+    void begin(current, manual, {
+      fromChooser: true,
+      accountId: reauthAccountId ?? undefined,
+      notice: why ?? undefined,
+      isRelaySkipped: true,
+    });
+  }
+
+  function hasOtherWays(current: Lane): boolean {
+    return current.methods.length > 1;
   }
 
   function stepBlock(step: 1 | 2, isLast: boolean, children: m.Children): m.Vnode {
@@ -235,10 +333,10 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
   ): m.Vnode {
     const glyph =
       kind === "pending"
-        ? loginSpinnerIcon()
+        ? spinnerIcon(24)
         : kind === "success"
-          ? icon("check", { size: 26, strokeWidth: 2.5 })
-          : warningIcon();
+          ? icon("check", { size: 20, strokeWidth: 2.5 })
+          : warningIcon(20);
     const disc =
       kind === "pending"
         ? css.STATUS_DISC_PENDING
@@ -252,8 +350,6 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
       mark,
     ]);
   }
-
-  // --- chooser ---------------------------------------------------------------------------
 
   /** IntroChooserModal's ChooserRow. */
   function laneRow(candidate: Lane): m.Vnode {
@@ -287,8 +383,7 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
     busy = true;
     error = null;
     try {
-      await loadLanes();
-      await loadAccounts();
+      await loadLanesAndAccountsWithRetry();
     } catch (e) {
       error = (e as Error).message || "Could not reach the workspace.";
     } finally {
@@ -305,7 +400,11 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
         m(
           "div",
           { class: css.FOOTER_ROW },
-          m(Button, { variant: "primary", disabled: busy, onclick: () => void load() }, "Try again"),
+          m(
+            Button,
+            { variant: "primary", disabled: busy, "data-e2e": "retry-providers", onclick: () => void load() },
+            "Try again",
+          ),
         ),
       ];
     }
@@ -322,28 +421,55 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
       error !== null ? m("p", { class: `${css.HINT} text-red-600` }, error) : null,
       signedIn !== null ? m("div", { class: `${css.SECTION_LABEL} mt-6` }, "Add more") : null,
       m("div", { class: css.ROW_STACK }, getLanes().map(laneRow)),
+      roomRow(),
     ];
+  }
+
+  /** "Chat room (no provider)": the last row when the chooser was opened for a chat awaiting its first send, which
+   *  then becomes a room among the workspace's people instead of a chat with an agent (section 7.3). Last, under
+   *  the providers: the chooser's job is signing in, and a room is the way out of that, not the point of it. */
+  function roomRow(): m.Children {
+    if (!isRoomChoiceOffered()) return null;
+    return m("div", { class: `${css.ROW_STACK} mt-6` }, [
+      // The pickable row anchors the pick target's stretched after-box; without it the box would cover the dialog.
+      m("div", { class: css.ACCOUNT_ROW_PICKABLE }, [
+        m(
+          "button",
+          {
+            type: "button",
+            class: css.ACCOUNT_PICK,
+            "data-e2e": "pick-room",
+            onclick: () => pickRoom(),
+          },
+          [
+            m("span", { class: "flex w-6 shrink-0 items-center justify-center text-secondary" }, peopleGlyph(20)),
+            m("span", { class: `${css.OPTION_ROW_NAME} min-w-0 flex-1 truncate` }, "Chat room (no provider)"),
+          ],
+        ),
+      ]),
+    ]);
   }
 
   /** A signed-in account is a STATE, not a place to navigate to, so the row reads as a listed
    *  fact with two explicit actions beside it. When the chooser was opened to pick an account,
-   *  the row itself also picks it; the account the caller is leaving is listed but not
-   *  pickable. Re-auth stays reachable because an expired credential is otherwise a
-   *  dead end: without it the only way back is to delete the account, which orphans every chat
-   *  bound to it rather than reviving them. */
+   *  the row itself also picks it; an account the caller refuses is listed but not
+   *  pickable, with the word for why beside it. Re-auth stays reachable because an expired
+   *  credential is otherwise a dead end: without it the only way back is to delete the account,
+   *  which orphans every chat bound to it rather than reviving them. */
   function renderAccounts(): m.Children {
     const signedIn = getAccounts();
     if (signedIn.length === 0) return null;
     const confirming = signedIn.find((account) => account.id === confirmingDelete) ?? null;
     const picking = isPickingAccount();
-    const brokenAccountId = getBrokenAccountId();
+    const unpickable = getUnpickableAccount();
     return m("div", [
       m("div", { class: css.SECTION_LABEL }, "Signed in"),
       m(
         "div",
         { class: css.ROW_STACK },
         signedIn.map((account) => {
-          const isBroken = account.id === brokenAccountId;
+          const unpickableNote =
+            unpickable !== null && account.id === unpickable.accountId ? UNPICKABLE_NOTES[unpickable.reason] : null;
           const identity = [
             m(
               "span",
@@ -359,39 +485,17 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
                   {
                     type: "button",
                     class: css.ACCOUNT_PICK,
-                    disabled: isBroken,
+                    disabled: unpickableNote !== null,
                     "data-e2e": `pick-account-${account.id}`,
                     onclick: () => pickAccount(account.id),
                   },
                   identity,
                 )
               : identity,
-            picking && isBroken ? m("span", { class: css.ACCOUNT_BROKEN_NOTE }, "Not working") : null,
-            m(
-              Button,
-              {
-                variant: "ghost",
-                sm: true,
-                extra: css.ACCOUNT_ACTION,
-                title: "Sign in again, keeping this account and every chat on it",
-                onclick: () => void reauthenticate(account.id, account.lane),
-              },
-              "Sign in again",
-            ),
-            m(
-              Button,
-              {
-                variant: "ghost",
-                sm: true,
-                icon: true,
-                extra: css.ACCOUNT_ACTION,
-                "aria-label": `Remove ${account.label}`,
-                onclick: () => {
-                  confirmingDelete = account.id;
-                },
-              },
-              m.trust(icon("trash", { size: 15 })),
-            ),
+            picking && unpickableNote !== null
+              ? m("span", { class: unpickableNote.class }, unpickableNote.text)
+              : null,
+            accountActions(account),
           ]);
         }),
       ),
@@ -410,7 +514,36 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
     ]);
   }
 
-  // --- sign-in bodies --------------------------------------------------------------------
+  /** "Sign in again" and remove, for someone who may change accounts. */
+  function accountActions(account: ReturnType<typeof getAccounts>[number]): m.Children {
+    return [
+      m(
+        Button,
+        {
+          variant: "ghost",
+          sm: true,
+          extra: css.ACCOUNT_ACTION,
+          title: "Sign in again, keeping this account and every chat on it",
+          onclick: () => void reauthenticate(account.id, account.lane, account.reauth_method),
+        },
+        "Sign in again",
+      ),
+      m(
+        Button,
+        {
+          variant: "ghost",
+          sm: true,
+          icon: true,
+          extra: css.ACCOUNT_ACTION,
+          "aria-label": `Remove ${account.label}`,
+          onclick: () => {
+            confirmingDelete = account.id;
+          },
+        },
+        m.trust(icon("trash", { size: 15 })),
+      ),
+    ];
+  }
 
   /** ProviderSignInModal's stepsBlock, step 1, plus the old modal's copy-link fallback. */
   function openLinkStep(url: string, label: string, title = "Open the sign-in page"): m.Vnode {
@@ -420,6 +553,7 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
         "a",
         {
           class: buttonClass("primary", { block: true, extra: "gap-[7px]" }),
+          ...buttonPartAttrs("primary", false),
           href: url,
           target: "_blank",
           rel: "noopener noreferrer",
@@ -445,10 +579,11 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
   /** stepsBlock, step 2. */
   function pasteCodeStep(): m.Vnode {
     return stepBlock(2, true, [
-      stepLabel("2", "Approve, then paste the code shown"),
+      stepLabel("2", PASTE_STEP_LABEL),
       m("div", { class: css.FIELD_ROW }, [
         m("input", {
           class: inputClass({ mono: true, extra: "flex-1" }),
+          ...FIELD_PART,
           type: "text",
           value: codeInput,
           // No placeholder. It read as an instruction about the code's SHAPE, and the shape
@@ -479,6 +614,7 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
           "Verify code",
         ),
       ]),
+      m("p", { class: css.HINT }, "Signed in without a code? This closes by itself."),
     ]);
   }
 
@@ -510,7 +646,7 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
     const lead =
       flow.shape === "code_then_wait"
         ? `Use your ${current.provider_name} account. Open the page below and enter the code we show you.`
-        : `Use your ${current.provider_name} account. Approve access in your browser, copy the code it gives you, then paste it below.`;
+        : `Use your ${current.provider_name} account. Approve access in your browser, and if it gives you a code, paste it below.`;
     return [
       m("p", { class: css.LEAD }, currentMethod.description || lead),
       flow.url !== null ? openLinkStep(flow.url, `Open ${current.provider_name} sign-in page`) : null,
@@ -520,54 +656,6 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
 
   /** ProviderSignInModal's apiKey case. With one provider it is just the field; with a
    *  list it is the two-step pick-then-paste, which is the interesting one. */
-  /** The dropdown itself, pinned under its trigger. Rendered by the overlay rather than the
-   *  panel, so the panel's `overflow-hidden` cannot clip a 28-row list. */
-  function keyProviderMenu(current: Lane): m.Children {
-    if (!keyMenuOpen || keyMenuAnchor === null) return null;
-    const anchor = keyMenuAnchor;
-    return [
-      m("button", {
-        type: "button",
-        class: css.PICKER_BACKDROP,
-        "aria-label": "Close provider menu",
-        // The shared helper, as the modal's own backdrop uses. It keys on mouse DOWN because a
-        // click fires wherever the press ENDED: selecting text inside the menu and releasing
-        // past its edge would otherwise read as "dismiss".
-        ...backdropDismissAttrs(() => {
-          keyMenuOpen = false;
-        }),
-      }),
-      m(
-        "div",
-        {
-          class: css.PICKER_MENU,
-          style: `left: ${anchor.left}px; top: ${anchor.bottom + 6}px; width: ${anchor.width}px;`,
-          onclick: (event: MouseEvent) => event.stopPropagation(),
-        },
-        current.key_providers.map((candidate) => {
-          const active = candidate.provider_id === keyProvider;
-          return m(
-            "button",
-            {
-              type: "button",
-              key: candidate.provider_id,
-              class: `${css.PICKER_OPTION} ${active ? css.PICKER_OPTION_ACTIVE : css.PICKER_OPTION_IDLE}`,
-              onclick: () => {
-                keyProvider = candidate.provider_id;
-                keyMenuOpen = false;
-                activeStep = 2;
-              },
-            },
-            [
-              m("span", { class: active ? css.PICKER_OPTION_NAME_ACTIVE : css.PICKER_OPTION_NAME }, candidate.display),
-              active ? m.trust(icon("check", { size: 15, strokeWidth: 2.5 })) : null,
-            ],
-          );
-        }),
-      ),
-    ];
-  }
-
   function apiKeyBody(current: Lane): m.Children {
     const choices = current.key_providers;
     const selected = choices.find((candidate) => candidate.provider_id === keyProvider) ?? null;
@@ -577,6 +665,7 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
     const keyField = m("div", { class: css.FIELD_ROW }, [
       m("input", {
         class: inputClass({ mono: true, extra: "flex-1" }),
+        ...FIELD_PART,
         type: "password",
         value: keyInput,
         placeholder: withPicker ? (selected?.hint ?? "Paste your key") : (selected?.hint ?? "sk-..."),
@@ -608,7 +697,7 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
 
     const savedAs =
       selected !== null && selected.env_var !== ""
-        ? m("p", { class: css.HINT }, `Saved as ${selected.env_var} for this mind.`)
+        ? m("p", { class: css.HINT }, `Saved as ${selected.env_var} for this agent.`)
         : null;
 
     if (!withPicker) {
@@ -649,31 +738,20 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
       m("p", { class: css.LEAD }, method?.description ?? "Pick the provider, then paste its key."),
       stepBlock(1, false, [
         stepLabel("1", "Pick your provider"),
-        m(
-          "button",
-          {
-            type: "button",
-            class: css.PICKER_TRIGGER,
-            "aria-expanded": keyMenuOpen ? "true" : "false",
-            onclick: (event: MouseEvent) => {
-              keyMenuAnchor = (event.currentTarget as HTMLElement).getBoundingClientRect();
-              keyMenuOpen = !keyMenuOpen;
-            },
+        m(Dropdown<string>, {
+          options: current.key_providers.map((candidate) => ({
+            value: candidate.provider_id,
+            label: candidate.display,
+            detail: candidate.env_var === "" ? undefined : candidate.env_var,
+          })),
+          value: keyProvider,
+          placeholder: "Choose a provider...",
+          "aria-label": "Provider",
+          onSelect: (providerId) => {
+            keyProvider = providerId;
+            activeStep = 2;
           },
-          [
-            selected !== null
-              ? m("span", { class: css.PICKER_TRIGGER_VALUE }, [
-                  m("span", { class: css.PICKER_TRIGGER_NAME }, selected.display),
-                  m("span", { class: css.PICKER_TRIGGER_ENV }, selected.env_var),
-                ])
-              : m("span", { class: css.PICKER_TRIGGER_EMPTY }, "Choose a provider..."),
-            m(
-              "span",
-              { class: `${css.PICKER_CARET} ${keyMenuOpen ? css.PICKER_CARET_OPEN : ""}` },
-              m.trust(icon("chevron-down", { size: 15 })),
-            ),
-          ],
-        ),
+        }),
       ]),
       stepBlock(2, true, [
         stepLabel("2", "Paste your API key"),
@@ -682,7 +760,7 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
           "p",
           { class: css.HINT },
           selected !== null && selected.env_var !== ""
-            ? `Saved as ${selected.env_var} for this mind.`
+            ? `Saved as ${selected.env_var} for this agent.`
             : "Pick a provider to see where the key is saved.",
         ),
       ]),
@@ -692,9 +770,10 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
   /** The menu: this lane's primary method inline, with its alternates under it. The
    *  the harness's own menu, which is why the section labels read the way they do. */
   function menuBody(current: Lane): m.Children {
-    const primary = current.methods[0];
-    const others = current.methods.slice(1);
+    const primary = method ?? current.methods[0];
+    const others = offeredMethods(current).filter((candidate) => candidate.id !== primary.id);
     return m("div", { class: "flex flex-col" }, [
+      notice !== null ? m("p", { class: css.HINT }, notice) : null,
       m("div", { class: css.SECTION_LABEL }, isPaste(primary) ? "Use an API key" : "Use your subscription"),
       isPaste(primary) ? apiKeyBody(current) : stepsBody(current, primary),
       others.length > 0
@@ -735,11 +814,55 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
     ]);
   }
 
-  /** Start this account's own lane's primary sign-in, into the folder it already has. */
-  async function reauthenticate(accountId: string, laneId: string): Promise<void> {
+  /** The desktop app opened the page and relays its callback: all that is left is the browser. */
+  function relayBody(current: Lane): m.Children {
+    const flow = getFlow();
+    return [
+      m("p", { class: css.LEAD }, `Finish signing in to ${current.provider_name} in your browser.`),
+      method !== null && method.note !== ""
+        ? m("div", { class: css.NOTE, "data-e2e": "method-note" }, m.trust(renderMarkdown(method.note)))
+        : null,
+      m("div", { class: css.RELAY_ACTIONS }, [
+        m(
+          Button,
+          {
+            variant: "secondary",
+            "data-e2e": "open-sign-in-again",
+            onclick: () => {
+              if (flow === null || flow.relay_url === null) return;
+              void relay(flow.relay_url, flow.flow_id).then((isRelaying) => {
+                if (isRelaying === null) return;
+                // The user may have gone back, closed the chooser, or finished meanwhile.
+                const live = getFlow();
+                const isStillWaiting =
+                  mode === "relay" &&
+                  live !== null &&
+                  live.flow_id === flow.flow_id &&
+                  live.status.state === "pending";
+                if (!isRelaying && isStillWaiting)
+                  signInAnotherWay(current, "Imbue Studio couldn't open the sign-in page. Sign in here instead:");
+              });
+            },
+          },
+          "Try again",
+        ),
+        hasOtherWays(current)
+          ? m(
+              Button,
+              { variant: "secondary", "data-e2e": "sign-in-another-way", onclick: () => signInAnotherWay(current) },
+              "Try another way",
+            )
+          : null,
+      ]),
+    ];
+  }
+
+  /** Sign in to this account again, into the folder it already has, the way it signed in before. */
+  async function reauthenticate(accountId: string, laneId: string, methodId: string): Promise<void> {
     const owner = getLanes().find((candidate) => candidate.id === laneId);
     if (owner === undefined) return;
-    await begin(owner, owner.methods[0], { fromChooser: true, accountId });
+    const reauthMethod = owner.methods.find((candidate) => candidate.id === methodId) ?? owner.methods[0];
+    await begin(owner, reauthMethod, { fromChooser: true, accountId });
   }
 
   return {
@@ -750,7 +873,7 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
       const accountId = takeChooserAccountId();
       if (accountId === null) return;
       const account = getAccounts().find((candidate) => candidate.id === accountId);
-      if (account !== undefined) await reauthenticate(account.id, account.lane);
+      if (account !== undefined) await reauthenticate(account.id, account.lane, account.reauth_method);
     },
 
     onremove() {
@@ -794,17 +917,30 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
         body = statusScreen(
           "success",
           "All set",
-          reauthAccountId === null
-            ? `Signed in. ${current.provider_name} is ready to use.`
-            : "Signed in again. Every chat on this provider can take a turn once more.",
+          [
+            reauthAccountId === null
+              ? `Signed in. ${current.provider_name} is ready to use.`
+              : "Signed in again. Every chat on this provider can take a turn once more.",
+            flow.status.detail === null ? "" : ` ${flow.status.detail}.`,
+          ].join(""),
           m("div", { class: css.STATUS_MARK }, [m.trust(providerMark(current.id, 18)), current.provider_name]),
         );
       } else if (isFailed || error !== null) {
         body = [
           statusScreen("error", "That didn't work", (isFailed ? flow.status.detail : null) ?? error),
-          m(
-            "div",
-            { class: css.FOOTER_ROW },
+          m("div", { class: css.FOOTER_ROW }, [
+            hasOtherWays(current)
+              ? m(
+                  Button,
+                  {
+                    variant: "secondary",
+                    disabled: busy,
+                    "data-e2e": "sign-in-another-way",
+                    onclick: () => signInAnotherWay(current),
+                  },
+                  "Try another way",
+                )
+              : null,
             m(
               Button,
               {
@@ -818,14 +954,20 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
               },
               "Try again",
             ),
-          ),
+          ]),
         ];
       } else if (isPending) {
         body = statusScreen(
           "pending",
           "Signing in...",
-          awaitingVerdict ? "Checking your code with the provider." : "Preparing your sign-in.",
+          awaitingVerdict
+            ? "Checking your code with the provider."
+            : isOpeningBrowser
+              ? "Opening your browser."
+              : "Preparing your sign-in.",
         );
+      } else if (mode === "relay") {
+        body = relayBody(current);
       } else if (mode === "apiKey") {
         body = apiKeyBody(current);
       } else if (mode === "menu") {
@@ -864,7 +1006,6 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
         // as "close this" and abort the flow the code was being copied out of.
         { class: MODAL_OVERLAY_CLASS, ...backdropDismissAttrs(onClose) },
         [
-          current !== null && mode === "apiKey" ? keyProviderMenu(current) : null,
           m(
             "div",
             {
@@ -873,9 +1014,10 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
               "aria-modal": "true",
               "aria-label": "Pick your AI provider",
               "data-e2e": "provider-chooser",
+              ...partAttrs("dialog"),
             },
             m("div", { class: css.PANEL }, [
-              m("div", { class: css.HEADER }, [
+              m("div", { class: css.HEADER, ...partAttrs("dialog-header") }, [
                 current !== null
                   ? m(
                       Button,
@@ -883,7 +1025,7 @@ export function ProviderChooserModal(): m.Component<ProviderChooserModalAttrs> {
                       m.trust(icon("chevron-left", { size: 16 })),
                     )
                   : null,
-                m("h2", { class: css.TITLE }, title),
+                m("h2", { class: css.TITLE, ...partAttrs("dialog-title") }, title),
                 // Which harness this connection will run on. Not a picker: provider ->
                 // harness is fixed in V1, so there is nothing to choose -- but it is still the
                 // fact you want before you hand over a credential, so the header states it.

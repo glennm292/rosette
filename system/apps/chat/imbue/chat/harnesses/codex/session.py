@@ -26,6 +26,7 @@ from imbue.chat.harnesses.codex.model import codex_models_to_options
 from imbue.chat.harnesses.codex.model import get_codex_model_options_path
 from imbue.chat.harnesses.codex.model import read_codex_model_options
 from imbue.chat.harnesses.codex.model import write_codex_model_options
+from imbue.chat.harnesses.interrupt import IsCompactionInFlight
 from imbue.chat.harnesses.interrupt import PressChord
 from imbue.chat.harnesses.interrupt import RestartProcess
 from imbue.chat.harnesses.interrupt import SettleActivity
@@ -35,6 +36,7 @@ from imbue.chat.harnesses.session import SendOutcome
 from imbue.chat.harnesses.session import SessionDeps
 from imbue.chat.harnesses.session import ShoulderTapOutcome
 from imbue.chat.harnesses.session_watcher import AgentSessionWatcher
+from imbue.chat.harnesses.session_watcher import StreamedReply
 from imbue.mngr_codex.app_server_client import CodexAppServerError
 from imbue.mngr_codex.app_server_client import TransportClosedError
 
@@ -62,7 +64,7 @@ class CodexHarnessSession(AgentHarnessSession):
             return None
         return connection.ledger
 
-    # -- liveness ---------------------------------------------------------------------------
+    # Liveness
 
     def ensure_live(self) -> None:
         """Ensure a live app-server connection + ledger (idempotent, self-healing).
@@ -108,6 +110,10 @@ class CodexHarnessSession(AgentHarnessSession):
         # shows the right dot immediately.
         self._deps.recompute_activity()
 
+    def is_starting_up(self) -> bool:
+        # With no live connection a send first builds one, which waits on a daemon still starting.
+        return self._live_ledger() is None
+
     def on_lifecycle_dead(self) -> None:
         """Reap the connection and the manager-side queue chips for a positively-dead daemon.
 
@@ -131,9 +137,9 @@ class CodexHarnessSession(AgentHarnessSession):
         if connection is not None:
             connection.stop()
 
-    # -- messages ---------------------------------------------------------------------------
+    # Messages
 
-    def send(self, text: str, message_id: str) -> SendOutcome:
+    def send(self, text: str, message_id: str, is_resent_when_unsure: bool = True) -> SendOutcome:
         """Send through the live ledger (contract A2: the ledger is the sole authority).
 
         ``message_id`` is passed only as a CORRELATION TOKEN (``clientUserMessageId``), which
@@ -168,12 +174,18 @@ class CodexHarnessSession(AgentHarnessSession):
         ledger = self._live_ledger()
         return ledger.is_sending() if ledger is not None else False
 
+    def read_streamed_reply(self) -> StreamedReply | None:
+        connection = self._connection
+        if connection is None or not connection.is_alive:
+            return None
+        return connection.read_streamed_reply()
+
     def in_flight_block(self) -> str:
         # The ledger returns its own not-yet-committed messages through the interrupt itself
         # (see ``interrupt_to_composer``), so there is no separate in-flight block to fold.
         return ""
 
-    # -- turn control -----------------------------------------------------------------------
+    # Turn control
 
     def is_tap_available(self, *, has_queued: bool) -> bool:
         """The ledger's own view: queue non-empty AND nothing Sending -- which also greys the
@@ -209,11 +221,13 @@ class CodexHarnessSession(AgentHarnessSession):
         restart_process: RestartProcess,
         settle_activity: SettleActivity,
         press_chord: PressChord,
+        is_compaction_in_flight: IsCompactionInFlight,
     ) -> str:
         """One native ``turn/interrupt`` on the running turn, then an authoritative per-id
         settle: every non-committed owned message returns to the composer in send order,
         while a message that committed before the interrupt stays Delivered (contract
-        Interrupt + A4). The restart/chord capabilities go unused -- the daemon stays up.
+        Interrupt + A4). The restart/chord/compaction capabilities go unused -- the daemon
+        stays up, and its interrupt cannot cancel a compaction.
         With no live connection there is nothing running and nothing parked. The dot is
         settled via ``settle_activity`` like every other harness's stop: it normally
         clears when the rollout's turn_aborted marker lands, but a daemon dying
@@ -226,7 +240,7 @@ class CodexHarnessSession(AgentHarnessSession):
         settle_activity()
         return block
 
-    # -- model options ----------------------------------------------------------------------
+    # Model options
 
     def switch_options(self) -> tuple[ModelOption, ...]:
         """The ONE reconciled per-agent option set (D2) -- what the picker offered, the chip

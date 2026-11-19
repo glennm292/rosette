@@ -31,9 +31,14 @@ with the clearing that removed it (`clearing`, `cleared_at`, `how_cleared`,
 and any clearing can be put back. Every row keeps the model's raw
 response on disk even though nothing links to it.
 
-Answers come from `claude -p` (see `tutor.py` for the model, the prompt, and the
-per-language grammar checklists); each line costs under half a cent and takes
-around five seconds. Extended thinking is deliberately off -- it tripled the
+Answers come from Claude (see `tutor.py` for the model, the prompt, and the
+per-language grammar checklists) by one of two routes. With an Anthropic API key
+-- `ANTHROPIC_API_KEY` in the environment, or one saved from the page (stored as
+a file under the data directory, set or removed through `/api/credentials`) --
+each line goes straight to the API, which is quickest. Without one, each line
+runs through `claude -p` on the workspace's own sign-in, which starts a fresh
+process per line and takes around five seconds. Either way a line costs under
+half a cent. Extended thinking is deliberately off -- it tripled the
 wait without improving the answers. A correction whose runs do not faithfully
 rebuild what the student wrote is dropped, leaving the explanation without a
 wrong mark-up.

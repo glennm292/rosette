@@ -1,0 +1,706 @@
+import json
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+from app_manifest.manifest import Pin
+from app_manifest.manifest import ShortcutMode
+from app_manifest.primitives import AppName
+from app_manifest.primitives import LaunchPathId
+from app_manifest.primitives import LaunchPathValue
+from app_manifest.registry import read_registry
+from workspace_layout.identity import RequestIdentity
+from workspace_layout.primitives import ClientId
+from workspace_layout.primitives import DesktopId
+from workspace_layout.primitives import ParticipantKey
+from workspace_layout.primitives import UserId
+from workspace_layout.primitives import WallpaperKind
+from workspace_layout.primitives import WallpaperName
+from workspace_layout.primitives import WindowId
+from workspace_layout.primitives import WindowPath
+from workspace_layout.primitives import WindowTitle
+from workspace_layout.records import ClientRecord
+from workspace_layout.records import DesktopShortcut
+from workspace_layout.records import GridCell
+from workspace_layout.records import ShortcutTarget
+from workspace_layout.records import Wallpaper
+from workspace_themes.primitives import ThemeId
+
+from imbue.imbue_common.model_update import to_update
+from imbue.system_interface.shell.data_types import AppPin
+from imbue.system_interface.shell.data_types import ThemeChoices
+from imbue.system_interface.shell.desktop_document import next_shortcut_cell
+from imbue.system_interface.shell.desktop_document import seed_desktop_shortcuts
+from imbue.system_interface.shell.desktops import DEFAULT_SHORTCUTS_OFFERED_FILENAME
+from imbue.system_interface.shell.desktops import DESKTOP_GLYPH_COLORS
+from imbue.system_interface.shell.desktops import DesktopStore
+from imbue.system_interface.shell.desktops import FALLBACK_USER_DESKTOP_NAME
+from imbue.system_interface.shell.desktops import default_desktop
+from imbue.system_interface.shell.desktops import desktop_kept_by_returning_client
+from imbue.system_interface.shell.desktops import desktop_name_for_user
+from imbue.system_interface.shell.desktops import find_desktop_by_name_or_id
+from imbue.system_interface.shell.desktops import next_glyph_index
+from imbue.system_interface.shell.desktops import resolve_active_desktop
+from imbue.system_interface.shell.desktops import slugify_desktop_name
+from imbue.system_interface.shell.errors import DesktopConflictError
+from imbue.system_interface.shell.errors import DesktopNotFoundError
+from imbue.system_interface.shell.errors import DesktopValueError
+from imbue.system_interface.shell.errors import LastDesktopError
+from imbue.system_interface.shell.errors import ShellStateError
+from imbue.system_interface.shell.errors import WindowNotFoundError
+from imbue.system_interface.shell.ownership import desktop_owner_of
+from imbue.system_interface.shell.ownership import is_desktop_owned_by
+from imbue.system_interface.shell.primitives import GLYPH_COUNT
+from imbue.system_interface.shell.testing import BUILTIN_SHORTCUT_APPS_WITH_CHAT
+from imbue.system_interface.shell.testing import TEST_NOW
+from imbue.system_interface.shell.testing import builtin_chat_row_toml
+from imbue.system_interface.shell.testing import builtin_registry_rows
+from imbue.system_interface.shell.testing import builtin_rows_toml_before_chat
+from imbue.system_interface.shell.testing import default_target_pairs
+from imbue.system_interface.shell.testing import offered_targets_recorded
+from imbue.system_interface.shell.testing import read_desktops_file_in_its_released_shape
+from imbue.system_interface.shell.testing import registry_row_toml
+from imbue.system_interface.shell.testing import screen_row_toml
+from imbue.system_interface.shell.testing import shortcut_apps_on
+from imbue.system_interface.shell.testing import shortcut_at
+from imbue.system_interface.shell.testing import targets_and_cells
+from imbue.system_interface.shell.testing import window_record
+from imbue.system_interface.shell.testing import write_desktops_file
+from imbue.system_interface.shell.testing import write_registry
+
+_SEED = (
+    DesktopShortcut(
+        target=ShortcutTarget(app=AppName("chat"), launch=LaunchPathId("new")),
+        mode=ShortcutMode.NEW,
+        cell=GridCell(column=0, row=0),
+    ),
+)
+_WIN_1 = WindowId("win-0000000000000001")
+
+
+def test_the_default_desktop_is_created_once_on_the_first_read_that_may_seed(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    assert store.list_desktops() == []
+    assert not (tmp_path / "desktops.json").exists()
+    seeded = store.ensure_default(lambda: _SEED)
+    assert [desktop.name for desktop in seeded] == ["Home"]
+    assert seeded[0].id == "home" and seeded[0].shortcuts == _SEED and seeded[0].wallpaper is None
+    # A later read with another seed keeps what was written.
+    assert store.ensure_default(lambda: ()) == seeded
+    assert json.loads((tmp_path / "desktops.json").read_text())["version"] == 1
+    # The targets of the seeded shortcuts are recorded as offered.
+    assert offered_targets_recorded(tmp_path) == [("chat", "new")]
+
+
+def test_a_late_apps_default_shortcut_is_offered_once_on_every_desktop_and_a_removal_sticks(tmp_path: Path) -> None:
+    before_chat, with_chat = builtin_registry_rows(tmp_path / "registry")
+    store = DesktopStore(state_directory=tmp_path)
+    store.ensure_default(lambda: seed_desktop_shortcuts(before_chat))
+    store.create_desktop("Work", "#111111", 1, seed_desktop_shortcuts(before_chat), (), None, before_chat)
+    rearranged = store.move_shortcut("work", AppName("files"), LaunchPathId("new"), GridCell(column=0, row=3))
+    assert store.reconcile_shortcuts_with(before_chat).is_written is False
+
+    offered = store.reconcile_shortcuts_with(with_chat)
+
+    assert offered.is_written is True
+    home, work = offered.desktops
+    # Home was untouched, so it reads as if the chat had registered first; Work keeps its arrangement.
+    assert home.shortcuts == seed_desktop_shortcuts(with_chat)
+    assert work.shortcuts[:-1] == rearranged.shortcuts
+    assert (shortcut_apps_on(work)[-1], work.shortcuts[-1].cell) == ("chat", next_shortcut_cell(rearranged))
+    assert store.list_desktops() == list(offered.desktops)
+    assert offered_targets_recorded(tmp_path) == default_target_pairs(with_chat)
+    stamp = (tmp_path / "desktops.json").stat().st_mtime_ns
+    assert store.reconcile_shortcuts_with(with_chat).is_written is False
+    assert (tmp_path / "desktops.json").stat().st_mtime_ns == stamp
+
+    # A shortcut the user removes stays removed while its app stays registered.
+    store.remove_shortcut("home", AppName("chat"), LaunchPathId("root"))
+    assert store.reconcile_shortcuts_with(with_chat).is_written is False
+    assert "chat" not in shortcut_apps_on(store.list_desktops()[0])
+
+
+def test_a_workspaces_own_apps_are_added_once_to_every_desktop_and_a_removal_sticks(tmp_path: Path) -> None:
+    """A workspace whose desktops were made before its user-built apps had shortcuts: each app a program runs is
+    added once to every desktop, a preview frame is not, and a shortcut the user then removes stays removed."""
+    _, with_chat = builtin_registry_rows(tmp_path / "registry")
+    with_own_apps = read_registry(
+        write_registry(
+            tmp_path / "registry" / "with_own_apps.toml",
+            *builtin_rows_toml_before_chat(),
+            builtin_chat_row_toml(),
+            registry_row_toml("notes", "http://localhost:8100", program="notes"),
+            # An app from before manifests: registered with ``--name --icon-file --program``, no display name.
+            registry_row_toml("recipes", "http://localhost:8200", program="recipes"),
+            registry_row_toml("preview-1", "http://localhost:8300", display_name="Notes (preview)"),
+        )
+    )
+    store = DesktopStore(state_directory=tmp_path / "state")
+    store.ensure_default(lambda: seed_desktop_shortcuts(with_chat))
+    store.create_desktop("Work", "#111111", 1, seed_desktop_shortcuts(with_chat), (), None, with_chat)
+
+    offered = store.reconcile_shortcuts_with(with_own_apps)
+
+    assert offered.is_written is True
+    for desktop in offered.desktops:
+        assert shortcut_apps_on(desktop) == (*BUILTIN_SHORTCUT_APPS_WITH_CHAT, "notes", "recipes")
+    assert offered_targets_recorded(tmp_path / "state") == default_target_pairs(with_own_apps)
+
+    store.remove_shortcut("home", AppName("notes"), LaunchPathId("open"))
+    assert store.reconcile_shortcuts_with(with_own_apps).is_written is False
+    assert "notes" not in shortcut_apps_on(store.list_desktops()[0])
+
+
+def test_a_workspace_updated_off_the_browser_app_trades_its_browser_shortcut_for_the_screens(tmp_path: Path) -> None:
+    """A workspace that ran the browser app, as the update to the Screen leaves it: desktops arranged by hand holding
+    the browser's shortcut, the Screen's one shortcut already added, and a record of apps. The browser's shortcut goes,
+    the Screen's Browser shortcut lands at the next free cell, nothing else moves or is added (the chat counts as
+    offered though the desktop holds a shortcut of another launch path of it), and the record is rewritten as
+    targets."""
+    rows = read_registry(
+        write_registry(
+            tmp_path / "registry" / "apps.toml",
+            builtin_chat_row_toml(),
+            registry_row_toml(
+                "files",
+                "http://localhost:7000",
+                program="files",
+                launcher_rank=20,
+                default_shortcuts=[("new", "new")],
+                launch_paths=[("new", "Files", "/")],
+            ),
+            screen_row_toml([("screen", "focus"), ("browser", "focus")]),
+            registry_row_toml("notes", "http://localhost:8100", program="notes"),
+        )
+    )
+    state_directory = tmp_path / "state"
+    arranged = (
+        shortcut_at("chat", "new", 0, 0),
+        shortcut_at("browser", "new", 0, 1),
+        shortcut_at("files", "new", 0, 2),
+        shortcut_at("notes", "open", 1, 0),
+        shortcut_at("screen", "screen", 2, 1),
+    )
+    home = default_desktop(arranged)
+    work = home.model_copy_update(
+        to_update(home.field_ref().id, DesktopId("work")), to_update(home.field_ref().name, "Work")
+    )
+    write_desktops_file(state_directory, home, work)
+    (state_directory / DEFAULT_SHORTCUTS_OFFERED_FILENAME).write_text(
+        json.dumps({"version": 1, "apps": ["browser", "chat", "files", "notes", "screen"]})
+    )
+    store = DesktopStore(state_directory=state_directory)
+
+    reconciled = store.reconcile_shortcuts_with(rows)
+
+    assert reconciled.is_written is True
+    for desktop in reconciled.desktops:
+        assert targets_and_cells(desktop) == [
+            ("chat", "new", 0, 0),
+            ("files", "new", 0, 2),
+            ("notes", "open", 1, 0),
+            ("screen", "screen", 2, 1),
+            ("screen", "browser", 2, 0),
+        ]
+    assert offered_targets_recorded(state_directory) == default_target_pairs(rows)
+    assert read_desktops_file_in_its_released_shape(state_directory) == reconciled.desktops
+    stamp = (state_directory / "desktops.json").stat().st_mtime_ns
+    assert store.reconcile_shortcuts_with(rows).is_written is False
+    assert (state_directory / "desktops.json").stat().st_mtime_ns == stamp
+
+
+def test_an_app_that_leaves_the_registry_loses_its_shortcuts_and_is_offered_them_again_when_it_returns(
+    tmp_path: Path,
+) -> None:
+    _, with_chat = builtin_registry_rows(tmp_path / "registry")
+    without_files = read_registry(
+        write_registry(
+            tmp_path / "registry" / "without_files.toml",
+            *(row for row in builtin_rows_toml_before_chat() if 'name = "files"' not in row),
+            builtin_chat_row_toml(),
+        )
+    )
+    store = DesktopStore(state_directory=tmp_path / "state")
+    store.ensure_default(lambda: seed_desktop_shortcuts(with_chat))
+    store.create_desktop("Work", "#111111", 1, seed_desktop_shortcuts(with_chat), (), None, with_chat)
+
+    dropped = store.reconcile_shortcuts_with(without_files)
+
+    assert dropped.is_written is True
+    for desktop in dropped.desktops:
+        assert "files" not in shortcut_apps_on(desktop)
+    assert ("files", "new") not in offered_targets_recorded(tmp_path / "state")
+    assert store.reconcile_shortcuts_with(without_files).is_written is False
+
+    returned = store.reconcile_shortcuts_with(with_chat)
+
+    assert returned.is_written is True
+    for before, after in zip(dropped.desktops, returned.desktops, strict=True):
+        assert after.shortcuts[:-1] == before.shortcuts
+        assert (shortcut_apps_on(after)[-1], after.shortcuts[-1].cell) == ("files", next_shortcut_cell(before))
+    assert offered_targets_recorded(tmp_path / "state") == default_target_pairs(with_chat)
+
+
+def test_an_app_that_returns_is_offered_only_the_shortcuts_it_lost_not_one_the_user_removed(tmp_path: Path) -> None:
+    with_screen = read_registry(
+        write_registry(
+            tmp_path / "registry" / "apps.toml",
+            builtin_chat_row_toml(),
+            screen_row_toml([("screen", "focus"), ("browser", "focus")]),
+        )
+    )
+    without_screen = read_registry(write_registry(tmp_path / "registry" / "chat_only.toml", builtin_chat_row_toml()))
+    store = DesktopStore(state_directory=tmp_path / "state")
+    store.ensure_default(lambda: seed_desktop_shortcuts(with_screen))
+    store.remove_shortcut("home", AppName("screen"), LaunchPathId("browser"))
+
+    assert store.reconcile_shortcuts_with(without_screen).is_written is True
+    (returned,) = store.reconcile_shortcuts_with(with_screen).desktops
+
+    assert [(app, launch) for app, launch, _, _ in targets_and_cells(returned)] == [
+        ("chat", "root"),
+        ("screen", "screen"),
+    ]
+    assert offered_targets_recorded(tmp_path / "state") == default_target_pairs(with_screen)
+
+
+def test_a_registry_with_no_rows_drops_no_shortcut(tmp_path: Path) -> None:
+    """An empty read is a registry nothing has registered in yet (or one that was removed), never every app retired."""
+    _, with_chat = builtin_registry_rows(tmp_path / "registry")
+    store = DesktopStore(state_directory=tmp_path / "state")
+    seeded = store.ensure_default(lambda: seed_desktop_shortcuts(with_chat))
+    store.reconcile_shortcuts_with(with_chat)
+    recorded = offered_targets_recorded(tmp_path / "state")
+
+    outcome = store.reconcile_shortcuts_with([])
+
+    assert outcome.is_written is False
+    assert store.list_desktops() == seeded
+    assert offered_targets_recorded(tmp_path / "state") == recorded
+    # With no record either, it writes none, so the next reconcile with rows counts the desktops' apps as offered.
+    offered_path = tmp_path / "state" / DEFAULT_SHORTCUTS_OFFERED_FILENAME
+    offered_path.unlink()
+    store.reconcile_shortcuts_with([])
+    assert not offered_path.exists()
+    assert store.reconcile_shortcuts_with(with_chat).is_written is False
+    assert offered_targets_recorded(tmp_path / "state") == recorded
+
+
+@pytest.mark.parametrize(
+    "offered_record_text",
+    [None, '{"version": 3, "targets": []}', '{"version": 2, "apps": []}', '{"version": 1}', "not json"],
+)
+def test_a_desktops_file_with_no_usable_offered_record_counts_its_shortcuts_as_offered(
+    tmp_path: Path, offered_record_text: str | None
+) -> None:
+    """A workspace whose default desktop was seeded before the chat registered, by a shell that kept no record or
+    beside a record this shell cannot read: the chat is added once, as if registered first, the record is written,
+    and desktops.json keeps the shape every release reads."""
+    before_chat, with_chat = builtin_registry_rows(tmp_path / "registry")
+    state_directory = tmp_path / "state"
+    write_desktops_file(state_directory, default_desktop(seed_desktop_shortcuts(before_chat)))
+    if offered_record_text is not None:
+        (state_directory / DEFAULT_SHORTCUTS_OFFERED_FILENAME).write_text(offered_record_text)
+    store = DesktopStore(state_directory=state_directory)
+
+    offered = store.reconcile_shortcuts_with(with_chat)
+
+    assert offered.is_written is True
+    assert shortcut_apps_on(offered.desktops[0]) == BUILTIN_SHORTCUT_APPS_WITH_CHAT
+    assert offered_targets_recorded(state_directory) == default_target_pairs(with_chat)
+    assert read_desktops_file_in_its_released_shape(state_directory) == offered.desktops
+
+
+def test_a_created_or_added_desktop_records_the_targets_of_its_default_shortcuts(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    store.create_desktop("Alpha", "#111111", 1, _SEED, (), None, ())
+    assert offered_targets_recorded(tmp_path) == [("chat", "new")]
+    store.add_desktop(default_desktop(()), {ShortcutTarget(app=AppName("files"), launch=LaunchPathId("new"))}, ())
+    assert offered_targets_recorded(tmp_path) == [("chat", "new"), ("files", "new")]
+
+
+def test_a_desktop_added_before_any_offered_record_starts_it_from_the_shortcuts_already_there(tmp_path: Path) -> None:
+    """An app with a shortcut on a desktop counts as offered its first default shortcut, whichever it holds."""
+    _, with_chat = builtin_registry_rows(tmp_path / "registry")
+    store = DesktopStore(state_directory=tmp_path / "state")
+    store.ensure_default(lambda: _SEED)
+    (tmp_path / "state" / DEFAULT_SHORTCUTS_OFFERED_FILENAME).unlink()
+
+    store.create_desktop("Alpha", "#111111", 1, (), (), None, with_chat)
+
+    assert offered_targets_recorded(tmp_path / "state") == [("chat", "root")]
+
+
+@pytest.mark.parametrize(
+    "offered_record_text",
+    [None, json.dumps({"version": 1, "apps": sorted(BUILTIN_SHORTCUT_APPS_WITH_CHAT)})],
+)
+def test_a_desktop_added_before_the_registry_is_read_leaves_the_offered_record_for_the_next_reconcile(
+    tmp_path: Path, offered_record_text: str | None
+) -> None:
+    """With no rows there is nothing to start a missing record over from, nor to read a record of apps as targets, so
+    the record is left as it is, whatever the new desktop holds: the next reconcile with rows still counts what was
+    offered and a shortcut the user removed from one desktop stays removed."""
+    before_chat, with_chat = builtin_registry_rows(tmp_path / "registry")
+    store = DesktopStore(state_directory=tmp_path / "state")
+    store.ensure_default(lambda: seed_desktop_shortcuts(with_chat))
+    store.create_desktop("Work", "#111111", 1, seed_desktop_shortcuts(with_chat), (), None, with_chat)
+    store.remove_shortcut("home", AppName("chat"), LaunchPathId("root"))
+    offered_path = tmp_path / "state" / DEFAULT_SHORTCUTS_OFFERED_FILENAME
+    if offered_record_text is None:
+        offered_path.unlink()
+    else:
+        offered_path.write_text(offered_record_text)
+
+    store.create_desktop("Alpha", "#222222", 2, seed_desktop_shortcuts(before_chat), (), None, ())
+
+    if offered_record_text is None:
+        assert not offered_path.exists()
+    else:
+        assert offered_path.read_text() == offered_record_text
+    home, _, alpha = store.reconcile_shortcuts_with(with_chat).desktops
+    assert "chat" not in shortcut_apps_on(home)
+    assert alpha.shortcuts == seed_desktop_shortcuts(before_chat)
+    assert offered_targets_recorded(tmp_path / "state") == default_target_pairs(with_chat)
+
+
+def _delete_file(path: Path) -> None:
+    path.unlink()
+
+
+def _add_an_unknown_desktop_key(path: Path) -> None:
+    raw = json.loads(path.read_text())
+    raw["desktops"][0]["unknown_key"] = True
+    path.write_text(json.dumps(raw))
+
+
+def _set_another_version(path: Path) -> None:
+    raw = json.loads(path.read_text())
+    raw["version"] = 2
+    path.write_text(json.dumps(raw))
+
+
+@pytest.mark.parametrize("spoil_desktops_file", [_delete_file, _add_an_unknown_desktop_key, _set_another_version])
+def test_seeding_the_default_desktop_again_starts_the_offered_record_over(
+    tmp_path: Path, spoil_desktops_file: Callable[[Path], None]
+) -> None:
+    """A desktops.json read as absent is seeded over before the chat registers: the record left from the desktops it
+    replaced no longer names the chat as offered, so the chat still reaches the new default desktop."""
+    before_chat, with_chat = builtin_registry_rows(tmp_path / "registry")
+    state_directory = tmp_path / "state"
+    store = DesktopStore(state_directory=state_directory)
+    store.ensure_default(lambda: seed_desktop_shortcuts(before_chat))
+    store.reconcile_shortcuts_with(with_chat)
+    assert offered_targets_recorded(state_directory) == default_target_pairs(with_chat)
+    spoil_desktops_file(state_directory / "desktops.json")
+
+    (home,) = store.ensure_default(lambda: seed_desktop_shortcuts(before_chat))
+
+    assert offered_targets_recorded(state_directory) == default_target_pairs(before_chat)
+    offered = store.reconcile_shortcuts_with(with_chat)
+    assert offered.is_written is True
+    assert offered.desktops[0].shortcuts == seed_desktop_shortcuts(with_chat)
+
+
+def test_a_desktop_added_where_no_desktop_stands_starts_the_offered_record_over(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    store.ensure_default(lambda: _SEED)
+    (tmp_path / "desktops.json").unlink()
+
+    store.create_desktop("Alpha", "#111111", 1, (), (), None, ())
+
+    assert offered_targets_recorded(tmp_path) == []
+
+
+def _seed_the_default_desktop(store: DesktopStore) -> None:
+    store.ensure_default(lambda: _SEED)
+
+
+def _create_a_desktop(store: DesktopStore) -> None:
+    store.create_desktop("Alpha", "#111111", 1, _SEED, (), None, ())
+
+
+@pytest.mark.parametrize("make_a_desktop_where_none_stands", [_seed_the_default_desktop, _create_a_desktop])
+def test_a_desktop_made_where_none_stands_is_not_written_when_its_offered_record_cannot_be(
+    tmp_path: Path, make_a_desktop_where_none_stands: Callable[[DesktopStore], None]
+) -> None:
+    """The record starts over before desktops.json is written, so the record of replaced desktops never stays beside
+    a new one."""
+    store = DesktopStore(state_directory=tmp_path)
+    # A directory where the offered record goes makes every write of it fail.
+    (tmp_path / DEFAULT_SHORTCUTS_OFFERED_FILENAME).mkdir()
+
+    with pytest.raises(ShellStateError):
+        make_a_desktop_where_none_stands(store)
+
+    assert not (tmp_path / "desktops.json").exists()
+
+
+def test_with_no_desktop_nothing_is_offered_or_recorded(tmp_path: Path) -> None:
+    _, with_chat = builtin_registry_rows(tmp_path / "registry")
+    store = DesktopStore(state_directory=tmp_path / "state")
+
+    outcome = store.reconcile_shortcuts_with(with_chat)
+
+    assert outcome.is_written is False and outcome.desktops == ()
+    assert not (tmp_path / "state").exists()
+
+
+def test_pinned_windows_are_reconciled_across_every_desktop_and_written_only_on_a_change(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    store.ensure_default(lambda: ())
+    store.create_desktop("Alpha", "#111111", 1, (), (), None, ())
+    pin = AppPin(app=AppName("chat"), pin=Pin(path=LaunchPathValue("/")))
+    ensured = store.ensure_pinned_windows([pin], TEST_NOW)
+    assert ensured.is_written is True
+    assert [[str(window.app) for window in desktop.windows] for desktop in ensured.desktops] == [["chat"], ["chat"]]
+    assert all(desktop.windows[0].is_pinned for desktop in ensured.desktops)
+    stamp = (tmp_path / "desktops.json").stat().st_mtime_ns
+    again = store.ensure_pinned_windows([pin], TEST_NOW)
+    assert again.is_written is False and again.desktops == ensured.desktops
+    assert (tmp_path / "desktops.json").stat().st_mtime_ns == stamp
+    withdrawn = store.ensure_pinned_windows([], TEST_NOW)
+    assert withdrawn.is_written is True
+    assert all(desktop.windows[0].is_pinned is False for desktop in withdrawn.desktops)
+    # A pinned window is born with a new desktop when the caller hands it over.
+    born = store.create_desktop("Beta", "#222222", 2, (), (ensured.desktops[0].windows[0],), None, ())
+    assert born.windows == (ensured.desktops[0].windows[0],)
+
+
+def test_a_file_of_another_version_or_shape_is_treated_as_absent(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    (tmp_path / "desktops.json").write_text(json.dumps({"version": 7, "desktops": []}))
+    assert store.list_desktops() == []
+    (tmp_path / "desktops.json").write_text(json.dumps({"version": 1, "desktops": [{"id": "x"}]}))
+    assert store.list_desktops() == []
+    assert [desktop.id for desktop in store.ensure_default(lambda: ())] == ["home"]
+
+
+def test_a_desktop_made_again_never_wears_a_theme_its_id_left_behind(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    store.ensure_default(lambda: ())
+    store.create_desktop("Research", "#12B5A5", 4, (), (), None, ())
+    store.set_default_theme(ThemeId("mac-classic"))
+    store.set_theme("home", ThemeId("windows-2000"))
+    store.set_theme("research", ThemeId("windows-2000"))
+    # A shell from before themes deletes the desktop without knowing desktop_themes.json.
+    write_desktops_file(tmp_path, *(desktop for desktop in store.list_desktops() if desktop.id != "research"))
+
+    store.create_desktop("Research", "#12B5A5", 4, (), (), None, ())
+    assert store.read_theme_choices() == ThemeChoices(
+        default=ThemeId("mac-classic"), theme_by_desktop_id={DesktopId("home"): ThemeId("windows-2000")}
+    )
+
+    (tmp_path / "desktops.json").unlink()
+    store.ensure_default(lambda: ())
+    assert store.read_theme_choices() == ThemeChoices(default=ThemeId("mac-classic"), theme_by_desktop_id={})
+
+
+def test_desktops_are_created_settled_and_deleted_with_the_last_one_refused(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    home = store.ensure_default(lambda: ())[0]
+    research = store.create_desktop("Research!", "#12B5A5", 4, _SEED, (), None, ())
+    assert research.id == "research" and research.shortcuts == _SEED
+    with pytest.raises(DesktopConflictError):
+        store.create_desktop("research", "#12B5A5", 4, (), (), None, ())
+    with pytest.raises(DesktopValueError):
+        store.create_desktop("Bad", "red", 4, (), (), None, ())
+    with pytest.raises(DesktopValueError):
+        store.create_desktop("Bad", "#12B5A5", 12, (), (), None, ())
+    with pytest.raises(DesktopValueError):
+        slugify_desktop_name("!!!")
+    settled = store.update_settings("research", "Research 2", "#222222", 2)
+    assert (settled.id, settled.name, settled.color, settled.glyph) == ("research", "Research 2", "#222222", 2)
+    # A rename alone keeps the colour and glyph as written (the multiplayer spec, S7).
+    renamed = store.update_settings("research", "Research 3", None, None)
+    assert (renamed.name, renamed.color, renamed.glyph) == ("Research 3", "#222222", 2)
+    assert store.update_settings("research", "Research 2", None, None).name == "Research 2"
+    papered = store.set_wallpaper("research", Wallpaper(kind=WallpaperKind.BUNDLED, name=WallpaperName("dunes")))
+    assert papered.wallpaper is not None and papered.wallpaper.name == "dunes"
+    assert store.set_wallpaper("research", None).wallpaper is None
+    assert store.read_theme_choices() == ThemeChoices(default=None, theme_by_desktop_id={})
+    assert store.set_theme("research", ThemeId("windows-2000")).name == "Research 2"
+    assert store.read_theme_choices().theme_by_desktop_id == {"research": "windows-2000"}
+    # desktops.json keeps the shape a shell from before themes reads; the theme lives beside it.
+    read_desktops_file_in_its_released_shape(store.state_directory)
+    assert store.set_default_theme(ThemeId("mac-classic")).default == "mac-classic"
+    store.set_theme("research", None)
+    assert store.read_theme_choices() == ThemeChoices(default=ThemeId("mac-classic"), theme_by_desktop_id={})
+    with pytest.raises(DesktopNotFoundError):
+        store.set_theme("nowhere", ThemeId("mac-classic"))
+    assert find_desktop_by_name_or_id(store.list_desktops(), "research 2") is not None
+    assert find_desktop_by_name_or_id(store.list_desktops(), "nowhere") is None
+
+    store.set_theme("home", ThemeId("windows-2000"))
+    outcome = store.delete_desktop("home")
+    assert outcome.deleted.id == home.id and outcome.fallback_desktop_id == "research"
+    assert store.read_theme_choices() == ThemeChoices(default=ThemeId("mac-classic"), theme_by_desktop_id={})
+    with pytest.raises(LastDesktopError):
+        store.delete_desktop("research")
+    with pytest.raises(DesktopNotFoundError):
+        store.delete_desktop("home")
+    assert [desktop.id for desktop in store.list_desktops()] == ["research"]
+
+
+def test_windows_are_opened_located_and_closed_idempotently(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    store.ensure_default(lambda: ())
+    opened = store.open_window("home", window_record(_WIN_1, "chat", "/"))
+    assert [window.id for window in opened.windows] == [_WIN_1]
+    located = store.set_window_location("home", _WIN_1, WindowPath("/?chat=agent-1"), WindowTitle("Plan"))
+    assert located.is_written is True and located.desktop.windows[0].path == "/?chat=agent-1"
+    again = store.set_window_location("home", _WIN_1, WindowPath("/?chat=agent-1"), WindowTitle("Plan"))
+    assert again.is_written is False
+    with pytest.raises(WindowNotFoundError):
+        store.set_window_location("home", WindowId("win-00000000000000ff"), WindowPath("/"), WindowTitle(""))
+    closed = store.close_window("home", _WIN_1)
+    assert closed.is_written is True and closed.desktop.windows == ()
+    assert store.close_window("home", _WIN_1).is_written is False
+    with pytest.raises(DesktopNotFoundError):
+        store.close_window("nowhere", _WIN_1)
+
+
+def test_shortcuts_are_set_moved_and_removed(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    store.ensure_default(lambda: _SEED)
+    files = DesktopShortcut(
+        target=ShortcutTarget(app=AppName("files"), launch=LaunchPathId("open")),
+        mode=ShortcutMode.FOCUS,
+        cell=GridCell(column=0, row=1),
+    )
+    assert [str(shortcut.target.app) for shortcut in store.set_shortcut("home", files).shortcuts] == ["chat", "files"]
+    moved = store.move_shortcut("home", AppName("files"), LaunchPathId("open"), GridCell(column=0, row=0))
+    assert {str(shortcut.target.app): shortcut.cell for shortcut in moved.shortcuts} == {
+        "files": GridCell(column=0, row=0),
+        "chat": GridCell(column=0, row=1),
+    }
+    removed = store.remove_shortcut("home", AppName("chat"), LaunchPathId("new"))
+    assert [str(shortcut.target.app) for shortcut in removed.shortcuts] == ["files"]
+
+
+def test_a_clients_active_desktop_falls_back_from_its_desktop_to_the_first(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    home, alpha = store.ensure_default(lambda: ())[0], store.create_desktop("Alpha", "#111111", 1, (), (), None, ())
+    desktops = [home, alpha]
+    assert resolve_active_desktop(None, desktops) == home.id
+    assert resolve_active_desktop(None, []) is None
+    on_alpha = ClientRecord(id=ClientId("c1"), active_desktop=DesktopId("alpha"), last_seen=TEST_NOW)
+    assert resolve_active_desktop(on_alpha, desktops) == alpha.id
+    stale = ClientRecord(id=ClientId("c1"), active_desktop=DesktopId("gone"), last_seen=TEST_NOW)
+    assert resolve_active_desktop(stale, desktops) == home.id
+    unplaced = ClientRecord(id=ClientId("c1"), last_seen=TEST_NOW)
+    assert resolve_active_desktop(unplaced, desktops) == home.id
+
+
+def test_a_desktops_file_carrying_the_retired_sharing_key_still_reads(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    home = store.ensure_default(lambda: ())[0]
+    raw = json.loads((tmp_path / "desktops.json").read_text())
+    raw["desktops"][0]["sharing"] = "personal"
+    (tmp_path / "desktops.json").write_text(json.dumps(raw))
+    assert store.list_desktops() == [home]
+    store.update_settings("home", "Home", "#2f6b4f", 1)
+    assert "sharing" not in json.loads((tmp_path / "desktops.json").read_text())["desktops"][0]
+
+
+def test_a_desktops_file_carrying_the_retired_window_settling_key_still_reads(tmp_path: Path) -> None:
+    store = DesktopStore(state_directory=tmp_path)
+    store.ensure_default(lambda: ())
+    opened = store.open_window("home", window_record(_WIN_1, "chat", "/"))
+    raw = json.loads((tmp_path / "desktops.json").read_text())
+    raw["desktops"][0]["windows"][0]["is_settling"] = True
+    (tmp_path / "desktops.json").write_text(json.dumps(raw))
+    assert store.list_desktops() == [opened]
+    store.update_settings("home", "Home", "#2f6b4f", 1)
+    assert "is_settling" not in json.loads((tmp_path / "desktops.json").read_text())["desktops"][0]["windows"][0]
+
+
+def test_a_users_desktop_is_named_after_them_and_made_unique() -> None:
+    home = default_desktop(())
+    assert desktop_name_for_user("Alice", "alice@example.com", [home]) == "Alice"
+    assert desktop_name_for_user(None, "bob.smith@example.com", [home]) == "bob.smith"
+    assert desktop_name_for_user("   ", "!!!@example.com", [home]) == FALLBACK_USER_DESKTOP_NAME
+    assert desktop_name_for_user(None, None, [home]) == FALLBACK_USER_DESKTOP_NAME
+    taken = [
+        home,
+        home.model_copy_update(
+            to_update(home.field_ref().id, DesktopId("alice")), to_update(home.field_ref().name, "alice")
+        ),
+    ]
+    assert desktop_name_for_user("Alice", "alice@example.com", taken) == "Alice 2"
+    # The name is unique by id as well as by name: "Home" is taken however it is spelled.
+    assert desktop_name_for_user("home!", "h@example.com", [home]) == "home! 2"
+
+
+def test_the_next_glyph_is_the_first_unused_then_cycles() -> None:
+    assert next_glyph_index([]) == 0
+    assert next_glyph_index([0, 1, 3]) == 2
+    assert next_glyph_index(list(range(GLYPH_COUNT))) == 0
+    assert next_glyph_index([*range(GLYPH_COUNT), 0]) == 1
+
+
+def test_the_shell_has_a_colour_for_every_glyph() -> None:
+    assert len(DESKTOP_GLYPH_COLORS) == GLYPH_COUNT
+
+
+def test_a_desktop_is_the_owners_with_no_key_and_its_keys_owner_otherwise() -> None:
+    """ "Mine" (the multiplayer spec, section 8.1): a desktop with no owner is the workspace owner's under either of
+    the owner's keys; a visitor's is the one carrying their key."""
+    home = default_desktop(())
+    alices = home.model_copy_update(
+        to_update(home.field_ref().id, DesktopId("alice")),
+        to_update(home.field_ref().owner, ParticipantKey("user:user-alice")),
+    )
+    anonymous_owner = RequestIdentity(owner=True)
+    signed_in_owner = RequestIdentity(owner=True, user_id="user-josh", email="josh@example.com")
+    alice = RequestIdentity(owner=False, user_id="user-alice", email="alice@example.com")
+    assert is_desktop_owned_by(home, anonymous_owner) and is_desktop_owned_by(home, signed_in_owner)
+    assert not is_desktop_owned_by(home, alice)
+    assert is_desktop_owned_by(alices, alice)
+    assert not is_desktop_owned_by(alices, signed_in_owner) and not is_desktop_owned_by(alices, anonymous_owner)
+    assert desktop_owner_of(anonymous_owner) is None and desktop_owner_of(signed_in_owner) is None
+    assert desktop_owner_of(alice) == "user:user-alice"
+
+
+def test_reordering_moves_the_requesters_own_desktops_and_leaves_the_others_in_place(tmp_path: Path) -> None:
+    """The order route's rule (the multiplayer spec, section 8.2): the requester's desktops take the order given in
+    the places their desktops held; an order naming any other desktop, or not every one of theirs, is refused."""
+    store = DesktopStore(state_directory=tmp_path)
+    store.ensure_default(lambda: ())
+    store.create_desktop("Alpha", "#111111", 1, (), (), ParticipantKey("user:user-alice"), ())
+    store.create_desktop("Beta", "#222222", 2, (), (), None, ())
+    store.create_desktop("Gamma", "#333333", 3, (), (), None, ())
+    owner = RequestIdentity(owner=True)
+    alice = RequestIdentity(owner=False, user_id="user-alice", email="alice@example.com")
+    reordered = store.reorder_desktops([DesktopId("gamma"), DesktopId("home"), DesktopId("beta")], owner)
+    assert [desktop.id for desktop in reordered] == ["gamma", "alpha", "home", "beta"]
+    assert [desktop.id for desktop in store.list_desktops()] == ["gamma", "alpha", "home", "beta"]
+    # Alice's one desktop is already in order; nothing is rewritten.
+    stamp = (tmp_path / "desktops.json").stat().st_mtime_ns
+    assert [desktop.id for desktop in store.reorder_desktops([DesktopId("alpha")], alice)] == [
+        "gamma",
+        "alpha",
+        "home",
+        "beta",
+    ]
+    assert (tmp_path / "desktops.json").stat().st_mtime_ns == stamp
+    with pytest.raises(DesktopValueError):
+        store.reorder_desktops([DesktopId("home")], owner)
+    with pytest.raises(DesktopValueError):
+        store.reorder_desktops([DesktopId("home"), DesktopId("beta"), DesktopId("gamma"), DesktopId("alpha")], owner)
+    with pytest.raises(DesktopValueError):
+        store.reorder_desktops([DesktopId("home"), DesktopId("home"), DesktopId("beta")], owner)
+
+
+def test_a_returning_client_keeps_its_desktop_only_when_it_last_arrived_as_the_same_user() -> None:
+    alice = UserId("user-alice")
+    desktop_ids = {DesktopId("home"), DesktopId("alice")}
+    on_home = ClientRecord(id=ClientId("c1"), active_desktop=DesktopId("home"), last_seen=TEST_NOW, user_id=alice)
+    assert desktop_kept_by_returning_client(on_home, alice, desktop_ids) == "home"
+    assert desktop_kept_by_returning_client(None, alice, desktop_ids) is None
+    bobs = on_home.model_copy_update(to_update(on_home.field_ref().user_id, UserId("user-bob")))
+    assert desktop_kept_by_returning_client(bobs, alice, desktop_ids) is None
+    anonymous = on_home.model_copy_update(to_update(on_home.field_ref().user_id, None))
+    assert desktop_kept_by_returning_client(anonymous, alice, desktop_ids) is None
+    gone = on_home.model_copy_update(to_update(on_home.field_ref().active_desktop, DesktopId("deleted")))
+    assert desktop_kept_by_returning_client(gone, alice, desktop_ids) is None

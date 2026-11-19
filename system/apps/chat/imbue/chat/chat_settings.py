@@ -1,4 +1,4 @@
-"""The chat app's workspace-wide settings: the fast mode a new chat starts in, and whether the user has been told.
+"""The chat app's workspace-wide settings: the fast mode and idle compaction a new chat starts with, and the notices shown.
 
 One small JSON file beside the chat app's other state (``data/.apps/chat/settings.json``),
 read on every use so an edit from another process lands without a restart, and written whole.
@@ -23,10 +23,10 @@ from imbue.imbue_common.mutable_model import MutableModel
 
 logger = _loguru_logger
 
-DEFAULT_SETTINGS_PATH: Final[Path] = Path("data/.apps/chat/settings.json")
+SETTINGS_FILENAME: Final[str] = "settings.json"
 # How many of the user's turns a chat in auto mode runs with fast mode on before the chat app
 # switches it to standard speed.
-DEFAULT_FAST_MODE_TURN_LIMIT: Final[int] = 5
+DEFAULT_FAST_MODE_TURN_LIMIT: Final[int] = 2
 
 
 class FastModeMode(LowerCaseStrEnum):
@@ -44,7 +44,7 @@ class ChatSettings(FrozenModel):
     """What the settings file holds. Every field has a default, so an older file reads whole."""
 
     fast_mode_default: FastModeMode = Field(
-        default=FastModeMode.AUTO,
+        default=FastModeMode.OFF,
         description="The fast mode a new chat starts in",
     )
     fast_mode_turn_limit: int = Field(
@@ -55,6 +55,14 @@ class ChatSettings(FrozenModel):
     is_fast_mode_notice_shown: bool = Field(
         default=False,
         description="Whether the one-time notice explaining the first automatic switch to standard speed has been shown",
+    )
+    autocompact_default: bool = Field(
+        default=True,
+        description="Whether a new chat starts with idle compaction on",
+    )
+    is_autocompact_notice_shown: bool = Field(
+        default=False,
+        description="Whether the one-time notice explaining idle compaction has been shown",
     )
 
 

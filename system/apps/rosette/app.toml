@@ -3,3 +3,6 @@ display_name = "Rosette"
 icon = "icon.svg"
 priority = "user"
 program = "rosette"
+# Replies run only for lines typed on the page, and a line left pending is re-queued at
+# startup: the shell stops it once no window shows it.
+stop_when_no_windows = true

@@ -10,10 +10,11 @@ the agent something. Claude is the reference implementation; the logic lives onc
 
 ## What is in scope here, and what is not
 
-In scope: **anything that inspects or alters the command an agent is about to run**, and
-**anything that holds the agent to the `tk` step discipline the chat progress view is built
-from**. Those are the workspace's own rules, they are enforced identically everywhere, and
-they are ours to change without a mngr release.
+In scope: **anything that inspects or alters the command an agent is about to run**, **anything
+that holds the agent to the `tk` step discipline the chat progress view is built from**, and
+**anything a chat agent owes the user at the end of a turn**. Those are the workspace's own
+rules, they are enforced identically everywhere, and they are ours to change without a mngr
+release.
 
 Out of scope, deliberately -- these look adjacent and are not:
 
@@ -36,11 +37,17 @@ Each is stated as an invariant, with the reason it exists. The scripts named are
 source of the logic; a harness that cannot run a script must reproduce its behaviour *and its
 exact wording*, so an agent gets an identical explanation everywhere.
 
-### P1. A command must not pipe into `tail` or `head`
-`agent_block_pipe_tail_head.sh` -- **hard block.**
+### P1. A command must not pipe output it cannot get back into `tail` or `head`
+`agent_block_pipe_tail_head.sh` -> `agent_block_pipe_tail_head_check.py` -- **hard block.**
 
-The pipe truncates output the agent then reasons about as if it were complete. Redirect to a
-file and read that instead, so the full output exists and can be re-read.
+The pipe truncates output the agent then reasons about as if it were complete, and getting
+the rest back means running the command again. Redirect to a file and read that instead, so
+the full output exists and can be re-read. A pipe is allowed when everything feeding it only
+reads files, directories or git history (`cat`, `grep`, `rg`, `sed`, `ls`, `find`,
+`git log/show/diff/status`, ...) or prints `--help`/`--version`, or when a `tee FILE` upstream
+keeps the full output: that output can be read again at no cost. Each pipeline in a compound
+command is judged on its own, and a pipe into `tail`/`head` the checker cannot place in one
+(inside quoted text or a substitution) is blocked.
 
 ### P2. A command must not rewrite git history
 `agent_prevent_commit_rewrite.sh` -- **hard block.**
@@ -89,12 +96,17 @@ Soft on purpose: a block here would fight the agent over a judgement call (wheth
 action is substantive), and the cost of being wrong is a missing timeline node, not a broken
 repo.
 
-### P6. A `tk start` or `tk close` must be the only thing in its tool call
+### P6. A `tk start` or `tk close` shares its tool call only with other tk commands
 `agent_tk_standalone.sh` -> `agent_tk_standalone_check.py` -- **hard block.**
 
-Chaining (`cd x && tk start s1`) or redirecting a step transition drops it out of the progress
-view, so the timeline silently disagrees with what happened. `tk create` is exempt -- it may
-be batched, because creating the plan up front is the intended usage.
+A `cd` prefix (`cd x && tk start s1`), real work in the same command, or a redirect drops a
+step transition out of the progress view, so the timeline silently disagrees with what
+happened. A sequence of tk lifecycle commands (`tk close s1 "done"; tk start s2`, or a batch
+of creates followed by the first start) is allowed: the view applies the `Updated` lines of
+one output in transcript order, so a step boundary costs one tool call. `tk create` on its
+own is exempt -- it may be batched, because creating the plan up front is the intended usage.
+Capturing a create's id to start it in the same call (`S1=$(tk create ...); tk start "$S1"`)
+is blocked as a command before the start: the assignment swallows the `Created` line.
 
 Tokenising again lives in the `.py`, single-sourced with P3.
 
@@ -109,6 +121,88 @@ continue, replace or close them.
 before the next turn, at stop, or riding a tool result -- because harnesses differ in which of
 those can reach the model at all. The invariant is only that an agent with open steps is told
 about them before it does more work.
+
+### P8. A chat agent tells the user when a turn leaves them something
+**Prose-only** (`AGENTS.md` and the `notify-user` skill); no hook on any harness.
+
+The user may have walked away the moment they sent the message, and nothing about a finished
+turn reaches them on its own. When a turn ends with something the user will want to know about
+or act on -- a finished deliverable, a result they were waiting for, or a question only they can
+answer -- a chat agent sends one notification (`.agents/skills/notify-user`), so the app's feed
+-- and its banner, when the user is looking elsewhere -- can bring them back to the chat. The
+amount of work or time is not the test: a turn that produced nothing of that kind (chitchat, an
+acknowledgement, progress with no result yet, the answer to a trivial question) sends none, and
+no turn sends more than one.
+
+**The judgement stays with the agent.** Whether the user cares about a turn's outcome is not
+decidable from outside, and no count of steps or minutes stands in for it. The agent decides as
+it finishes, and never narrates the decision.
+
+**Why there is no hook.** A Stop hook reaches the model only by refusing the stop; claude then
+injects the hook's text as a user message and runs a further assistant turn, which the chat
+renders as a "Stop hook feedback" chip followed by a duplicated reply. An unconditional
+per-turn ask therefore doubled every chat turn in the minds-v0.7.0 staging rehearsal
+(2026-09-22) and was removed. pi and agy have no stop channel that reaches the model at all.
+
+**Chats only.** A worker's result reaches the user through the chat that launched it, and only
+chats appear in the feed; `MNGR_AGENT_ROLE=chat` (set by the `chat` create template) is how a
+chat is told apart.
+
+### P9. A secret file is read only by `with_secrets.py`
+`agent_secrets_guard.sh` -> `agent_secrets_guard_check.py` -- **hard block.**
+
+A file under `data/.secrets/` holds a value the user typed into the chat's **secret card**
+(the `connect-external-service` skill's `request_secret.py`) so that it would never enter the
+transcript. A `cat`, a `source`, a `sed`, a `python3 -c`, a redirect, or a `Read`/`Edit` tool call
+on such a file puts the value into a tool call, which defeats the point. The one sanctioned
+reader is `system/scripts/with_secrets.py`, which puts the file's variables into a child
+process's environment and execs the command; `ls` and `rm` on the directory are allowed, and so
+is the request script, whose output names the path it will write. The directory's README is not
+a secret. A workspace set up before MCP servers went through latchkey may still hold mcpc's
+store at `data/.secrets/mcpc/`, so a mention of `~/.mcpc` (its link) counts as a mention of
+the directory.
+
+Two halves: the shell half tokenises the command (a quoted rationale that mentions the
+directory stays inside one token) and unwraps `bash -c "..."`, so a supervisord program that
+runs the wrapper passes, and judges the command the wrapper runs after its `--` by the same
+rule, so the wrapper does not launder a `cat` of the file; the file-tool half refuses claude's
+`Read`/`Grep`/`Glob`/`Edit`/`Write`, pi's `read`/`edit`/`write`/`grep`/`find`, and a codex
+`apply_patch` whose file lines point under the directory. Unlike the other blockers, this one
+therefore polices every tool call, not only shell calls. The checker never prints the command or
+a path back, since either may carry a value.
+
+What it guarantees is narrower than "the value never leaves the file": the checker judges the
+text of a tool call, so it catches the ordinary reads and cannot see what a program run under
+the wrapper does with its environment, nor a path spelled so that the prefilter misses it. It
+is a backstop against a slip; the skill's own rule carries the rest.
+
+### P10. A secret request must be the only thing in its tool call
+`agent_latchkey_request_standalone.sh` -> `agent_latchkey_request_check.py` -- **hard block.**
+
+P3 for the secret card: `request_secret.py` prints the filed request as JSON, and the chat builds
+the card's password inputs from that echo in the same call's result. So the call stands alone,
+for exactly the reasons P3 gives, and the same files enforce it -- the checker counts a run of
+the request script as a filing alongside a POST to the permission-requests host.
+
+### P11. A command must not wait on a foreground `sleep` of 5 seconds or more
+`agent_block_foreground_sleep.sh` -> `agent_block_foreground_sleep_check.py` -- **hard block.**
+
+A timed sleep is a guess at how long something else takes, and it holds the agent's turn for the
+whole guess: a message to the agent waits until it ends, and so does the agent when the thing it
+waits on finished early. The agent waits on the event instead -- a command run in the background
+(`run_in_background.py`) wakes it when it ends, and a state is checked with short sleeps
+(`until curl -sf URL; do sleep 1; done`). A sleep is judged wherever it runs as a command of its
+own, chained, alone, or in a loop or branch body; one under 5 seconds is allowed, and so is one
+in a list the command sends to the background with `&`, one that is only an argument (the command
+handed to `run_in_background.py`), or one in a call claude runs with `run_in_background`. A wait
+that really is about time belongs inside a background command. `AGENTS.md` carries the same rule
+as prose.
+
+The checker reads segments, not the shell's grouping, so it is a seatbelt with known gaps: a `;`
+inside a backgrounded group (`{ sleep 30; } &`) and a heredoc body holding a sleep are blocked, and
+a sleep behind a wrapper (`timeout`, `nohup`, `exec`, `env`), one with a non-literal duration, or
+one cleared by an inner `&` (`sleep 30 && (cmd &)`) gets through. The checker's docstring lists them
+all.
 
 ## The rule that keeps this honest
 

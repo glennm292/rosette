@@ -1,0 +1,3482 @@
+/**
+ * ``DesktopStore``: the one class with mutable fields (desktop-interface plan section 6.2). It
+ * holds this client's state (the record the reducers step), the theme metrics and the backdrop
+ * size the geometry needs, the gesture in progress, and whether the launcher is open; applies
+ * the reducers; schedules redraws; saves the layout with a debounce, a save id, and the stamp it
+ * was based on (a stale save is refused with 409 and the layout refetched); and subscribes to
+ * the socket. Everything that reads or writes the shell goes through here, the phone layout's showing of one
+ * window at a time included (plan-phone-interface.md): a phone never writes a placement, lands where it
+ * left off, and opens every window on the first desktop, out of every other client's sight.
+ */
+
+import type {
+  LaunchOutcome,
+  LaunchRequest,
+  LaunchTarget,
+  PageShowOutcome,
+  PageShowRequest,
+  PlacementsSaveRequest,
+  WindowOpenOutcome,
+  WindowOpenRequest,
+} from "../model/api";
+import {
+  OPEN_FILE_MESSAGE,
+  OPEN_URL_MESSAGE,
+  classifyLink,
+  externalLinkMessageType,
+  isCustomSchemeLink,
+} from "@imbue/workspace-ui/src/links";
+import { StalePlacementsSaveError } from "../model/api";
+import { refreshShellKeybindings } from "../model/keybindings";
+import {
+  NO_DRAFT_APP_REASON,
+  NO_TEXT_APP_REASON,
+  appChatLaunchOf,
+  appChatParams,
+  appShortcutsOf,
+  draftRowsOf,
+  freeTextParams,
+  freeTextRowsOf,
+  launchPathOf,
+  launchRowKindOf,
+  mentionParams,
+  mentionRowsOf,
+  textRowDisabledReason,
+} from "../model/launch";
+import { applyPresence, getOwnIdentity, getOwnParticipant } from "../model/Presence";
+import { applyRoster, getRoster } from "../model/Roster";
+import { isClientOf, isOwnDesktop, ownDesktops, ownerEntryOf } from "../model/Ownership";
+import { applyChatsActivity } from "../model/ChatsActivity";
+import {
+  isMentionOf,
+  nextExpiryOf,
+  raisesBubble,
+  withBubble,
+  withoutChat,
+  withoutExpired,
+  withoutSpeaker,
+} from "../model/Bubbles";
+import type { BubbleStack } from "../model/Bubbles";
+import { labelForApp, pinPageOfLink, shareDomainOf, windowAtBackendUrl, windowAtLocalAppHost } from "../model/pageUrl";
+import type {
+  AppRecord,
+  AvatarCatalog,
+  AvatarDesign,
+  BubbleWire,
+  ClientArrival,
+  ClientRecord,
+  Desktop,
+  DesktopShortcut,
+  EntryMode,
+  EntryPresentation,
+  FloatingPosition,
+  Frame,
+  GridCell,
+  IfPresent,
+  Inventory,
+  LaunchPath,
+  Layout,
+  MessageRelay,
+  OwnerLayout,
+  Placement,
+  PresentUser,
+  RosterParticipant,
+  ShortcutMode,
+  Wallpaper,
+  WindowRecord,
+  WindowState,
+} from "../model/records";
+import { isSameCell, isSameWindowPaths, shortcutKey } from "../model/records";
+import { ToastQueue } from "@imbue/workspace-ui/src/models/toasts";
+import { OwnIdMinter, PAGE_ID_PREFIX, REPORT_ID_PREFIX, SAVE_ID_PREFIX, mintHex } from "../model/ownIds";
+import { isPreviewShell } from "../model/PreviewShell";
+import { noticeFromWire } from "../model/UpdateNotice";
+import { applyResourceGauge, viewFromWire as resourceGaugeFromWire } from "../model/resourceGauge";
+import type { DeepLink } from "../model/deepLinks";
+import {
+  backdropFrameOf,
+  fitFrameToBackdrop,
+  fitStateFrame,
+  frameForState,
+  frameFromPixels,
+  frameToPixels,
+  movedRect,
+  resizedRect,
+  snapFrame,
+  snapZoneForRelease,
+  unsnapFrame,
+} from "../geometry/frames";
+import type { PixelPoint, PixelRect, PixelSize, ResizeEdge, SnapZone } from "../geometry/frames";
+import { letterboxFor } from "../geometry/letterbox";
+import type { Letterbox } from "../geometry/letterbox";
+import { defaultFloatingPosition, floatingEntryRect, floatingPositionFromPixels } from "../geometry/floating";
+import {
+  cellAtPoint,
+  cellRect,
+  gridDimensions,
+  placeShortcuts,
+  placedShortcutKey,
+  withRoomMadeFor,
+} from "../geometry/grid";
+import {
+  chromeOf,
+  EMPTY_THEME_CATALOG,
+  resolveDesktopTheme,
+  type ThemeCatalog,
+  type ThemeChrome,
+  type ThemeRecord,
+} from "../model/themes";
+import type { GridDimensions, PlacedShortcut } from "../geometry/grid";
+import { isPlacementShown, placementOf } from "../geometry/stack";
+import {
+  activeDesktop,
+  activeFocusedWindowId,
+  activePlacements,
+  appByName,
+  avatarPinnedEntryOf,
+  desktopById,
+  detachedWindowsOf,
+  draftTargetOf,
+  effectiveWindow,
+  effectiveWindowTitle,
+  entryLook,
+  findWindow,
+  initialDesktopState,
+  isAppStoppable,
+  isChatOnScreen,
+  isEmbedderMessageHandled,
+  isLayoutDirty,
+  openableApps,
+  pinnedWindowOf,
+  reduceDesktopState,
+  shownHistoryEntry,
+  withShownRecorded,
+} from "../reducers/desktopState";
+import type {
+  DesktopEvent,
+  DesktopState,
+  DetachedWindowReport,
+  PhoneSheet,
+  PhoneShown,
+} from "../reducers/desktopState";
+import { focusTargetOf, isShownWindowGone, phoneLanding, shownWindowOf } from "../reducers/phone";
+import {
+  STILL_CONNECTING_NOTICE,
+  cellForAddedShortcut,
+  findShortcut,
+  isShortcutOf,
+  nextDesktopName,
+  resolveLaunchRun,
+} from "../reducers/shortcuts";
+import type { ThemeMetrics, RenderModes } from "../theme/metrics";
+import { ReconnectBackoff } from "@imbue/workspace-ui/src/models/backoff";
+import type {
+  ActiveDesktopChangedEvent,
+  ClientEntriesChangedEvent,
+  DesktopSocket,
+  LayoutOpEvent,
+  PlacementsUpdatedEvent,
+} from "./socket";
+
+// A gesture's save lands shortly after it ends; the shell edits the saved layout for agent ops, and
+// an op that follows a gesture has to see the gesture in the file.
+const SAVE_DEBOUNCE_MS = 300;
+
+/** How often a window viewing somebody else's desktop re-reads the owner's layout when no ``placements_updated``
+ *  push has arrived (the multiplayer spec, section 8.3): the pushes are the live signal, this the backstop. */
+const VIEWING_REFRESH_INTERVAL_MS = 10_000;
+
+/** How long after the backdrop last changed size the desktop layout reports it: a window being resized changes
+ *  size many times a second, and only where it settles matters to a window viewing this client's desktop. */
+export const VIEWPORT_REPORT_DEBOUNCE_MS = 300;
+
+/** Why a window switches desktops: the user chose one ("user"), the bootstrap lands it ("landing"), or it follows the
+ *  client's stored desktop, pushed or re-read ("follow"). The first two move the client; a follow moves nothing. */
+export type SwitchCause = "user" | "landing" | "follow";
+
+// How long a solo shell whose first layout does not say its window is out waits for the desktop's word before
+// writing the detach itself: the main window's shell writes it as the window leaves, and that save is on its
+// way while the solo shell boots, so a first load that beats it is followed by the broadcast within this.
+const SOLO_HEAL_GRACE_MS = 1000;
+
+/** The routes the store calls, injectable so the store is tested against a fake shell. */
+export interface DesktopApi {
+  /** The desktops, the apps, and the clients in one read (contracts.md section 5.5): what a page boots from. */
+  fetchInventory(): Promise<Inventory>;
+  /** Create a desktop named ``name``, owned by this client's participant; the shell picks the rest. */
+  createDesktop(name: string): Promise<Desktop>;
+  renameDesktop(desktopId: string, name: string): Promise<Desktop>;
+  /** Put the participant's own desktops in this order (every one of theirs, once); answers every desktop. */
+  reorderDesktops(desktopIds: readonly string[]): Promise<Desktop[]>;
+  setDesktopWallpaper(desktopId: string, wallpaper: Wallpaper | null): Promise<Desktop>;
+  setDesktopTheme(desktopId: string, theme: string | null): Promise<Desktop>;
+  /** The workspace's themes and its default (workspace-themes plan section 5.2). */
+  fetchThemes(): Promise<ThemeCatalog>;
+  setDefaultTheme(theme: string | null): Promise<void>;
+  /** Turn a themeable app's theming on or off (workspace-themes plan section 7.1). */
+  setAppTheming(app: string, isOn: boolean): Promise<void>;
+  deleteDesktop(desktopId: string): Promise<string>;
+  setDesktopShortcut(desktopId: string, shortcut: DesktopShortcut): Promise<Desktop>;
+  moveDesktopShortcut(desktopId: string, app: string, launch: string, cell: GridCell): Promise<Desktop>;
+  removeDesktopShortcut(desktopId: string, app: string, launch: string): Promise<Desktop>;
+  openWindow(desktopId: string, request: WindowOpenRequest): Promise<WindowOpenOutcome>;
+  /** Run a launch path (post-launch-paths plan section 5.3): the shell resolves the page and opens or navigates. */
+  launch(desktopId: string, request: LaunchRequest): Promise<LaunchOutcome>;
+  /** The ``show`` op for this client (contracts.md section 5.3): the shell chooses the window. */
+  showPage(clientId: string, request: PageShowRequest): Promise<PageShowOutcome>;
+  closeWindow(desktopId: string, windowId: string): Promise<void>;
+  reportWindowLocation(
+    desktopId: string,
+    windowId: string,
+    clientId: string,
+    path: string,
+    title: string,
+  ): Promise<WindowRecord>;
+  fetchPlacements(desktopId: string, clientId: string): Promise<Layout>;
+  /** The desktop as its owner last arranged it (the multiplayer spec, section 8.3), for a window viewing it, with
+   *  the backdrop size their client arranged it in. */
+  fetchOwnerPlacements(desktopId: string): Promise<OwnerLayout>;
+  savePlacements(desktopId: string, request: PlacementsSaveRequest): Promise<string | null>;
+  arriveClient(clientId: string): Promise<ClientArrival>;
+  fetchClients(): Promise<ClientRecord[]>;
+  /** Record what this client's phone layout shows: a window, or the home grid for null. */
+  recordShown(clientId: string, windowId: string | null): Promise<ClientRecord>;
+  /** Record the backdrop size this client's desktop layout draws its frames in (section 8.3). */
+  reportViewport(clientId: string, viewport: PixelSize): Promise<ClientRecord>;
+  quitApp(appName: string): Promise<void>;
+  setEntryPresentation(clientId: string, app: string, presentation: EntryPresentation): Promise<ClientRecord>;
+  fetchAvatars(): Promise<AvatarCatalog>;
+  selectAvatar(design: string): Promise<void>;
+  relayEmbedderMessage(
+    type: string,
+    clientId: string,
+    payload: Readonly<Record<string, unknown>>,
+    sender: string,
+  ): Promise<MessageRelay>;
+}
+
+/** A message this page received, from the Imbue Studio chrome or from an app's frame: its type and its own fields. */
+export type EmbedderMessage = { readonly type: string } & Readonly<Record<string, unknown>>;
+
+/** The sender the relay names for a message the Imbue Studio chrome sent (contracts.md section 5.6). */
+export const EMBEDDER_SENDER = "embedder";
+
+/** What a link to another workspace's app gets, since only that workspace can open it. */
+export const OTHER_WORKSPACE_LINK_NOTICE = "That link belongs to another workspace, so it cannot open here.";
+
+/** What a page shown or a window opened on this client's desktop gets while the client has only pop-outs open. */
+export const SHOWN_WITH_NO_DESKTOP_WINDOW_NOTICE =
+  "It opened on your desktop. Reopen the main Imbue Studio window to see it.";
+
+/** Why a click on a person's tray entry went nowhere: no app takes a mention of them. */
+export const NO_MENTION_APP_REASON = "No app in this workspace can open a chat with them";
+/** Why a window's "Chat about this app" went nowhere: no app declares a launch path about an app. */
+export const NO_APP_CHAT_REASON = "No app in this workspace can open a chat about an app";
+/** Why a chat could not be shown: no app takes the message that shows one. */
+export const NO_CHAT_APP_REASON = "No app in this workspace shows a chat";
+/** What a change refused while this window views somebody else's desktop gets (the multiplayer spec, section 8.3). */
+export const STOP_VIEWING_FIRST_NOTICE = "Stop viewing first";
+/** What "Stop viewing" says when it could not ask the shell where to go; pressing it again asks again. */
+export const STOP_VIEWING_UNANSWERED_NOTICE = "Couldn't leave this desktop: the workspace did not answer";
+/** What "Stop viewing" says when the viewer has no desktop of their own to go to (the workspace owner after
+ *  deleting all of theirs; a visitor is always seeded one). */
+export const STOP_VIEWING_NOWHERE_NOTICE = "Couldn't leave this desktop: you have no desktop of your own to go to";
+/** How long a tray entry wears its hop class: a little past style.css's 420ms ``tray-hop``, so the class outlives
+ *  the animation. */
+export const TRAY_HOP_MS = 450;
+/** The message that shows a chat, as the Imbue Studio app's notifications send it (the chat app registers for it). */
+export const FOCUS_CHAT_MESSAGE_TYPE = "minds:focus-chat";
+/** The sender a message of the shell's own is relayed as (for the relay's logs). */
+export const SHELL_SENDER = "system_interface";
+
+/** What the live-page layer does for the store, registered by that layer (it sits above the store). */
+export interface PageDriver {
+  /** Reload one window's page. */
+  reload(windowId: string): void;
+  /** Reload every page of an app. */
+  reloadApp(appName: string): void;
+  /** Send every page of an app the theme it wears again (its theming was turned on or off). */
+  resendTheme(appName: string): void;
+  /** Tell every greeted page somebody changed a keybinding, so it re-fetches its resolved chords. */
+  broadcastKeybindingsChanged(): void;
+  /** Send the page ``shell:close-request`` (the Imbue Studio close chord). */
+  requestClose(windowId: string): void;
+  /** Whether the window's page declared it owns the close chord (``closeChord: true``). */
+  ownsCloseChord(windowId: string): boolean;
+}
+
+/** What the shell asks the embedding chrome for when a window is pulled out (the pull-out-window spec). */
+export interface PopOutRequest {
+  readonly windowId: string;
+  readonly title: string;
+  /** The window's rendered size in CSS px. */
+  readonly width: number;
+  readonly height: number;
+}
+
+/** A title-bar drag announced to the chrome, which watches the cursor from there (the pull-out-window spec,
+ *  section 5.1): the window's rendered size and where inside it the pointer holds it, so the desktop window the
+ *  chrome opens once the cursor leaves its window is sized and held the same way. */
+export interface WindowDragRequest extends PopOutRequest {
+  readonly grabX: number;
+  readonly grabY: number;
+}
+
+/** A step of a watched drag as the chrome reports it (``minds:tear-out``): the cursor left the chrome's window
+ *  by the tear-out distance and a desktop window of the chrome's follows it, came back inside, or the button was
+ *  released while out. */
+export type TearOutPhase = "out" | "in" | "released";
+
+/** The shell's side of the pull-out conversation with the embedding chrome, injectable so the store is tested
+ *  against a recorder. Every call is a no-op without an embedder. */
+export interface PopOutBridge {
+  requestPopOut(request: PopOutRequest): void;
+  beginWindowDrag(request: WindowDragRequest): void;
+  endWindowDrag(windowId: string, isDetached: boolean, isCancelled: boolean): void;
+  reportDetachedWindows(windows: readonly DetachedWindowReport[]): void;
+}
+
+const NULL_POP_OUT_BRIDGE: PopOutBridge = {
+  requestPopOut: () => undefined,
+  beginWindowDrag: () => undefined,
+  endWindowDrag: () => undefined,
+  reportDetachedWindows: () => undefined,
+};
+
+/** Where an external link no app of the workspace takes opens: through the Imbue Studio chrome
+ *  (``minds:open-external``), or in the user's own browser when no chrome can, a custom-scheme link in the app of the
+ *  user's system it belongs to. */
+export interface OutsideLinkOpener {
+  openInEmbedder(url: string): void;
+  openInBrowser(url: string): void;
+  /** Launch a custom-scheme link by navigating this page to it, which opens no window and leaves the page where it
+   *  is: an Imbue Studio that does not take custom-scheme links shows a popup of one as an empty window. */
+  launchInSystemApp(url: string): void;
+}
+
+/** Which external links the embedder opens outside the workspace for it (``minds:embedder-capabilities``): any, and
+ *  custom-scheme ones among them. */
+export interface OutsideLinkCapabilities {
+  readonly opensExternalLinks: boolean;
+  readonly opensCustomSchemeLinks: boolean;
+}
+
+const NO_OUTSIDE_LINK_CAPABILITIES: OutsideLinkCapabilities = {
+  opensExternalLinks: false,
+  opensCustomSchemeLinks: false,
+};
+
+const NULL_OUTSIDE_LINK_OPENER: OutsideLinkOpener = {
+  openInEmbedder: () => undefined,
+  openInBrowser: () => undefined,
+  launchInSystemApp: () => undefined,
+};
+
+/** The shell's side of immersive mode (the Screen integration spec, section 5): the ask to the embedding chrome to
+ *  take the whole app window with the keyboard locked, or to give it back. Every call is a no-op without an
+ *  embedder; the store asks only once the chrome has said it can (``minds:embedder-capabilities``). */
+export interface ImmersiveBridge {
+  requestImmersive(windowId: string, isOn: boolean): void;
+}
+
+const NULL_IMMERSIVE_BRIDGE: ImmersiveBridge = {
+  requestImmersive: () => undefined,
+};
+
+/** Immersive mode as the chrome last reported it (``minds:immersive-changed``) while it is on: the window that
+ *  asked for it, when this shell did the asking, and whether the keyboard lock was obtained. */
+export interface ImmersiveStatus {
+  readonly windowId: string | null;
+  readonly isKeyboardLocked: boolean;
+}
+
+/** What the chrome says of immersive mode after every change. */
+export interface ImmersiveChange {
+  readonly isOn: boolean;
+  readonly isKeyboardLocked: boolean;
+  /** Why a request could not be honoured, when it could not. */
+  readonly error: string | null;
+}
+
+/** What the toast says when the chrome could not enter immersive mode. */
+export const IMMERSIVE_REFUSED_NOTICE = "Immersive mode could not start";
+
+// The layout verbs that edit a placement, which two shells never apply. A solo shell (the pull-out-window spec,
+// section 7.5) is a view of one window, and the desktop's arrangement belongs to the client's main window; its
+// two exceptions are its own window's detach (the first load's fallback, when no desktop shell wrote it) and
+// reattach (the way back when no desktop shell can take it). The phone layout shows windows without placing them.
+const PLACEMENT_EDIT_EVENTS: ReadonlySet<DesktopEvent["type"]> = new Set([
+  "window_raised",
+  "window_minimized",
+  "window_restored",
+  "window_state_set",
+  "window_frame_set",
+  "window_detached",
+  "window_reattached",
+]);
+
+export interface StoreDependencies {
+  readonly clientId: string;
+  readonly api: DesktopApi;
+  readonly socket: DesktopSocket;
+  readonly metrics: ThemeMetrics;
+  readonly modes: RenderModes;
+  /** Schedule a redraw of the views after a state change. */
+  readonly redraw: () => void;
+  /** Reload the whole interface (the ``reload_system_interface`` op). */
+  readonly reloadInterface: () => void;
+  /** The pull-out conversation with the embedder; absent means no embedder. */
+  readonly popOut?: PopOutBridge;
+  /** Where external links open when no app takes them; absent opens none. */
+  readonly outsideLinks?: OutsideLinkOpener;
+  /** The immersive-mode conversation with the embedder; absent means no embedder. */
+  readonly immersive?: ImmersiveBridge;
+  /** The one window this shell shows edge to edge (a pulled-out window's own desktop window), else null. */
+  readonly soloWindowId?: string | null;
+  /** Whether the chrome reopened the solo window's desktop window (a session restore, a reopen of the app, a
+   *  backend retry) rather than opening it for a tear-out just now; absent means a tear-out, as an older chrome
+   *  says. */
+  readonly isSoloReopened?: boolean;
+}
+
+/** A navigation this client asked for on its own page (the chooser's draft), which the live pages honour
+ *  even where the page just reported leaving that very path. */
+export interface OwnNavigation {
+  readonly windowId: string;
+  readonly path: string;
+}
+
+/** A window move in progress: the rendered rectangle it started from and where it is now. */
+export interface MoveGesture {
+  readonly kind: "move";
+  readonly windowId: string;
+  readonly startRect: PixelRect;
+  readonly startPointer: PixelPoint;
+  readonly currentRect: PixelRect;
+  /** The snap zone the pointer is in right now, drawn as the preview; applied on release. */
+  readonly zone: SnapZone | null;
+  /** Whether a snapped or maximized window has been un-snapped by this drag. */
+  readonly isUnsnapped: boolean;
+  /** Whether the chrome watches this drag (``minds:window-drag-started`` went out): it opens a desktop window of
+   *  its own once the cursor leaves its window, and hears when the gesture ends here. */
+  readonly isWatched: boolean;
+  /** Whether the chrome reported the cursor past its window by the tear-out distance: it is dragging a desktop
+   *  window of its own under the cursor, and this one is hidden until the drag comes back inside or ends (the
+   *  pull-out-window spec). */
+  readonly isTearingOut: boolean;
+}
+
+export interface ResizeGesture {
+  readonly kind: "resize";
+  readonly windowId: string;
+  readonly edge: ResizeEdge;
+  readonly startRect: PixelRect;
+  readonly currentRect: PixelRect;
+}
+
+export interface ShortcutGesture {
+  readonly kind: "shortcut";
+  readonly app: string;
+  readonly launch: string;
+  /** The cell it was lifted from: the box it is drawn in for the whole drag, which the lift translates
+   *  rather than moves, so the icon stays exactly where it was grabbed under the hand. */
+  readonly originCell: GridCell;
+  /** How far the pointer has travelled since the press: what the lifted icon is translated by. */
+  readonly lift: PixelPoint;
+  /** The cell the pointer is over: where the icon would land, and what the shortcut in it steps aside from. */
+  readonly targetCell: GridCell;
+}
+
+/** A floating entry being dragged: its box's top-left corner follows the pointer less the grab offset. */
+export interface FloatingEntryGesture {
+  readonly kind: "floating-entry";
+  readonly app: string;
+  readonly grabOffset: PixelPoint;
+  readonly currentRect: PixelRect;
+}
+
+/** A shortcut and the cell it should take: what an optimistic write of the desktop names, one per shortcut. */
+interface ShortcutCellUpdate {
+  readonly app: string;
+  readonly launch: string;
+  readonly cell: GridCell;
+}
+
+export type ActiveGesture = MoveGesture | ResizeGesture | ShortcutGesture | FloatingEntryGesture;
+
+/** A watched drag this shell ended on its own release, whose last word from the chrome may still be on its way. */
+interface ReleasedWatchedDrag {
+  readonly windowId: string;
+  readonly isDetached: boolean;
+  /** The window's placement as the drag began, which a late pull-out puts back before detaching it. */
+  readonly placementAtStart: Placement;
+}
+
+type Listener = () => void;
+
+/** The theme this client wears, and whether it is a choice Desktop settings shows without having saved it. */
+export interface ShownTheme {
+  readonly record: ThemeRecord;
+  readonly isPreview: boolean;
+}
+
+type ShownThemeListener = (shown: ShownTheme) => void;
+
+export class DesktopStore {
+  private state: DesktopState;
+  private metrics: ThemeMetrics;
+  private backdrop: PixelSize = { width: 0, height: 0 };
+  private gesture: ActiveGesture | null = null;
+  private releasedWatchedDrag: ReleasedWatchedDrag | null = null;
+  private isLauncherOpenNow = false;
+  // Set when the shell had to seed a fresh desktop for this user at arrival; the notice shows once.
+  private replacedDesktop: ReplacedDesktop | null = null;
+  /** A theme picked in a desktop's settings and not yet saved: shown while that desktop is on screen. */
+  private themePreview: { readonly desktopId: string; readonly choice: string | null } | null = null;
+  /** The workspace's themes as the shell last answered or pushed them. */
+  private themeCatalog: ThemeCatalog = EMPTY_THEME_CATALOG;
+  private hasThemeCatalog = false;
+  /** Until the first catalog arrives the client cannot know its theme, so a failed read is retried, further apart
+   *  each time. */
+  private readonly themeReadBackoff = new ReconnectBackoff();
+  private themeReadRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly shownThemeListeners = new Set<ShownThemeListener>();
+  /** The shown theme the listeners last heard. */
+  private lastShownTheme: ShownTheme | null = null;
+  private readonly listeners = new Set<Listener>();
+  private readonly saveIds = new OwnIdMinter(SAVE_ID_PREFIX);
+  private readonly reportIds = new OwnIdMinter(REPORT_ID_PREFIX);
+  private readonly pageId = `${PAGE_ID_PREFIX}${mintHex()}`;
+  // The newest revision of the client's stored desktop this window has heard of, pushed or read: news of an older
+  // one was overtaken by a later move on its way here.
+  private desktopRevisionHeard = 0;
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private saveInFlight: Promise<void> | null = null;
+  private layoutFetchSequence = 0;
+  private pageDriver: PageDriver | null = null;
+  private hasSocketConnected = false;
+  // The path each window's page reported last, so a report answered out of order is not applied.
+  private readonly latestReportedPaths = new Map<string, string>();
+  /** The one navigation this client asked for itself and has not yet followed (``navigateOwnWindow``). */
+  private ownNavigation: OwnNavigation | null = null;
+  // Bumped by every desktops record the shell hands over (the bootstrap's read, each broadcast, its answer to a
+  // linked window's navigate this window landed), and not by a local edit: the live pages follow their windows'
+  // stored paths after the shell speaks.
+  private desktopsRevision = 0;
+  // Bumped by every layout the shell hands over: an independent window's stored path arrives with the layout.
+  private layoutLoadsRevision = 0;
+  // Bumped by every push of the workspace's selection and of this client's entries: a read issued before a
+  // push answers older than the push, and must not overwrite it.
+  private avatarSelectionPushes = 0;
+  private entryPushes = 0;
+  // Bumped by every pushed theme catalog, by this client's own change of the default, and by every read of the
+  // catalog as the read starts: a read answers only if none of them came since.
+  private themeCatalogChanges = 0;
+  // Resolved by the first app list to land: the bootstrap's inventory read, or the socket's ``apps_updated`` when
+  // the socket is quicker; a deep link's open or launch waits for it.
+  private readonly appsLoaded: Promise<void>;
+  private markAppsLoaded: () => void = () => undefined;
+  private readonly popOut: PopOutBridge;
+  private readonly outsideLinks: OutsideLinkOpener;
+  private readonly immersiveBridge: ImmersiveBridge;
+  private readonly soloWindowId: string | null;
+  /** Whether the embedder can pull a window out; off until it says so (an older chrome, a plain browser). */
+  private canPopOut = false;
+  /** Which external links the embedder opens outside the workspace for it; none until it says so. */
+  private outsideLinkCapabilities = NO_OUTSIDE_LINK_CAPABILITIES;
+  /** Whether the embedder opens its settings for the files shared from the user's computer; off until it says so. */
+  private opensLocalFiles = false;
+  /** Whether the embedder takes immersive-mode requests; off until it says so (an older chrome, a plain browser). */
+  private canImmerse = false;
+  /** Immersive mode while the chrome says it is on; never persisted (the integration spec, S4). */
+  private immersive: ImmersiveStatus | null = null;
+  /** The window whose immersive request is out and unanswered, so the answer can be credited to it. */
+  private immersiveRequestWindowId: string | null = null;
+  /** The detached set as last reported to the embedder, serialized, so a redraw reports nothing new. */
+  private lastReportedDetached: string | null = null;
+  /** Solo mode's first layout load is still owed: the one load that may re-detach the solo window. */
+  private isSoloFirstLayoutPending: boolean;
+  /** The grace a solo shell gives the desktop's detach save before writing the detach itself. */
+  private soloHealTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A solo shell's reattach is on its way to the shell: the detached-set report waits for it to land, since
+   *  the chrome closes this window on a report without its window, which would abort the save. */
+  private isReportHeldForSave = false;
+  /** A window an agent op showed this phone before the desktops update that brings it landed. */
+  private pendingPhoneShowId: string | null = null;
+  /** Whether the page was out of sight since the socket last connected: a reconnect then reloads the phone's page,
+   *  whose own connection most likely went down with the shell's. */
+  private isHiddenSinceConnect = false;
+  /** The notes a refusal leaves on screen (plan-phone-interface.md's toasts). */
+  readonly toasts: ToastQueue;
+  /** The speech bubbles up over the tray (the multiplayer spec, section 6.5), in arrival order. */
+  private bubbles: BubbleStack = [];
+  private bubbleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The roster entries connected at the last push, so one that just became connected hops. */
+  private connectedKeys: ReadonlySet<string> = new Set();
+  /** The tray entries hopping now, and the one timer that ends the hop. */
+  private hopping: ReadonlySet<string> = new Set();
+  private hopTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Whether an Imbue Studio chrome frames this page and has said what it can do: the tray's share button is
+   *  drawn only then, since it sends the chrome a message. */
+  private isEmbedderPresent = false;
+  /** The clients as last read: what each person is looking at (the multiplayer spec, section 6.3). */
+  private clients: readonly ClientRecord[] = [];
+  /** Where every client's stored desktop moved since the clients were read, by client id: the
+   *  ``active_desktop_changed`` news is every client's, so the tray can ring the owner of a desktop someone else is
+   *  viewing (the multiplayer spec, section 8.3). */
+  private readonly clientDesktopsHeard = new Map<string, string>();
+  /** Whether the overview is up over the backdrop (the multiplayer spec, section 8.2). */
+  private isOverviewOpenNow = false;
+  /** This client's layouts of the desktops the overview draws thumbnails of, read once each while it is open; a
+   *  desktop whose read is on its way has no entry yet. Cleared with the overview, whichever way it closes, so
+   *  the next open reads them again. */
+  private readonly overviewLayouts = new Map<string, Layout>();
+  private readonly overviewLayoutReads = new Set<string>();
+  /** The desktop whose deletion the overview is confirming in place, or null. */
+  private overviewDeletingId: string | null = null;
+  /** The desktop whose name the overview is editing in place, or null. */
+  private overviewRenamingId: string | null = null;
+  /** While this window views a desktop that is not the viewer's own, the desktop it was on, to go back to; null
+   *  when it came from nowhere of its own (section 8.3). */
+  private returnDesktopId: string | null = null;
+  /** The viewed desktop's fallback refresh, running only while viewing: the owner's saves push
+   *  ``placements_updated``, so this covers a missed push alone. */
+  private viewingRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  /** The backdrop size the viewed desktop's owner arranged it in, from the last owner-layout read; null while not
+   *  viewing, or when their client never reported one (the layout is then drawn at this backdrop's size). */
+  private viewedViewport: PixelSize | null = null;
+  /** The backdrop size report (section 8.3): whether the arrival has settled (the record it writes to exists only
+   *  then), the size last reported, and the debounce of the next report. */
+  private isArrivalSettled = false;
+  private lastReportedViewport: PixelSize | null = null;
+  private viewportReportTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(private readonly deps: StoreDependencies) {
+    this.state = initialDesktopState(deps.clientId, deps.modes);
+    this.metrics = deps.metrics;
+    this.popOut = deps.popOut ?? NULL_POP_OUT_BRIDGE;
+    this.outsideLinks = deps.outsideLinks ?? NULL_OUTSIDE_LINK_OPENER;
+    this.immersiveBridge = deps.immersive ?? NULL_IMMERSIVE_BRIDGE;
+    this.soloWindowId = deps.soloWindowId ?? null;
+    this.isSoloFirstLayoutPending = this.soloWindowId !== null;
+    this.appsLoaded = new Promise((resolve) => {
+      this.markAppsLoaded = resolve;
+    });
+    this.toasts = new ToastQueue(() => this.notifyListeners());
+  }
+
+  /** Tell the user about a refusal. */
+  private toast(message: string): void {
+    this.toasts.show(message);
+  }
+
+  /** Whether this window is viewing somebody else's desktop, in which case the change named by ``action`` is
+   *  refused (the multiplayer spec, section 8.3: a viewed desktop is looked at, never arranged) and the user told
+   *  once per gesture: a note already up covers the rest of the gesture (a restore that raises, a close that
+   *  minimizes), so the refusals of one press raise one note. */
+  private refuseWhileViewing(action: string): boolean {
+    if (this.viewedDesktop() === null) return false;
+    console.info(`[si] refused to ${action} while viewing somebody else's desktop`);
+    if (!this.toasts.current().some((toast) => toast.message === STOP_VIEWING_FIRST_NOTICE)) {
+      this.toast(STOP_VIEWING_FIRST_NOTICE);
+    }
+    return true;
+  }
+
+  /** The one window this shell shows alone, or null for the whole desktop. */
+  getSoloWindowId(): string | null {
+    return this.soloWindowId;
+  }
+
+  /** Whether the embedder can pull a window out into a desktop window of its own. */
+  getCanPopOut(): boolean {
+    return this.canPopOut;
+  }
+
+  /** The embedder said what it can do (``minds:embedder-capabilities``). */
+  setCanPopOut(canPopOut: boolean): void {
+    if (this.canPopOut === canPopOut) return;
+    this.canPopOut = canPopOut;
+    this.notifyListeners();
+  }
+
+  /** The embedder said which external links it opens for the workspace (``minds:embedder-capabilities``). */
+  setOutsideLinkCapabilities(capabilities: OutsideLinkCapabilities): void {
+    this.outsideLinkCapabilities = capabilities;
+  }
+
+  /** Whether the embedder opens its settings for the files shared from the user's computer, which each page is told
+   *  in its handshake. */
+  getOpensLocalFiles(): boolean {
+    return this.opensLocalFiles;
+  }
+
+  /** The embedder said whether it opens its settings for shared files (``minds:embedder-capabilities``). Pages
+   *  already greeted hear it as the shell's rebroadcast of that message. */
+  setOpensLocalFiles(opensLocalFiles: boolean): void {
+    this.opensLocalFiles = opensLocalFiles;
+  }
+
+  /** Whether the embedder can take the app window immersive for a window of this desktop. */
+  getCanImmerse(): boolean {
+    return this.canImmerse;
+  }
+
+  /** The embedder said whether it takes immersive-mode requests (``minds:embedder-capabilities``). */
+  setCanImmerse(canImmerse: boolean): void {
+    if (this.canImmerse === canImmerse) return;
+    this.canImmerse = canImmerse;
+    this.notifyListeners();
+  }
+
+  /** Immersive mode as the chrome last reported it, or null while it is off. */
+  getImmersive(): ImmersiveStatus | null {
+    return this.immersive;
+  }
+
+  /** Ask the chrome to take the app window immersive for ``windowId`` (the fullscreen strip's or the window menu's
+   *  "Immersive"). Called straight from the click handler: the chrome needs the gesture's activation for its
+   *  fullscreen request, so nothing may wait between the click and the send. Nothing is asked of a chrome that
+   *  never said it could. */
+  requestImmersive(windowId: string): void {
+    if (!this.canImmerse || findWindow(this.state, windowId) === null) return;
+    this.immersiveRequestWindowId = windowId;
+    this.immersiveBridge.requestImmersive(windowId, true);
+  }
+
+  /** Ask the chrome to leave immersive mode (the strip's control, the menu's row); the mode ends when the chrome
+   *  says so. The ask names the window that entered it, else ``windowId``, the one the control belongs to: the
+   *  contract validates the id, so a mode the chrome entered on its own still needs a real one to leave by. */
+  leaveImmersive(windowId: string): void {
+    const immersive = this.immersive;
+    if (immersive === null) return;
+    this.immersiveBridge.requestImmersive(immersive.windowId ?? this.immersiveRequestWindowId ?? windowId, false);
+  }
+
+  /** The chrome said immersive mode changed (``minds:immersive-changed``), by a request of this shell's or on its
+   *  own (the user held Escape, the OS left fullscreen). A refused request is a toast. */
+  onImmersiveChanged(change: ImmersiveChange): void {
+    if (change.error !== null) this.toast(`${IMMERSIVE_REFUSED_NOTICE}: ${change.error}`);
+    this.immersive = change.isOn
+      ? { windowId: this.immersiveRequestWindowId, isKeyboardLocked: change.isKeyboardLocked }
+      : null;
+    if (!change.isOn) this.immersiveRequestWindowId = null;
+    this.notifyListeners();
+  }
+
+  /** Whether a window move in progress has pulled ``windowId`` out of the chrome's window (it is hidden meanwhile). */
+  isTearingOut(windowId: string): boolean {
+    return this.moveGestureOf(windowId)?.isTearingOut === true;
+  }
+
+  private moveGestureOf(windowId: string): MoveGesture | null {
+    const gesture = this.gesture;
+    return gesture !== null && gesture.kind === "move" && gesture.windowId === windowId ? gesture : null;
+  }
+
+  /** The chrome reported a step of the drag it watches. "out": the window is detached where it stood, its
+   *  frame untouched, and saved at once, so the chrome's own desktop window (which stands in for it under the
+   *  cursor from here) reads a placement that already says so, in this shell's stacking order; the ghost
+   *  stands where the drag began. "in": the chrome dropped that window, and this one is brought back and shown
+   *  again where the drag has it, saved at once too. "released": the button came up while out, and the gesture
+   *  is over; the placement is already what it is to be, so nothing is written. This shell is the one writer
+   *  during a drag; the chrome's window only reads. A word on a watched drag this shell already ended on its own
+   *  release still stands (``takeLateTearOut``). */
+  setTearOut(windowId: string, phase: TearOutPhase): void {
+    const gesture = this.moveGestureOf(windowId);
+    if (gesture === null) {
+      this.takeLateTearOut(windowId, phase);
+      return;
+    }
+    if (!gesture.isWatched) return;
+    if (phase === "released") {
+      if (!gesture.isTearingOut) return;
+      this.gesture = null;
+      this.notifyListeners();
+      return;
+    }
+    const isTearingOut = phase === "out";
+    if (gesture.isTearingOut === isTearingOut) return;
+    this.gesture = { ...gesture, isTearingOut, zone: isTearingOut ? null : gesture.zone };
+    if (isTearingOut) this.detachDraggedWindow(windowId);
+    else this.bringBackDraggedWindow(windowId);
+    this.notifyListeners();
+  }
+
+  /** Out: the window is detached where it stood, its frame untouched, so the ghost stands where the drag began
+   *  and a return lands there. Saved at once, since the chrome's window reads the placement as soon as it loads. */
+  private detachDraggedWindow(windowId: string): void {
+    this.dispatch({ type: "window_detached", windowId });
+    void this.flushPendingSave();
+  }
+
+  /** The chrome's word on a watched drag this shell already ended on its own release, which reached it first. The
+   *  chrome's word stands: "released" after a release inside means the chrome kept the window it pulled out, so
+   *  this one goes out too, from the placement the drag began at, as if "out" had come in time; "in" after a
+   *  release outside means the chrome dropped its window, so this one comes back. A late "out" alone changes
+   *  nothing: the chrome follows it with "released" when it keeps its window. */
+  private takeLateTearOut(windowId: string, phase: TearOutPhase): void {
+    const released = this.releasedWatchedDrag;
+    if (released === null || released.windowId !== windowId) return;
+    if (phase === "released" && !released.isDetached) {
+      const start = released.placementAtStart;
+      this.dispatch({ type: "window_frame_set", windowId, frame: start.frame });
+      if (start.state !== "NORMAL") this.dispatch({ type: "window_state_set", windowId, state: start.state });
+      this.detachDraggedWindow(windowId);
+    } else if (phase === "in" && released.isDetached) {
+      this.bringBackDraggedWindow(windowId);
+    } else {
+      return;
+    }
+    this.releasedWatchedDrag = null;
+    this.notifyListeners();
+  }
+
+  /** Back inside, or cancelled while out: the window is on the desktop again, raised (its state kept, so a
+   *  snapped window that un-snapped mid-drag is still where the drag has it), saved at once so the file never
+   *  says a window is out while the desktop shows it. */
+  private bringBackDraggedWindow(windowId: string): void {
+    if (!placementOf(this.state.layout, windowId).is_detached) return;
+    this.dispatch({ type: "window_raised", windowId });
+    void this.flushPendingSave();
+  }
+
+  getState(): DesktopState {
+    return this.state;
+  }
+
+  getMetrics(): ThemeMetrics {
+    return this.metrics;
+  }
+
+  getBackdropSize(): PixelSize {
+    return this.backdrop;
+  }
+
+  /** The letterbox a viewed desktop is drawn in (the multiplayer spec, section 8.3): the owner's backdrop scaled
+   *  down to fit this one and centred, or null while this window views nothing, or views a desktop whose owner's
+   *  client never reported its size (drawn at this backdrop's size then, as before). The desktop layout's alone:
+   *  the phone layout and a pulled-out window's shell draw no stage to scale. */
+  viewingLetterbox(): Letterbox | null {
+    if (this.isPhoneLayout() || this.soloWindowId !== null) return null;
+    if (this.viewedViewport === null || this.viewedDesktop() === null) return null;
+    return letterboxFor(this.viewedViewport, this.backdrop);
+  }
+
+  /** The backdrop the frames are fractions of: the owner's while a viewed desktop is drawn in a letterbox, else
+   *  this one. */
+  frameBackdrop(): PixelSize {
+    return this.viewingLetterbox()?.size ?? this.backdrop;
+  }
+
+  getGesture(): ActiveGesture | null {
+    return this.gesture;
+  }
+
+  isLauncherOpen(): boolean {
+    return this.isLauncherOpenNow;
+  }
+
+  /** How many times the shell has said what the desktops are; changes only with a ``desktops_updated``. */
+  getDesktopsRevision(): number {
+    return this.desktopsRevision;
+  }
+
+  /** How many times the shell has handed over a layout, which carries this client's paths for independent windows. */
+  getLayoutLoadsRevision(): number {
+    return this.layoutLoadsRevision;
+  }
+
+  gridDimensions(): GridDimensions {
+    return gridDimensions(this.frameBackdrop(), this.metrics);
+  }
+
+  /** Whether this shell can stop and start the app: supervised, not critical, not inside a critical program, and
+   *  not from a preview shell, whose stop and start would reach the live workspace's supervisord. */
+  canStopApp(app: AppRecord): boolean {
+    return !isPreviewShell() && isAppStoppable(this.state, app);
+  }
+
+  /** The rectangle a placement renders at, in backdrop pixels (the fit applied; the whole viewport for a
+   *  fullscreen window). A viewed desktop's fullscreen window fills its letterbox instead: the letterbox is the
+   *  owner's backdrop alone, and the viewer's taskbar keeps "Stop viewing" (the multiplayer spec, 8.3). */
+  renderedRect(placement: Placement): PixelRect {
+    const stateFrame = frameForState(placement.frame, placement.state);
+    if (this.viewedDesktop() === null) return fitStateFrame(stateFrame, this.backdrop, this.metrics);
+    return fitFrameToBackdrop(backdropFrameOf(stateFrame), this.frameBackdrop(), this.metrics);
+  }
+
+  /** Whether a fullscreen window is on the active desktop's screen: the desktop then paints over the taskbar's
+   *  band, which the backdrop otherwise clips. Never while viewing somebody else's desktop: their fullscreen window
+   *  is drawn inside the letterbox, and the viewer's taskbar keeps "Stop viewing" (the multiplayer spec, 8.3). */
+  isFullscreenShown(): boolean {
+    if (this.viewedDesktop() !== null) return false;
+    return activePlacements(this.state).some(
+      (placement) => isPlacementShown(placement) && placement.state === "FULLSCREEN",
+    );
+  }
+
+  subscribe(listener: Listener): () => void {
+    this.listeners.add(listener);
+    return () => void this.listeners.delete(listener);
+  }
+
+  setPageDriver(driver: PageDriver | null): void {
+    this.pageDriver = driver;
+  }
+
+  dispatch(event: DesktopEvent): void {
+    // A solo shell leaves the desktop's arrangement to the client's main window; only its own window's detach
+    // and reattach are its to write.
+    if (this.soloWindowId !== null && PLACEMENT_EDIT_EVENTS.has(event.type)) {
+      const isOwnWindow = "windowId" in event && event.windowId === this.soloWindowId;
+      const isOwnVerb = event.type === "window_detached" || event.type === "window_reattached";
+      if (!isOwnWindow || !isOwnVerb) return;
+    }
+    // A phone shows windows without placing them, so a laptop client never sees anything move.
+    if (this.isPhoneLayout() && PLACEMENT_EDIT_EVENTS.has(event.type)) return;
+    const next = reduceDesktopState(this.state, event);
+    if (next === this.state) return;
+    // Only an event that changed the layout re-arms the debounce: a broadcast landing while a save
+    // waits (every page's location report is one) must not push the save back.
+    const isLayoutChanged = next.layoutVersion !== this.state.layoutVersion;
+    this.state = next;
+    if (isLayoutChanged && isLayoutDirty(next)) this.scheduleSave();
+    this.notifyListeners();
+    this.followShownWindow();
+  }
+
+  /** Whether this shell draws the phone layout: the phone mode, and not a solo shell (which shows its one window
+   *  whatever the viewport). */
+  isPhoneLayout(): boolean {
+    return this.state.modes.isPhone && this.soloWindowId === null;
+  }
+
+  /** Keep what the phone shows honest after any change: a shown window that no desktop holds any longer sends the
+   *  phone home, a pinned window that is not the active desktop's gives way to its app's pinned window there (the
+   *  phone lists only those), and a window an agent op showed before the desktops that hold it arrived is shown once
+   *  they do. */
+  private followShownWindow(): void {
+    if (!this.isPhoneLayout() || !this.state.isDesktopsLoaded) return;
+    const pending = this.pendingPhoneShowId;
+    if (pending !== null && findWindow(this.state, pending) !== null) {
+      this.showOnPhone({ kind: "window", windowId: pending });
+      return;
+    }
+    if (isShownWindowGone(this.state)) {
+      // A sheet open when the window went (its own X, Close all, another client's close) stays open over home.
+      const sheet = this.state.phone.sheet;
+      this.showOnPhone({ kind: "home" });
+      if (sheet !== null) this.openPhoneSheet(sheet);
+      return;
+    }
+    const shown = shownWindowOf(this.state);
+    if (shown?.is_pinned !== true) return;
+    const pinned = pinnedWindowOf(this.state, shown.app);
+    if (pinned !== null && pinned.id !== shown.id) this.showOnPhone({ kind: "window", windowId: pinned.id });
+  }
+
+  /** Put ``shown`` on the phone's screen and record it with the shell, which keeps it as this client's history: a
+   *  reload lands there, and an agent reading the client sees it. Closes any open sheet. */
+  showOnPhone(shown: PhoneShown): void {
+    this.pendingPhoneShowId = null;
+    this.dispatch({ type: "phone_shown", shown });
+    this.recordShownWithShell(shown);
+  }
+
+  private recordShownWithShell(shown: PhoneShown): void {
+    const windowId = shown.kind === "window" ? shown.windowId : null;
+    void this.deps.api.recordShown(this.deps.clientId, windowId).catch((error: unknown) => {
+      console.warn("[si] could not record what the phone shows", error);
+    });
+  }
+
+  /** Take the shell's record of what this client showed. A phone showing something the record does not end on (a
+   *  show whose recording failed, or one this read overtook) keeps it as the newest entry and records it again, so
+   *  the shell, the windows sheet's order and the screen agree. */
+  private takeShownHistory(history: readonly string[]): void {
+    const shown = this.state.phone.shown;
+    if (!this.isPhoneLayout() || shown === null || history[history.length - 1] === shownHistoryEntry(shown)) {
+      this.dispatch({ type: "phone_history_loaded", history });
+      return;
+    }
+    this.dispatch({ type: "phone_history_loaded", history: withShownRecorded(history, shownHistoryEntry(shown)) });
+    this.recordShownWithShell(shown);
+  }
+
+  goHome(): void {
+    this.showOnPhone({ kind: "home" });
+  }
+
+  /** Show a window an agent op named, now if this client knows it, else once the desktops that hold it arrive. */
+  private showOnPhoneWhenKnown(windowId: string): void {
+    if (findWindow(this.state, windowId) !== null) {
+      this.showOnPhone({ kind: "window", windowId });
+      return;
+    }
+    this.pendingPhoneShowId = windowId;
+  }
+
+  /** Where the phone lands: what this client recorded last, else the pinned chat window, else home. Taken without
+   *  recording, since the history already says it. */
+  private landPhone(): void {
+    if (!this.isPhoneLayout() || this.state.phone.shown !== null || !this.state.isDesktopsLoaded) return;
+    this.dispatch({ type: "phone_shown", shown: phoneLanding(this.state) });
+  }
+
+  openPhoneSheet(sheet: PhoneSheet | null): void {
+    this.dispatch({ type: "phone_sheet_set", sheet });
+  }
+
+  /** A home tile's tap: the app's window on this client's desktop nearest the top of its stack, else its newest
+   *  window anywhere, else the launch of the app's first desktop shortcut (``appShortcutsOf``), or its first launch path
+   *  when it has none. */
+  async runHomeTile(appName: string): Promise<void> {
+    const target = focusTargetOf(this.state, appName);
+    if (target !== null) {
+      this.showOnPhone({ kind: "window", windowId: target.id });
+      return;
+    }
+    const app = appByName(this.state, appName);
+    const launch = (app === undefined ? undefined : appShortcutsOf(app)[0])?.launch ?? app?.launch_paths[0]?.id;
+    if (app === undefined || launch === undefined) {
+      this.toast(`Cannot open: ${appName} has nothing to open`);
+      return;
+    }
+    await this.runLaunch(app.name, launch, "new");
+  }
+
+  /** Close every window but the pinned one, one after another. */
+  async closeAllWindows(): Promise<void> {
+    const windows = this.state.desktops.flatMap((desktop) => desktop.windows.filter((window) => !window.is_pinned));
+    for (const window of windows) await this.closeWindow(window.id);
+  }
+
+  /** The page came back into sight or went out of it. Back in sight, the shell's word is read again, since a
+   *  phone's page sleeps while hidden and the pushes of the time away may never have arrived. */
+  onVisibilityChange(isVisible: boolean): void {
+    if (!isVisible) {
+      this.isHiddenSinceConnect = true;
+      return;
+    }
+    void this.refreshInventory();
+  }
+
+  private async refreshInventory(): Promise<void> {
+    let inventory: Inventory;
+    try {
+      inventory = await this.deps.api.fetchInventory();
+    } catch (error) {
+      console.warn("[si] could not read the inventory again", error);
+      return;
+    }
+    this.takeApps(inventory.apps);
+    // As a push: a desktop deleted while the page was away moves this client to the fallback, told to the shell.
+    this.takeDesktops(inventory.desktops);
+    this.dispatch({ type: "workspace_name_updated", workspaceName: inventory.workspace_name });
+    const own = inventory.clients.find((client) => client.id === this.deps.clientId);
+    if (own !== undefined) this.takeShownHistory(own.shown_history);
+  }
+
+  /** Schedule a redraw, telling the shown-theme listeners first when the shown theme changed. */
+  private redraw(): void {
+    this.noteShownTheme();
+    this.deps.redraw();
+  }
+
+  private notifyListeners(): void {
+    for (const listener of this.listeners) listener();
+    this.redraw();
+    this.reportDetachedWindows();
+  }
+
+  /** Tell the embedder which windows of the active desktop are pulled out, when that changed. Only once the
+   *  layout is known and, in a solo shell, its first load has settled and no reattach save is on its way: a
+   *  report without the solo window (before the layout loads, between a first load that does not yet say it
+   *  is out and the desktop's word, or before its own reattach has landed) would read, in that window's own
+   *  desktop window, as its window having been brought back, and the chrome closes that window on it. */
+  private reportDetachedWindows(): void {
+    if (!this.state.isLayoutLoaded || this.isSoloFirstLayoutPending || this.isReportHeldForSave) return;
+    const report = detachedWindowsOf(this.state);
+    const serialized = JSON.stringify(report);
+    if (serialized === this.lastReportedDetached) return;
+    this.lastReportedDetached = serialized;
+    this.popOut.reportDetachedWindows(report);
+  }
+
+  setBackdropSize(size: PixelSize): void {
+    if (size.width === this.backdrop.width && size.height === this.backdrop.height) return;
+    this.backdrop = size;
+    this.scheduleViewportReport();
+    this.notifyListeners();
+  }
+
+  /** Report the backdrop's size to the shell (the multiplayer spec, section 8.3), so a window viewing one of this
+   *  client's desktops can draw the layout at it. Only the desktop layout's: a phone's or a pulled-out window's
+   *  host is no desktop's backdrop. The first report goes as soon as the backdrop is measured and the arrival has
+   *  settled; a resize reports where it settles. */
+  private scheduleViewportReport(): void {
+    if (this.viewportReportTimer !== null) {
+      clearTimeout(this.viewportReportTimer);
+      this.viewportReportTimer = null;
+    }
+    if (!this.isArrivalSettled || this.isPhoneLayout() || this.soloWindowId !== null) return;
+    if (this.backdrop.width <= 0 || this.backdrop.height <= 0) return;
+    if (this.lastReportedViewport === null) {
+      this.reportViewport();
+      return;
+    }
+    this.viewportReportTimer = setTimeout(() => {
+      this.viewportReportTimer = null;
+      this.reportViewport();
+    }, VIEWPORT_REPORT_DEBOUNCE_MS);
+  }
+
+  private reportViewport(): void {
+    const size = this.backdrop;
+    const last = this.lastReportedViewport;
+    if (last !== null && last.width === size.width && last.height === size.height) return;
+    this.lastReportedViewport = size;
+    void this.deps.api.reportViewport(this.deps.clientId, size).catch((error: unknown) => {
+      console.warn("[si] could not report the backdrop size", error);
+    });
+  }
+
+  setThemeMetrics(metrics: ThemeMetrics, modes: RenderModes): void {
+    this.metrics = metrics;
+    // A gesture of the desktop does not carry over into the phone layout, which has none to finish it.
+    if (modes.isPhone) this.cancelGesture();
+    // The modes event always yields a new state, so the dispatch notifies and redraws.
+    this.dispatch({ type: "render_modes_changed", modes });
+    this.landPhone();
+    void this.leaveOthersDesktopOnPhone();
+    // A report waiting when the phone layout came must not go out; one that is due goes once it is gone.
+    this.scheduleViewportReport();
+  }
+
+  /** The phone layout never views (the multiplayer spec, section 8.3): a phone-width window whose active desktop
+   *  is somebody else's lands on the desktop it left for it, else the viewer's first own desktop, else the one the
+   *  shell seeds for a visitor with none; the letterbox and the way back go with the viewing. Nothing until a
+   *  heartbeat has said who the viewer is, and nothing on a desktop of their own. */
+  private async leaveOthersDesktopOnPhone(): Promise<void> {
+    const desktop = activeDesktop(this.state);
+    if (!this.isPhoneLayout() || desktop === null || getOwnIdentity() === null || this.isOwnDesktop(desktop)) return;
+    this.viewedViewport = null;
+    const target = await this.wayBackOrOwnDesktop();
+    if (target !== null && target !== this.state.activeDesktopId) await this.switchDesktop(target, "landing");
+  }
+
+  /** Resolves once the app list has landed, with the bootstrap's inventory read or the socket's first
+   *  ``apps_updated``, whichever comes first. A ``start`` that failed to read the inventory resolves without
+   *  it, so a caller that needs the apps (which of them take the Imbue Studio chrome's messages) waits on this too. */
+  whenAppsLoaded(): Promise<void> {
+    return this.appsLoaded;
+  }
+
+  /** Connect, post this client's arrival, read the inventory (the apps, the desktops, and this client's record),
+   *  land on the deep link's desktop else the one the shell answered, fetch the layout, and honour the deep
+   *  link's open or launch. The apps come with the inventory rather than waiting on the socket, so a shortcut
+   *  is never drawn for an app the page does not know yet. */
+  async start(deepLink: DeepLink): Promise<void> {
+    this.deps.socket.connect({
+      onConnected: () => this.takeConnected(),
+      onAppsUpdated: (apps) => this.takeApps(apps),
+      onDesktopsUpdated: (desktops) => this.takeDesktops(desktops),
+      onPlacementsUpdated: (event) => this.takePlacementsUpdated(event),
+      onActiveDesktopChanged: (event) => this.takeActiveDesktopChanged(event),
+      onClientEntriesChanged: (event) => this.takeClientEntriesChanged(event),
+      onAvatarStatus: (status) => this.dispatch({ type: "avatar_status_updated", status }),
+      onAvatarSelectionChanged: (design) => {
+        this.avatarSelectionPushes += 1;
+        this.dispatch({ type: "avatar_selection_updated", design, defaultDesign: null });
+      },
+      onUpdateNoticeChanged: (wire) =>
+        this.dispatch({ type: "update_notice_changed", notice: wire === null ? null : noticeFromWire(wire) }),
+      onResourceGaugeChanged: (view) => {
+        applyResourceGauge(resourceGaugeFromWire(view), this.deps.redraw);
+        this.deps.redraw();
+      },
+      onThemesChanged: (catalog) => {
+        this.themeCatalogChanges += 1;
+        this.takeThemeCatalog(catalog);
+      },
+      onKeybindingsChanged: () => {
+        void refreshShellKeybindings();
+        this.pageDriver?.broadcastKeybindingsChanged();
+      },
+      onLayoutOp: (event) => this.handleLayoutOp(event),
+      onPresenceUpdated: (users) => this.takePresence(users),
+      onRosterUpdated: (participants) => this.takeRoster(participants),
+      // A client left (its socket closed, or its record was pruned) while its person may still be here on another:
+      // the listing is read again, so a ring their viewing window held is let go of.
+      onClientsUpdated: () => void this.refreshClients(),
+      onChatsActivity: (chats) => {
+        applyChatsActivity(chats);
+        this.deps.redraw();
+      },
+      onBubble: (bubble) => this.takeBubble(bubble),
+    });
+    void this.loadAvatarSelection();
+    void this.loadThemes();
+    const entryPushesBefore = this.entryPushes;
+    // The arrival comes first: it may seed a desktop for this user, which the inventory read then includes.
+    let arrival: ClientArrival | null;
+    try {
+      arrival = await this.deps.api.arriveClient(this.deps.clientId);
+    } catch (error) {
+      console.warn("[si] the shell could not settle where this client lands", error);
+      arrival = null;
+    }
+    // The arrival wrote this client's record, which the backdrop size report (measured already, as a rule) needs.
+    this.isArrivalSettled = true;
+    this.scheduleViewportReport();
+    let inventory: Inventory;
+    try {
+      inventory = await this.deps.api.fetchInventory();
+    } catch (error) {
+      console.warn("[si] could not read the inventory", error);
+      this.toast(`Could not read the desktops and apps: ${(error as Error).message}`);
+      return;
+    }
+    // The apps before the desktops, so the first draw of a desktop's shortcuts already knows every app.
+    this.takeApps(inventory.apps);
+    this.desktopsRevision += 1;
+    this.dispatch({ type: "desktops_updated", desktops: inventory.desktops });
+    this.dispatch({ type: "workspace_name_updated", workspaceName: inventory.workspace_name });
+    this.replacedDesktop = replacedDesktopOf(arrival);
+    this.clients = inventory.clients;
+    const own = inventory.clients.find((client) => client.id === this.deps.clientId);
+    this.takeFetchedEntries(own, entryPushesBefore);
+    if (own !== undefined) {
+      this.takeShownHistory(own.shown_history);
+      this.hearDesktopRevision(own.desktop_revision);
+    }
+    // The shell's answer says where this client lands; without one (the arrival failed), the recorded desktop.
+    // A solo shell lands on the desktop that holds its window, wherever the client is.
+    const landing = arrival?.desktop_id ?? own?.active_desktop ?? null;
+    const soloDesktopId =
+      this.soloWindowId === null
+        ? null
+        : (inventory.desktops.find((desktop) => desktop.windows.some((window) => window.id === this.soloWindowId))
+            ?.id ?? null);
+    // A phone never picks a desktop: its active one is only ever the one the shell assigns on arrival.
+    const deepLinkDesktopId = this.isPhoneLayout() ? null : deepLink.desktopId;
+    const chosen = chooseInitialDesktopId(inventory.desktops, soloDesktopId ?? deepLinkDesktopId, landing);
+    if (chosen === null) return;
+    await this.switchDesktop(chosen, "landing");
+    this.landPhone();
+    if (deepLink.open === null && deepLink.launch === null) return;
+    await this.appsLoaded;
+    await this.applyDeepLink(deepLink);
+  }
+
+  /** The socket (re)opened: the shell hears which desktop this client is on. The first connect leaves
+   *  the rest to ``start``; a reconnect resynchronises, since the messages of the time apart are gone
+   *  with the socket (the shell resends the apps and desktops itself). */
+  private takeConnected(): void {
+    // A solo shell's socket is still its client's: registered as a pop-out's, the ops aimed at the client reach it.
+    if (this.soloWindowId !== null) this.deps.socket.reportPopOut();
+    const wasHidden = this.isHiddenSinceConnect;
+    this.isHiddenSinceConnect = false;
+    if (this.hasSocketConnected) {
+      void this.resyncAfterReconnect();
+      const shown = shownWindowOf(this.state);
+      if (wasHidden && this.isPhoneLayout() && shown !== null) this.pageDriver?.reload(shown.id);
+      return;
+    }
+    this.hasSocketConnected = true;
+    this.reportMove("");
+  }
+
+  /** The client record is the shell's word after a reconnect: another window of this client may have switched
+   *  desktops meanwhile (the ``active_desktop_changed`` is gone), and reporting this window's own desktop would move
+   *  the whole client back to it. So the recorded desktop is adopted as a push when it differs and is newer than
+   *  anything this window heard. A record no newer says nothing the window has not taken, and the window's own
+   *  desktop may be a switch whose report went down with the socket: it is reported as a move unless the record
+   *  already names it. News heard on the new socket while the record was being read, or while the pending save is
+   *  awaited, is newer than what this window had: the window follows it and only registers its connection here,
+   *  since its desktop may still be the one the news moved the client off.
+   *  The layout is read again either way, for the ``placements_updated`` missed, and the record's entries, the
+   *  workspace's selection, and the theme catalog too, for the ``client_entries_changed``,
+   *  ``avatar_selection_changed``, and ``themes_changed`` missed (the server resends the rest). */
+  private async resyncAfterReconnect(): Promise<void> {
+    let recorded: string | null = null;
+    let isRecordedNewer = false;
+    let isResetUnderPage = false;
+    const entryPushesBefore = this.entryPushes;
+    const heardBeforeRead = this.desktopRevisionHeard;
+    try {
+      const clients = await this.deps.api.fetchClients();
+      const own = clients.find((client) => client.id === this.deps.clientId);
+      this.takeFetchedEntries(own, entryPushesBefore);
+      if (own !== undefined) this.takeShownHistory(own.shown_history);
+      // The shell only ever raises a record's revision, so one below what this window had heard (or no record at
+      // all) means the record was reset under the page, restored or pruned: the shell counts again from there.
+      const recordedRevision = own?.desktop_revision ?? 0;
+      isResetUnderPage = this.desktopRevisionHeard === heardBeforeRead && recordedRevision < this.desktopRevisionHeard;
+      if (isResetUnderPage) this.desktopRevisionHeard = recordedRevision;
+      isRecordedNewer = this.hearDesktopRevision(recordedRevision);
+      recorded = own?.active_desktop ?? null;
+    } catch (error) {
+      console.warn("[si] could not read the client records after reconnecting", error);
+    }
+    const heardAfterRead = this.desktopRevisionHeard;
+    void this.loadAvatarSelection();
+    void this.loadThemes();
+    // The desktop shown is read after the save: a follow of news heard meanwhile waits on it to move the window.
+    await this.flushPendingSave();
+    // News is counted from the record when it set what this window has heard, newer or reset.
+    const isNewsHeard =
+      this.desktopRevisionHeard > (isRecordedNewer || isResetUnderPage ? heardAfterRead : heardBeforeRead);
+    const isRecordedKnown = recorded !== null && this.state.desktops.some((desktop) => desktop.id === recorded);
+    // A solo shell stays on its window's desktop: the recorded one is the main window's, and a report from
+    // any other desktop would omit the solo window, which the chrome reads as its return.
+    const isRecordedAdopted =
+      this.soloWindowId === null &&
+      isRecordedKnown &&
+      isRecordedNewer &&
+      !isNewsHeard &&
+      recorded !== this.state.activeDesktopId;
+    if (recorded !== null && isRecordedAdopted) {
+      await this.switchDesktop(recorded, "follow");
+      return;
+    }
+    // A window already on the recorded desktop has nothing to re-assert, and a move would undo any switch another
+    // window made after the read.
+    const isOnRecorded = isRecordedKnown && recorded === this.state.activeDesktopId;
+    if (isNewsHeard || isOnRecorded) this.reportFollowedDesktop();
+    else this.reportMove("");
+    await this.refetchLayout();
+  }
+
+  private takeApps(apps: readonly AppRecord[]): void {
+    const themingBefore = new Map(this.state.apps.map((app) => [app.name, app.theming]));
+    this.dispatch({ type: "apps_updated", apps });
+    this.markAppsLoaded();
+    for (const app of apps) {
+      const before = themingBefore.get(app.name);
+      if (before !== undefined && before !== app.theming) this.pageDriver?.resendTheme(app.name);
+    }
+  }
+
+  /** Turn a themeable app's theming on or off; every client sends its pages the theme again when the app list says
+   *  so. */
+  async setAppTheming(app: string, isOn: boolean): Promise<void> {
+    await this.deps.api.setAppTheming(app, isOn);
+  }
+
+  /** Who is here changed: the clients are read again too, so a ring follows a viewer who left. */
+  private takePresence(users: PresentUser[]): void {
+    applyPresence(users);
+    this.redraw();
+    void this.refreshClients();
+  }
+
+  /** The bubbles up now, oldest first; the view stacks them upward over the tray. */
+  getBubbles(): BubbleStack {
+    return this.bubbles;
+  }
+
+  /** The tray entries hopping now: they just became connected, or just said something (the multiplayer spec,
+   *  sections 6.2 and 6.5). */
+  getHopping(): ReadonlySet<string> {
+    return this.hopping;
+  }
+
+  /** The roster the shell pushed: the entries that became connected since the last push hop; the first push with
+   *  anyone connected is an arrival of nobody. */
+  private takeRoster(participants: RosterParticipant[]): void {
+    const connected = new Set(participants.filter((entry) => entry.is_connected).map((entry) => entry.key));
+    const arrived = this.connectedKeys.size === 0 ? [] : [...connected].filter((key) => !this.connectedKeys.has(key));
+    this.connectedKeys = connected;
+    applyRoster(participants);
+    this.hop(arrived);
+    this.deps.redraw();
+  }
+
+  /** The tray entries of ``keys`` hop for ``TRAY_HOP_MS``; a hop under way is restarted. */
+  private hop(keys: readonly string[]): void {
+    if (keys.length === 0) return;
+    this.hopping = new Set([...this.hopping, ...keys]);
+    if (this.hopTimer !== null) clearTimeout(this.hopTimer);
+    this.hopTimer = setTimeout(() => {
+      this.hopTimer = null;
+      this.hopping = new Set();
+      this.deps.redraw();
+    }, TRAY_HOP_MS);
+  }
+
+  /** Somebody just said something, or a chat notified the user: their entry hops, and when it is a notification
+   *  or mentions the viewer their bubble is raised or refreshed (S11) and the next timeout is armed. A bubble for
+   *  the chat the user is looking at says nothing they cannot already see, so it is not raised -- unless it
+   *  mentions the viewer, whose mark must not be missable. */
+  private takeBubble(bubble: BubbleWire): void {
+    this.hop([bubble.speaker]);
+    const viewer = getOwnParticipant();
+    const isRaised =
+      raisesBubble(bubble, viewer) && (isMentionOf(bubble, viewer) || !isChatOnScreen(this.state, bubble.chat_id));
+    if (isRaised) {
+      this.setBubbles(withBubble(this.bubbles, bubble, viewer, Date.now()));
+    } else {
+      this.deps.redraw();
+    }
+  }
+
+  /** Put a speaker's bubble away: it was dismissed, or clicked. */
+  dismissBubble(speaker: string): void {
+    this.setBubbles(withoutSpeaker(this.bubbles, speaker));
+  }
+
+  /** A bubble was clicked: the chat it was said in is shown with its composer focused, which puts it away along
+   *  with every other bubble pointing at that chat; when nothing can show the chat it stays, so a mention of the
+   *  viewer is not lost to a click that opened nothing. */
+  openBubble(speaker: string): void {
+    const bubble = this.bubbles.find((candidate) => candidate.speaker === speaker);
+    if (bubble === undefined) return;
+    // The chat would be shown on the viewed desktop; the bubble stays up for after the viewing.
+    if (this.refuseWhileViewing("open a chat")) return;
+    void this.showChat(bubble.chatId);
+  }
+
+  private setBubbles(next: BubbleStack): void {
+    this.bubbles = next;
+    this.armBubbleTimer();
+    this.deps.redraw();
+  }
+
+  /** Arm one timer for the next bubble to time out; none while every bubble up is a mention of the viewer. */
+  private armBubbleTimer(): void {
+    if (this.bubbleTimer !== null) {
+      clearTimeout(this.bubbleTimer);
+      this.bubbleTimer = null;
+    }
+    const expiry = nextExpiryOf(this.bubbles);
+    if (expiry === null) return;
+    this.bubbleTimer = setTimeout(
+      () => {
+        this.bubbleTimer = null;
+        this.setBubbles(withoutExpired(this.bubbles, Date.now()));
+      },
+      Math.max(0, expiry - Date.now()),
+    );
+  }
+
+  /** The clients as last read. */
+  getClients(): readonly ClientRecord[] {
+    return this.clients;
+  }
+
+  /** Read the clients again: a person's card opens on what they are looking at now. The listing overtakes the
+   *  moves heard before the read began; one heard while it was on its way is newer than the listing and stays. */
+  async refreshClients(): Promise<void> {
+    const heardBeforeRead = new Map(this.clientDesktopsHeard);
+    try {
+      this.clients = await this.deps.api.fetchClients();
+    } catch (error) {
+      console.warn("[si] could not read the client records", error);
+      return;
+    }
+    for (const [clientId, desktopId] of heardBeforeRead) {
+      if (this.clientDesktopsHeard.get(clientId) === desktopId) this.clientDesktopsHeard.delete(clientId);
+    }
+    this.deps.redraw();
+  }
+
+  /** The desktop a known client is on: the news heard since the clients were read, else what the read said. */
+  private desktopOfClient(client: ClientRecord): string | null {
+    return this.clientDesktopsHeard.get(client.id) ?? client.active_desktop;
+  }
+
+  /** The keys of the roster entries whose desktop some connected client of somebody else is viewing (the
+   *  multiplayer spec, section 8.3): the tray rings them in their colour. */
+  viewedOwnerKeys(): ReadonlySet<string> {
+    const roster = getRoster();
+    const keys = new Set<string>();
+    for (const client of this.clients) {
+      if (!client.is_connected) continue;
+      const desktopId = this.desktopOfClient(client);
+      const desktop = desktopId === null ? null : desktopById(this.state, desktopId);
+      const owner = desktop === null ? null : ownerEntryOf(desktop, roster);
+      if (owner !== null && !isClientOf(owner, client)) keys.add(owner.key);
+    }
+    return keys;
+  }
+
+  /** Whether the desktop is the viewer's own (section 8.1). */
+  isOwnDesktop(desktop: Desktop): boolean {
+    return isOwnDesktop(desktop, getOwnIdentity());
+  }
+
+  /** The viewer's own desktops, in the shell's order. */
+  ownDesktops(): Desktop[] {
+    return ownDesktops(this.state.desktops, getOwnIdentity());
+  }
+
+  /** The desktop this window is viewing: the active one, when it is not the viewer's own (section 8.3); null on
+   *  one of the viewer's own, and until a heartbeat has said who the viewer is, so a visitor's page does not wear
+   *  the viewing chrome on their own desktop while the first heartbeat is on its way. The phone layout never
+   *  views: it is on its way off somebody else's desktop (``leaveOthersDesktopOnPhone``) the moment it finds
+   *  itself there. */
+  viewedDesktop(): Desktop | null {
+    const desktop = activeDesktop(this.state);
+    if (desktop === null || getOwnIdentity() === null || this.isPhoneLayout()) return null;
+    return this.isOwnDesktop(desktop) ? null : desktop;
+  }
+
+  /** Start or stop the viewed desktop's fallback refresh, to match whether this window is viewing one. */
+  private syncViewingRefresh(): void {
+    const isViewing = this.viewedDesktop() !== null;
+    if (isViewing && this.viewingRefreshTimer === null) {
+      this.viewingRefreshTimer = setInterval(() => {
+        if (this.viewedDesktop() !== null) void this.refetchLayout();
+      }, VIEWING_REFRESH_INTERVAL_MS);
+    } else if (!isViewing && this.viewingRefreshTimer !== null) {
+      clearInterval(this.viewingRefreshTimer);
+      this.viewingRefreshTimer = null;
+    }
+  }
+
+  /** The first heartbeat has said who the viewer is (or who they are changed): until then the active desktop read
+   *  as the viewer's own, so a window that landed straight on somebody else's desktop re-reads its layout as the
+   *  owner's now (the multiplayer spec, section 8.3). */
+  takeViewerIdentityKnown(): void {
+    if (this.isPhoneLayout()) {
+      void this.leaveOthersDesktopOnPhone();
+    } else if (this.viewedDesktop() !== null) {
+      // An overview opened before the answer landed would keep its tiles outside the stage the viewing
+      // transforms, and the live-page layer could not lay their pages over them.
+      this.closeOverview();
+      void this.refetchLayout();
+    } else {
+      this.syncViewingRefresh();
+    }
+  }
+
+  /** Stop viewing: back to the desktop this window was on, else the viewer's first desktop, else the desktop the
+   *  shell seeds for a visitor who has none left. When none of those is somewhere else to go, the window stays and
+   *  a toast says why. */
+  async stopViewing(): Promise<void> {
+    const viewedId = this.state.activeDesktopId;
+    const target = await this.wayBackOrOwnDesktop();
+    if (target === null || target === viewedId) {
+      // A window that moved off while the shell was asked has left already: there is nothing to tell.
+      if (this.state.activeDesktopId !== viewedId) return;
+      this.toast(target === null ? STOP_VIEWING_UNANSWERED_NOTICE : STOP_VIEWING_NOWHERE_NOTICE);
+      return;
+    }
+    await this.switchDesktop(target);
+  }
+
+  isOverviewOpen(): boolean {
+    return this.isOverviewOpenNow;
+  }
+
+  /** Open the overview, unless this window is viewing somebody else's desktop (the multiplayer spec, section
+   *  8.3): the button is hidden then, and the keyboard's way in is refused here. */
+  openOverview(): void {
+    if (this.isOverviewOpenNow || this.viewedDesktop() !== null) return;
+    this.isOverviewOpenNow = true;
+    this.notifyListeners();
+  }
+
+  /** Close the overview and forget what it read and was confirming: every way out (Escape, the backdrop, any
+   *  desktop switch) comes through here, so the next open starts afresh. */
+  closeOverview(): void {
+    this.overviewLayouts.clear();
+    this.overviewLayoutReads.clear();
+    this.overviewDeletingId = null;
+    this.overviewRenamingId = null;
+    if (!this.isOverviewOpenNow) return;
+    this.isOverviewOpenNow = false;
+    this.notifyListeners();
+  }
+
+  toggleOverview(): void {
+    if (this.isOverviewOpenNow) this.closeOverview();
+    else this.openOverview();
+  }
+
+  /** A desktop's layout as this client keeps it: the active one's as held, another's read from the shell (the
+   *  overview's thumbnails draw every one of the viewer's desktops). */
+  async readLayoutOf(desktopId: string): Promise<Layout> {
+    if (desktopId === this.state.activeDesktopId && this.state.isLayoutLoaded) return this.state.layout;
+    return this.deps.api.fetchPlacements(desktopId, this.deps.clientId);
+  }
+
+  /** Read this client's layout of every desktop given that the open overview has not read yet, once each; the
+   *  active desktop's is the store's own. Nothing while the overview is closed. */
+  ensureOverviewLayouts(desktops: readonly Desktop[]): void {
+    if (!this.isOverviewOpenNow) return;
+    for (const desktop of desktops) {
+      if (desktop.id === this.state.activeDesktopId || this.overviewLayoutReads.has(desktop.id)) continue;
+      this.overviewLayoutReads.add(desktop.id);
+      void this.readLayoutOf(desktop.id)
+        .then((layout) => {
+          if (this.overviewLayoutReads.has(desktop.id)) this.overviewLayouts.set(desktop.id, layout);
+        })
+        .catch((error: unknown) => {
+          console.warn(`[si] could not read the layout of ${desktop.id} for the overview`, error);
+        })
+        .finally(() => this.deps.redraw());
+    }
+  }
+
+  /** A desktop's layout for the overview's thumbnail: the active one's as held, another's as read since the
+   *  overview opened, or null while its read is on its way. */
+  overviewLayoutOf(desktopId: string): Layout | null {
+    if (desktopId === this.state.activeDesktopId) return this.state.layout;
+    return this.overviewLayouts.get(desktopId) ?? null;
+  }
+
+  getOverviewDeletingId(): string | null {
+    return this.overviewDeletingId;
+  }
+
+  /** The desktop whose deletion the overview confirms in place, or null once it is confirmed or kept. */
+  setOverviewDeletingId(desktopId: string | null): void {
+    this.overviewDeletingId = desktopId;
+    this.deps.redraw();
+  }
+
+  getOverviewRenamingId(): string | null {
+    return this.overviewRenamingId;
+  }
+
+  /** The desktop whose name the overview edits in place (a double-click or the thumbnail menu's Rename row), or
+   *  null once the edit is committed or abandoned. */
+  setOverviewRenamingId(desktopId: string | null): void {
+    this.overviewRenamingId = desktopId;
+    this.deps.redraw();
+  }
+
+  /** The chrome that frames this page has said what it can do (``minds:embedder-capabilities``). */
+  setEmbedderPresent(isPresent: boolean): void {
+    this.isEmbedderPresent = isPresent;
+    this.deps.redraw();
+  }
+
+  /** Whether the tray draws its share button: only under a chrome that takes the share-settings message. */
+  getIsEmbedderPresent(): boolean {
+    return this.isEmbedderPresent;
+  }
+
+  /** Show a chat on this client, the way the Imbue Studio app's notifications do (``minds:focus-chat``): the apps
+   *  registered for that message put it on screen; the shell names no app. Once the chat is to be shown, every
+   *  bubble pointing at it is put away, whichever surface asked (a bubble's click, the agent card's rows): its
+   *  mentions are seen (the multiplayer spec, section 7.4). When nothing shows a chat the user is told and the
+   *  bubbles stay, a mention of the viewer among them until its chat opens. */
+  async showChat(chatId: string): Promise<boolean> {
+    if (!isEmbedderMessageHandled(this.state, FOCUS_CHAT_MESSAGE_TYPE)) {
+      this.toast(NO_CHAT_APP_REASON);
+      return false;
+    }
+    this.setBubbles(withoutChat(this.bubbles, chatId));
+    return this.deliverMessage({ type: FOCUS_CHAT_MESSAGE_TYPE, chatId }, SHELL_SENDER);
+  }
+
+  /** A click on a person's tray entry (the multiplayer spec, section 7.5): a mention of them is drafted through the
+   *  first launch path of the machine that takes one, pinned-first as a free-text row runs; with no such launch
+   *  path the user is told. */
+  async mentionPerson(handle: string): Promise<boolean> {
+    const [row] = mentionRowsOf(openableApps(this.state));
+    if (row === undefined) {
+      this.toast(NO_MENTION_APP_REASON);
+      return false;
+    }
+    return this.launchPinnedFirst(row.app.name, row.launchPath.id, mentionParams(row.launchPath, `@${handle} `));
+  }
+
+  /** A click on the agent's tray entry (the multiplayer spec, section 6.2): the avatar's pinned window on the
+   *  active desktop is put on screen on whatever chat it holds, never put away; with no such window the main chat
+   *  opens, through the primary text action with nothing to send. Refused while viewing somebody else's desktop,
+   *  whose pinned window is theirs. False when refused or when nothing opened. */
+  async openAgentChat(): Promise<boolean> {
+    if (this.refuseWhileViewing("show the agent's chat")) return false;
+    const pinned = avatarPinnedEntryOf(this.state);
+    if (pinned === null) return this.startWithText("");
+    this.showWindow(pinned.window.id);
+    return true;
+  }
+
+  /** A window's "Chat about this app" (the multiplayer spec, section 9.2): the window's app is named to the first
+   *  launch path of the machine that is about an app, whose page is put on screen by the show rule and laid out
+   *  beside the window; with no such launch path the user is told. False when nothing was shown. */
+  async openAppChat(windowId: string): Promise<boolean> {
+    if (this.refuseWhileViewing("open the chat about an app")) return false;
+    const found = findWindow(this.state, windowId);
+    const about = found === null ? undefined : appByName(this.state, found.window.app);
+    if (found === null || about === undefined) return false;
+    const launch = appChatLaunchOf(openableApps(this.state));
+    if (launch === null) {
+      this.toast(NO_APP_CHAT_REASON);
+      return false;
+    }
+    const params = appChatParams(launch.launchPath, about);
+    const shown = await this.launchAt(launch.app.name, launch.launchPath.id, params, {
+      kind: "show",
+      besideWindowId: windowId,
+    });
+    return shown !== null;
+  }
+
+  private async applyDeepLink(link: DeepLink): Promise<void> {
+    if (link.open !== null) {
+      if (appByName(this.state, link.open.app) === undefined)
+        console.warn(`[si] deep link ignored: no app ${link.open.app}`);
+      else await this.openWindowAt(link.open.app, link.open.path, "focus");
+    }
+    if (link.launch !== null) {
+      const app = appByName(this.state, link.launch.app);
+      const launchPath = app === undefined ? null : launchPathOf(app, link.launch.launch);
+      if (app === undefined || launchPath === null) {
+        console.warn(`[si] deep link ignored: no launch path ${link.launch.app}:${link.launch.launch}`);
+      } else {
+        await this.launchAt(app.name, launchPath.id, {}, { kind: "new" });
+      }
+    }
+  }
+
+  /** Tell the shell this window moved the client onto the desktop it is on, leaving ``previousDesktop`` ("" when it
+   *  left none). The report names the newest revision the window heard: a move written since by anything but this
+   *  page wins over the report, and the window follows that move's news when it arrives. */
+  private reportMove(previousDesktop: string): void {
+    const active = this.reportedDesktopId();
+    if (active === null) return;
+    this.deps.socket.reportClientState({
+      activeDesktop: active,
+      previousDesktop,
+      reportId: this.reportIds.mint(),
+      isFollowing: false,
+      pageId: this.pageId,
+      revision: this.desktopRevisionHeard,
+    });
+  }
+
+  /** Tell the shell this window followed the client's stored desktop, which registers it there and moves nothing. */
+  private reportFollowedDesktop(): void {
+    const active = this.reportedDesktopId();
+    if (active === null) return;
+    this.deps.socket.reportClientState({
+      activeDesktop: active,
+      previousDesktop: "",
+      reportId: null,
+      isFollowing: true,
+      pageId: this.pageId,
+      revision: null,
+    });
+  }
+
+  /** The desktop this window reports as its own, null when it reports none. */
+  private reportedDesktopId(): string | null {
+    // A solo shell sits on its window's desktop without moving the client there: the client's active desktop
+    // is its main window's.
+    if (this.soloWindowId !== null) return null;
+    return this.state.activeDesktopId;
+  }
+
+  /** Take note of a revision of the client's stored desktop; answers whether it is newer than any heard before. */
+  private hearDesktopRevision(revision: number): boolean {
+    if (revision <= this.desktopRevisionHeard) return false;
+    this.desktopRevisionHeard = revision;
+    return true;
+  }
+
+  private takeDesktops(desktops: readonly Desktop[]): void {
+    const previous = this.state.activeDesktopId;
+    const wasViewing = this.viewedDesktop() !== null;
+    this.desktopsRevision += 1;
+    this.dispatch({ type: "desktops_updated", desktops });
+    if (this.state.activeDesktopId === previous) return;
+    // The active desktop was deleted and the reducer landed on the fallback (the first desktop listed).
+    this.cancelGesture();
+    if (wasViewing) void this.landAfterViewedDesktopDeleted();
+    else this.landOnFallback();
+  }
+
+  /** The window reports the reducer's landing as a move, as the page's own landing does, so the client's record
+   *  names the desktop the user now sees. */
+  private landOnFallback(): void {
+    this.reportMove("");
+    void this.refetchLayout();
+  }
+
+  /** The viewed desktop was deleted under this window (the multiplayer spec, section 8.3): the first desktop
+   *  listed, where the reducer landed, is as likely somebody else's, so the window lands on the way back when it
+   *  still exists, else on the viewer's first own desktop, else, for a visitor with no desktop of their own, on
+   *  the one the shell seeds when they arrive again. The overview, the letterbox, and the way back are cleared
+   *  with the viewing. */
+  private async landAfterViewedDesktopDeleted(): Promise<void> {
+    this.closeOverview();
+    this.viewedViewport = null;
+    const target = await this.wayBackOrOwnDesktop();
+    if (target === null || target === this.state.activeDesktopId) this.landOnFallback();
+    else await this.switchDesktop(target, "landing");
+  }
+
+  /** Where a window stops viewing lands: the desktop it left for the viewed one when it still exists, else the
+   *  viewer's first own desktop, else the desktop the shell seeds for a visitor with none when they arrive again;
+   *  null when there is nowhere to go. The way back is forgotten either way. */
+  private async wayBackOrOwnDesktop(): Promise<string | null> {
+    const back = this.returnDesktopId;
+    this.returnDesktopId = null;
+    if (back !== null && desktopById(this.state, back) !== null) return back;
+    return this.ownDesktops()[0]?.id ?? (await this.arriveAgain());
+  }
+
+  /** Arrive as the page did at its start: the shell seeds a desktop for a visitor who has none (contracts.md section
+   *  5.5) and says where the client lands; null when it could not. */
+  private async arriveAgain(): Promise<string | null> {
+    let arrival: ClientArrival;
+    try {
+      arrival = await this.deps.api.arriveClient(this.deps.clientId);
+    } catch (error) {
+      console.warn("[si] the shell could not settle where this client lands", error);
+      return null;
+    }
+    if (arrival.created_desktop !== null) this.takeDesktop(arrival.created_desktop);
+    this.replacedDesktop = replacedDesktopOf(arrival);
+    return arrival.desktop_id;
+  }
+
+  private takePlacementsUpdated(event: PlacementsUpdatedEvent): void {
+    if (event.desktopId !== this.state.activeDesktopId) return;
+    if (event.clientId !== this.deps.clientId) {
+      // Another client's layout is normally not this window's business; while this window is viewing the
+      // desktop, the owner's saves are exactly what it shows, so any client's save of it refreshes the view.
+      if (this.viewedDesktop() !== null) void this.refetchLayout();
+      return;
+    }
+    if (this.saveIds.isOwn(event.saveId)) return;
+    void this.refetchLayout();
+  }
+
+  /** Follow the client's stored desktop when it moved, unless the news is stale: a revision no newer than one this
+   *  window heard was overtaken by a later move on its way here, and the echo of a switch this window reported and
+   *  has replaced since with another is followed by the later one's own echo. */
+  private takeActiveDesktopChanged(event: ActiveDesktopChangedEvent): void {
+    // Every client's move is news for the tray's rings; only this client's moves this window.
+    this.clientDesktopsHeard.set(event.clientId, event.desktopId);
+    if (event.clientId !== this.deps.clientId) {
+      // A client the last read did not list connected since: read again, so whose it is is known.
+      if (this.clients.some((client) => client.id === event.clientId)) this.deps.redraw();
+      else void this.refreshClients();
+      return;
+    }
+    if (!this.hearDesktopRevision(event.revision)) return;
+    if (event.reportId !== null && this.reportIds.isSuperseded(event.reportId)) return;
+    // News naming the desktop shown still goes to switchDesktop: an earlier follow waiting on a save has yet to move
+    // the window, and switchDesktop compares against the desktop only once that save is done.
+    // A solo shell stays on its window's desktop whatever the client's main window switches to.
+    if (this.soloWindowId !== null) return;
+    void this.switchDesktop(event.desktopId, "follow");
+  }
+
+  private takeClientEntriesChanged(event: ClientEntriesChangedEvent): void {
+    if (event.clientId !== this.deps.clientId) return;
+    this.entryPushes += 1;
+    this.dispatch({ type: "entries_updated", entries: event.entries });
+  }
+
+  /** This client's entries as its fetched record carries them, unless a push landed while the records were
+   *  read: the push is newer than the answer. */
+  private takeFetchedEntries(own: ClientRecord | undefined, entryPushesBefore: number): void {
+    if (own === undefined || this.entryPushes !== entryPushesBefore) return;
+    this.dispatch({ type: "entries_updated", entries: own.entries });
+  }
+
+  /** The workspace's design and the fallback, from the catalog; a read that fails leaves the initial ones, and
+   *  a selection pushed while the catalog was read stands over the catalog's older answer. */
+  private async loadAvatarSelection(): Promise<void> {
+    const pushesBefore = this.avatarSelectionPushes;
+    try {
+      const catalog = await this.deps.api.fetchAvatars();
+      const design = this.avatarSelectionPushes === pushesBefore ? catalog.selected : this.state.avatar.design;
+      this.dispatch({ type: "avatar_selection_updated", design, defaultDesign: catalog.default });
+    } catch (error) {
+      console.warn("[si] could not read the avatar designs", error);
+    }
+  }
+
+  /** The designs on offer, read anew on every call so one an agent registered meanwhile is listed. */
+  async fetchAvatarDesigns(): Promise<readonly AvatarDesign[]> {
+    return (await this.deps.api.fetchAvatars()).designs;
+  }
+
+  /** Hand ``text`` to the pinned window that takes a draft (plan section 4.7): its app's draft launch path runs
+   *  into this client's view of that window with the text as the draft param, and the window is restored and
+   *  raised; the app drafts the text into a composer and the page reports where it landed. False when no pinned
+   *  app on this desktop takes one, or the launch was refused. A text that is not about the window's page
+   *  (``isAboutPage`` false) is sent without it, so the app drafts it where such a text goes (the chat app: its
+   *  main chat) rather than into what the window shows. */
+  async draftIntoPinnedWindow(text: string, isAboutPage = true): Promise<boolean> {
+    const target = draftTargetOf(this.state);
+    if (target === null) return false;
+    const launched = await this.launchAt(
+      target.window.app,
+      target.launchPath.id,
+      freeTextParams(target.launchPath, text),
+      { kind: "window", windowId: target.window.id, sendsWindowPath: isAboutPage },
+    );
+    this.restoreWindow(target.window.id);
+    return launched !== null;
+  }
+
+  /** A message this page received, from the Imbue Studio chrome (``senderApp`` null) or from the frame of an app's
+   *  page (``senderApp`` that app): the shell is asked, once, to deliver it with this client's id to the apps
+   *  registered for its type (contracts.md section 5.6); the apps decide what it means. When it did not reach
+   *  every app, the user is told why in the relay's words. Answers whether it was relayed and reached every app.
+   *
+   *  A chrome message is relayed only when an app registered for its type, and never from a preview shell (whose
+   *  backend refuses the relay: the apps it names are the live ones) or a solo shell (whose client is the main
+   *  window's, which relays the chrome's messages itself). An app's message is always relayed, from a solo shell
+   *  too: what it shows lands on this client's desktop, in the main window (or stays in its own window when it is
+   *  popped out), and when the main window is closed the user is told to reopen it. */
+  async relayEmbedderMessage(message: EmbedderMessage, senderApp: string | null): Promise<boolean> {
+    const isFromEmbedder = senderApp === null;
+    if (
+      isFromEmbedder &&
+      (isPreviewShell() || this.soloWindowId !== null || !isEmbedderMessageHandled(this.state, message.type))
+    ) {
+      return false;
+    }
+    return this.deliverMessage(message, senderApp ?? EMBEDDER_SENDER);
+  }
+
+  /** Ask the shell to deliver ``message`` to the apps registered for its type, telling the user why when it did not
+   *  reach every one, or when a page it showed waits for a desktop window; answers whether it reached every app. */
+  private async deliverMessage(message: EmbedderMessage, sender: string): Promise<boolean> {
+    const { type, ...payload } = message;
+    let relay: MessageRelay;
+    try {
+      relay = await this.deps.api.relayEmbedderMessage(type, this.deps.clientId, payload, sender);
+    } catch (error) {
+      this.toast((error as Error).message);
+      return false;
+    }
+    if (relay.deliveries.some((delivery) => delivery.has_no_desktop_window)) {
+      this.toast(SHOWN_WITH_NO_DESKTOP_WINDOW_NOTICE);
+    }
+    return true;
+  }
+
+  /** Open a link where it belongs in this workspace: a file in Files (``open:file``), a local URL on an
+   *  app's ``<label>.localhost`` (or ``<name>.localhost``) host, or else at its registered backend port, as that app's
+   *  window at its path, any other local URL in the workspace's browser
+   *  (``open:url``), one of this workspace's app addresses (on its share domain too) as that app's window at its
+   *  path, an external link in the app registered for its kind (``open:web``, ``open:mailto``, ``open:<scheme>``) or else
+   *  outside the workspace. Another workspace's address is refused with a notice.
+   *  ``workspaceHost`` is this page's own host, which says which workspace it is; ``senderApp`` is the app whose page
+   *  asked, or null for the Imbue Studio chrome, and names the message it sends. */
+  async openLink(url: string, workspaceHost: string, senderApp: string | null): Promise<void> {
+    const target = classifyLink(url, workspaceHost, shareDomainOf(this.state.apps));
+    switch (target.kind) {
+      case "file":
+        await this.deliverMessage({ type: OPEN_FILE_MESSAGE, path: target.path }, senderApp ?? EMBEDDER_SENDER);
+        return;
+      case "local-url": {
+        const apps = openableApps(this.state);
+        const appWindow = windowAtLocalAppHost(apps, target.url) ?? windowAtBackendUrl(apps, target.url);
+        if (appWindow !== null) {
+          await this.openAppLink(appWindow.app, appWindow.path);
+          return;
+        }
+        await this.deliverMessage({ type: OPEN_URL_MESSAGE, url: target.url }, senderApp ?? EMBEDDER_SENDER);
+        return;
+      }
+      case "app-address": {
+        const app = openableApps(this.state).find((candidate) => labelForApp(candidate) === target.label);
+        if (app === undefined) {
+          this.toast(`Nothing in this workspace is at ${target.url}`);
+          return;
+        }
+        await this.openAppLink(app, target.path);
+        return;
+      }
+      case "other-workspace":
+        this.toast(OTHER_WORKSPACE_LINK_NOTICE);
+        return;
+      case "unroutable":
+        this.toast(`Nothing in this workspace is at ${url}`);
+        return;
+      case "external":
+        await this.openExternalLink(target.url, senderApp);
+        return;
+    }
+  }
+
+  /** An external link goes to the app registered for its kind; with none, it opens outside the workspace at once,
+   *  still inside the click that asked for it (a browser opens a new tab only then): through the Imbue Studio chrome
+   *  when it said it opens that kind of link, else as a popup; a custom-scheme link facing an older chrome, which
+   *  shows that popup as an empty window, opens from this page instead. One the
+   *  chrome handed over (``senderApp`` null) goes back to it however early: a chrome that hands a link over opens it
+   *  too, and opening it here would only send it back again. */
+  private async openExternalLink(url: string, senderApp: string | null): Promise<void> {
+    const type = externalLinkMessageType(url);
+    const capabilities = this.outsideLinkCapabilities;
+    const isCustomScheme = isCustomSchemeLink(url);
+    const doesEmbedderOpen =
+      capabilities.opensExternalLinks && (capabilities.opensCustomSchemeLinks || !isCustomScheme);
+    if (isEmbedderMessageHandled(this.state, type)) {
+      await this.deliverMessage({ type, url }, senderApp ?? EMBEDDER_SENDER);
+    } else if (doesEmbedderOpen || senderApp === null) {
+      this.outsideLinks.openInEmbedder(url);
+    } else if (isCustomScheme && capabilities.opensExternalLinks) {
+      this.outsideLinks.launchInSystemApp(url);
+    } else {
+      this.outsideLinks.openInBrowser(url);
+    }
+  }
+
+  /** A link to a page of ``app``. One at the app's pin page in a state of its own (a chat at ``/?chat=<id>``) goes
+   *  through the shell's ``show``, which raises a window already there, or points the app's window on that page or
+   *  its pinned window at it, rather than opening another; any other page is focused or opened. */
+  private async openAppLink(app: AppRecord, path: string): Promise<void> {
+    const pinPage = pinPageOfLink(app, path);
+    if (pinPage === null) {
+      await this.focusOrOpenWindowAt(app.name, path);
+      return;
+    }
+    await this.showAppPage(app.name, path, [pinPage]);
+  }
+
+  /** Put a page of ``app`` on this client's screen through the shell's ``show``: a window already there is raised,
+   *  else the app's window on one of the ``repoint`` pages (or its pinned window) is pointed at it, else one opens. */
+  async showAppPage(app: string, path: string, repoint: readonly string[]): Promise<void> {
+    await this.flushPendingSave();
+    let outcome: PageShowOutcome;
+    try {
+      outcome = await this.deps.api.showPage(this.deps.clientId, { app, path, repoint });
+    } catch (error) {
+      this.toast(`Could not open ${app}: ${(error as Error).message}`);
+      return;
+    }
+    if (outcome.hasNoDesktopWindow) this.toast(SHOWN_WITH_NO_DESKTOP_WINDOW_NOTICE);
+  }
+
+  /** Open a window of ``app`` at ``path``, raising one already there. A window there that this client has popped out
+   *  is raised in its own window, as an agent's ``open`` raises it, rather than pulled back onto the desktop: the
+   *  windows route's raise would bring it back, and its own window would close. */
+  private async focusOrOpenWindowAt(app: string, path: string): Promise<void> {
+    const desktopId = this.openingDesktopId();
+    const found = this.isPhoneLayout()
+      ? undefined
+      : this.state.desktops
+          .find((desktop) => desktop.id === desktopId)
+          ?.windows.find((window) => window.app === app && window.path === path);
+    if (found !== undefined && placementOf(this.state.layout, found.id).is_detached) {
+      this.showDetachedWindow(found.id);
+      return;
+    }
+    await this.openWindowAt(app, path, "focus");
+  }
+
+  /** Point this client's view of a window at ``path``, the way an agent's ``navigate`` does: the location is
+   *  written through the shell and the answer applied as a load rather than as the page's own report, so the
+   *  following step moves the page there (a page's own report is the one thing the following never bounces back,
+   *  and applying it that way would leave the page where it was). False when the shell refused. */
+  async navigateOwnWindow(windowId: string, path: string): Promise<boolean> {
+    if (this.refuseWhileViewing("move a window to a page")) return false;
+    const found = findWindow(this.state, windowId);
+    if (found === null) return false;
+    const title = effectiveWindowTitle(this.state, found.window, appByName(this.state, found.window.app));
+    let reported: WindowRecord;
+    try {
+      reported = await this.deps.api.reportWindowLocation(found.desktop.id, windowId, this.deps.clientId, path, title);
+    } catch (error) {
+      this.toast(`Could not move the window: ${(error as Error).message}`);
+      return false;
+    }
+    this.applyOwnNavigation(found, reported);
+    return true;
+  }
+
+  /** Take the window the shell answered a navigation of this client's own with, as a load the pages follow. */
+  private applyOwnNavigation(found: { desktop: Desktop; window: WindowRecord }, reported: WindowRecord): void {
+    // Marked only once the answer is applied, for the one follow that application triggers: set any earlier, a
+    // refusal or a broadcast landing meanwhile would leave the mark to lift the guard for some other follow.
+    if (found.window.scope === "independent") {
+      if (found.desktop.id !== this.state.activeDesktopId) return;
+      this.ownNavigation = { windowId: found.window.id, path: reported.path };
+      this.layoutLoadsRevision += 1;
+      this.dispatch({
+        type: "window_paths_loaded",
+        desktopId: found.desktop.id,
+        windowPaths: {
+          ...this.state.layout.window_paths,
+          [found.window.id]: { path: reported.path, title: reported.title },
+        },
+      });
+      return;
+    }
+    this.ownNavigation = { windowId: found.window.id, path: reported.path };
+    this.desktopsRevision += 1;
+    this.dispatch({ type: "window_location_reported", desktopId: found.desktop.id, window: reported });
+  }
+
+  /** The navigation this client asked for itself since the pages last followed, handed over once. */
+  takeOwnNavigation(): OwnNavigation | null {
+    const own = this.ownNavigation;
+    this.ownNavigation = null;
+    return own;
+  }
+
+  /** Choose the workspace's avatar design; every window (this one included) follows the shell's broadcast. */
+  async selectAvatar(design: string): Promise<void> {
+    try {
+      await this.deps.api.selectAvatar(design);
+    } catch (error) {
+      this.toast(`Could not change the avatar: ${(error as Error).message}`);
+    }
+  }
+
+  /** Write how this client shows a pinned entry (its mode, style, and floating position). Applied at once, so a
+   *  released drag lands where it was dropped rather than at the old spot until the shell answers. A push that
+   *  lands while the shell answers is its newer word (the shell announces every write, this one included, before
+   *  answering it) and stands: without one, the record the shell answers is taken, and a refusal puts that
+   *  entry's old presentation back (another entry written meanwhile is not undone with it). */
+  async setEntryPresentation(app: string, presentation: EntryPresentation): Promise<void> {
+    const previous = this.state.entries[app];
+    const entryPushesBefore = this.entryPushes;
+    this.dispatch({ type: "entries_updated", entries: { ...this.state.entries, [app]: presentation } });
+    try {
+      const record = await this.deps.api.setEntryPresentation(this.deps.clientId, app, presentation);
+      if (this.entryPushes !== entryPushesBefore) return;
+      this.dispatch({ type: "entries_updated", entries: record.entries });
+    } catch (error) {
+      this.toast(`Could not change the entry: ${(error as Error).message}`);
+      if (this.entryPushes !== entryPushesBefore) return;
+      const others = Object.fromEntries(Object.entries(this.state.entries).filter(([name]) => name !== app));
+      this.dispatch({
+        type: "entries_updated",
+        entries: previous === undefined ? others : { ...others, [app]: previous },
+      });
+    }
+  }
+
+  /** The presentation a write of one field starts from: the entry's current look. */
+  private presentationOf(app: string): EntryPresentation | null {
+    const window = pinnedWindowOf(this.state, app);
+    if (window === null) return null;
+    const look = entryLook(this.state, window, appByName(this.state, app));
+    if (look === null) return null;
+    return { mode: look.mode, style: look.style, position: look.position, is_window_shown: look.isWindowShown };
+  }
+
+  /** Whether this client lists a pinned window in its taskbar, or hid its entry by closing it. */
+  private isPinnedEntryShown(windowId: string): boolean {
+    const window = findWindow(this.state, windowId)?.window;
+    if (window === undefined) return true;
+    const look = entryLook(this.state, window, appByName(this.state, window.app));
+    return look === null || look.isWindowShown;
+  }
+
+  /** Write whether this client lists a pinned window in its taskbar. */
+  private setPinnedEntryShown(windowId: string, isShown: boolean): void {
+    const app = findWindow(this.state, windowId)?.window.app;
+    if (app === undefined) return;
+    const current = this.presentationOf(app);
+    if (current === null || current.is_window_shown === isShown) return;
+    void this.setEntryPresentation(app, { ...current, is_window_shown: isShown });
+  }
+
+  setEntryMode(app: string, mode: EntryMode): Promise<void> {
+    const current = this.presentationOf(app);
+    return current === null ? Promise.resolve() : this.setEntryPresentation(app, { ...current, mode });
+  }
+
+  /** Where a floating entry's box is right now, in backdrop pixels: the drag's rectangle while one moves it,
+   *  else its stored position (the default corner when it has none), clamped into the backdrop. */
+  renderedFloatingEntryRect(app: string, position: FloatingPosition | null): PixelRect {
+    const gesture = this.gesture;
+    if (gesture !== null && gesture.kind === "floating-entry" && gesture.app === app) return gesture.currentRect;
+    return floatingEntryRect(
+      position ?? defaultFloatingPosition(this.backdrop, this.metrics),
+      this.backdrop,
+      this.metrics,
+    );
+  }
+
+  handleLayoutOp(event: LayoutOpEvent): void {
+    switch (event.op) {
+      case "refresh": {
+        const windowId = event.args.window;
+        const appName = event.args.app;
+        if (typeof windowId === "string" && windowId !== "") this.pageDriver?.reload(windowId);
+        else if (typeof appName === "string" && appName !== "") this.pageDriver?.reloadApp(appName);
+        return;
+      }
+      case "reload_system_interface":
+        this.deps.reloadInterface();
+        return;
+      case "show":
+      case "open":
+      case "focus": {
+        // An op that put a window on this client's screen. A phone shows it; a desktop has it placed already, and
+        // acts only on a pulled-out window the shell left out, whose desktop window it raises as the taskbar's
+        // "Show" does. The main window's page asks for any window; a solo page asks for its own, so the raise works
+        // with the main window closed (the chrome raises an existing desktop window on the ask, whoever sends it).
+        const windowId = event.args.window;
+        if (typeof windowId !== "string" || windowId === "") return;
+        const isDetachedShow = event.op === "show" && event.args.is_detached === true;
+        if (this.soloWindowId !== null) {
+          if (isDetachedShow && windowId === this.soloWindowId) this.showDetachedWindow(windowId);
+        } else if (this.isPhoneLayout()) this.showOnPhoneWhenKnown(windowId);
+        else if (isDetachedShow) this.showDetachedWindow(windowId);
+        return;
+      }
+    }
+  }
+
+  /** Switch this window onto ``desktopId``: flush the outgoing layout's pending save, tell the shell,
+   *  and fetch the incoming layout. The user's switch moves the client and names the desktop it left; the
+   *  bootstrap's landing moves it naming none; a follow of the stored desktop moves nothing. */
+  async switchDesktop(desktopId: string, cause: SwitchCause = "user"): Promise<void> {
+    // The desktop left is read after the save: an earlier switch waiting on the same save moves the window first.
+    await this.flushPendingSave();
+    const previous = this.state.activeDesktopId;
+    if (previous === desktopId) return;
+    this.cancelGesture();
+    this.closeOverview();
+    this.rememberReturnDesktop(previous, desktopId);
+    // The size the desktop left was arranged in says nothing about the next one; its own read brings its own.
+    this.viewedViewport = null;
+    this.dispatch({ type: "desktop_activated", desktopId });
+    switch (cause) {
+      case "user":
+        this.reportMove(previous ?? "");
+        break;
+      case "landing":
+        this.reportMove("");
+        break;
+      case "follow":
+        this.reportFollowedDesktop();
+        break;
+    }
+    await this.refetchLayout();
+  }
+
+  /** Where a switch leaves the way back (the multiplayer spec, section 8.3): a switch onto one of the viewer's own
+   *  desktops ends any viewing, and a switch off one of their own onto somebody else's remembers it. */
+  private rememberReturnDesktop(previous: string | null, next: string): void {
+    const target = desktopById(this.state, next);
+    if (target === null || this.isOwnDesktop(target)) {
+      this.returnDesktopId = null;
+      return;
+    }
+    const from = previous === null ? null : desktopById(this.state, previous);
+    if (from !== null && this.isOwnDesktop(from)) this.returnDesktopId = previous;
+  }
+
+  /** Create a desktop and switch to it; the shell seeds it and makes it the viewer's own. */
+  async createDesktop(name: string): Promise<void> {
+    try {
+      const created = await this.deps.api.createDesktop(name);
+      // The broadcast may have landed first: upsert rather than append.
+      this.takeDesktop(created);
+      await this.switchDesktop(created.id);
+    } catch (error) {
+      this.toast(`Could not create the desktop: ${(error as Error).message}`);
+    }
+  }
+
+  /** Create a desktop named the first free "Desktop N" (the overview's plus, the backdrop menu, the card). */
+  createNextDesktop(): Promise<void> {
+    return this.createDesktop(nextDesktopName(this.state.desktops));
+  }
+
+  async renameDesktop(desktopId: string, name: string): Promise<void> {
+    try {
+      this.takeDesktop(await this.deps.api.renameDesktop(desktopId, name));
+    } catch (error) {
+      this.toast(`Could not rename the desktop: ${(error as Error).message}`);
+    }
+  }
+
+  /** Put the viewer's own desktops in ``desktopIds``' order (every one of theirs, once); the shell's answer, every
+   *  desktop in its new order, is taken whole. */
+  async reorderDesktops(desktopIds: readonly string[]): Promise<void> {
+    try {
+      this.dispatch({ type: "desktops_updated", desktops: await this.deps.api.reorderDesktops(desktopIds) });
+    } catch (error) {
+      this.toast(`Could not reorder the desktops: ${(error as Error).message}`);
+    }
+  }
+
+  /** This user's deleted desktop and the one seeded in its place, while the notice about them is still owed. */
+  getReplacedDesktop(): ReplacedDesktop | null {
+    return this.replacedDesktop;
+  }
+
+  dismissReplacedDesktopNotice(): void {
+    this.replacedDesktop = null;
+    this.redraw();
+  }
+
+  async setDesktopWallpaper(desktopId: string, wallpaper: Wallpaper | null): Promise<void> {
+    if (this.refuseWhileViewing("change the wallpaper")) return;
+    this.takeDesktop(await this.deps.api.setDesktopWallpaper(desktopId, wallpaper));
+  }
+
+  /** The theme a desktop wears by its own choice; null wears the workspace's default. */
+  async setDesktopTheme(desktopId: string, theme: string | null): Promise<void> {
+    if (this.refuseWhileViewing("change the theme")) return;
+    this.takeDesktop(await this.deps.api.setDesktopTheme(desktopId, theme));
+  }
+
+  /** The workspace's default theme; null wears the standard one. Every window hears the new catalog over the
+   *  socket; this one takes the new default at once, so it shows even while the socket is down. With no catalog
+   *  read yet there is nothing to put the default in, so the catalog is read again. */
+  async setDefaultTheme(theme: string | null): Promise<void> {
+    await this.deps.api.setDefaultTheme(theme);
+    if (!this.hasThemeCatalog) {
+      await this.loadThemes();
+      return;
+    }
+    this.themeCatalogChanges += 1;
+    this.takeThemeCatalog({ ...this.themeCatalog, default: theme });
+  }
+
+  /** Read the workspace's themes again. */
+  async loadThemes(): Promise<void> {
+    if (this.themeReadRetryTimer !== null) clearTimeout(this.themeReadRetryTimer);
+    this.themeReadRetryTimer = null;
+    const change = ++this.themeCatalogChanges;
+    try {
+      const catalog = await this.deps.api.fetchThemes();
+      this.themeReadBackoff.reset();
+      if (change === this.themeCatalogChanges) this.takeThemeCatalog(catalog);
+    } catch (error) {
+      console.warn("[si] could not read the themes", error);
+      if (!this.hasThemeCatalog && change === this.themeCatalogChanges) {
+        this.themeReadRetryTimer = setTimeout(() => {
+          this.themeReadRetryTimer = null;
+          if (!this.hasThemeCatalog) void this.loadThemes();
+        }, this.themeReadBackoff.nextDelay());
+      }
+    }
+  }
+
+  private takeThemeCatalog(catalog: ThemeCatalog): void {
+    this.themeCatalog = catalog;
+    this.hasThemeCatalog = true;
+    this.redraw();
+  }
+
+  /** Whether `shownTheme()` names the theme this client should wear: the catalog has arrived and a desktop is on
+   *  screen. Before then it answers the standard look or the default, which is not yet known to be right. */
+  isShownThemeKnown(): boolean {
+    return this.hasThemeCatalog && activeDesktop(this.state) !== null;
+  }
+
+  /** Whether the workspace's themes have been read; until then `getThemeCatalog()` answers an empty catalog. */
+  isThemeCatalogKnown(): boolean {
+    return this.hasThemeCatalog;
+  }
+
+  getThemeCatalog(): ThemeCatalog {
+    return this.themeCatalog;
+  }
+
+  /** Show a theme choice on a desktop before it is saved: a theme id, or null for the workspace's default. */
+  previewDesktopTheme(desktopId: string, choice: string | null): void {
+    this.themePreview = { desktopId, choice };
+    this.redraw();
+  }
+
+  /** Go back to the desktop's saved theme. */
+  clearThemePreview(): void {
+    if (this.themePreview === null) return;
+    this.themePreview = null;
+    this.redraw();
+  }
+
+  /** The theme this client wears: the active desktop's (or the one previewed on it), resolved through the
+   *  workspace's default to an available theme, or the standard look. */
+  shownTheme(): ThemeRecord {
+    const desktop = activeDesktop(this.state);
+    const isPreviewed = desktop !== null && this.themePreview?.desktopId === desktop.id;
+    const choice = isPreviewed ? (this.themePreview?.choice ?? null) : (desktop?.theme ?? null);
+    return resolveDesktopTheme(this.themeCatalog, choice);
+  }
+
+  /** Hear the shown theme whenever it changes: another theme or revision, or a preview put on or taken off; and the
+   *  same theme again from each catalog that arrives, so a page whose stylesheet failed can put it back. A listener
+   *  hears the current one at once when it is known. */
+  onShownThemeChanged(listener: ShownThemeListener): () => void {
+    this.shownThemeListeners.add(listener);
+    if (this.lastShownTheme !== null) listener(this.lastShownTheme);
+    return () => void this.shownThemeListeners.delete(listener);
+  }
+
+  private noteShownTheme(): void {
+    if (!this.isShownThemeKnown()) return;
+    const desktop = activeDesktop(this.state);
+    const shown: ShownTheme = {
+      record: this.shownTheme(),
+      isPreview: desktop !== null && this.themePreview?.desktopId === desktop.id,
+    };
+    const last = this.lastShownTheme;
+    if (last !== null && last.record === shown.record && last.isPreview === shown.isPreview) return;
+    this.lastShownTheme = shown;
+    for (const listener of this.shownThemeListeners) listener(shown);
+  }
+
+  /** The title bar the shown theme draws (workspace-themes plan section 4.3). */
+  shownChrome(): ThemeChrome {
+    return chromeOf(this.shownTheme());
+  }
+
+  /** Delete a desktop; the shell moves this client to the fallback and says so over the socket. A refusal (the
+   *  last desktop) is told to the user. */
+  async deleteDesktop(desktopId: string): Promise<void> {
+    try {
+      await this.deps.api.deleteDesktop(desktopId);
+    } catch (error) {
+      this.toast(`Could not delete the desktop: ${(error as Error).message}`);
+    }
+  }
+
+  private takeDesktop(desktop: Desktop): void {
+    const desktops = this.state.desktops.some((candidate) => candidate.id === desktop.id)
+      ? this.state.desktops.map((candidate) => (candidate.id === desktop.id ? desktop : candidate))
+      : [...this.state.desktops, desktop];
+    this.dispatch({ type: "desktops_updated", desktops });
+  }
+
+  /** Add a launch path to the active desktop at the first free cell in reading order over the current grid, drawn
+   *  at once and taken off again if the shell refuses; nothing when it is already there (the shell would move the
+   *  shortcut and reset its mode). A refusal takes off only the shortcut drawn here: one a broadcast put there in
+   *  the meantime is the shell's and stays. */
+  async addShortcut(app: string, launch: string, mode: ShortcutMode): Promise<void> {
+    const desktop = activeDesktop(this.state);
+    if (desktop === null) return;
+    if (findShortcut(desktop, app, launch) !== undefined) return;
+    const cell = cellForAddedShortcut(desktop, this.gridDimensions());
+    const shortcut: DesktopShortcut = { target: { kind: "launch", app, launch }, mode, cell };
+    this.takeDesktop({ ...desktop, shortcuts: [...desktop.shortcuts, shortcut] });
+    try {
+      this.takeDesktop(await this.deps.api.setDesktopShortcut(desktop.id, shortcut));
+    } catch (error) {
+      const now = desktopById(this.state, desktop.id);
+      if (now !== null && findShortcut(now, app, launch) === shortcut) {
+        this.takeDesktop({ ...now, shortcuts: now.shortcuts.filter((candidate) => candidate !== shortcut) });
+      }
+      this.toast(`Could not add the shortcut: ${(error as Error).message}`);
+    }
+  }
+
+  /** Replace a shortcut the desktop holds, as the shortcut menu's mode flip does. */
+  async setShortcut(desktopId: string, shortcut: DesktopShortcut): Promise<void> {
+    try {
+      this.takeDesktop(await this.deps.api.setDesktopShortcut(desktopId, shortcut));
+    } catch (error) {
+      this.toast(`Could not change the shortcut: ${(error as Error).message}`);
+    }
+  }
+
+  /** Drop a dragged shortcut into ``cell``, showing the arrangement the drag drew at once and putting the
+   *  cells back if the shell refuses: a drop that waited on the round trip would draw the shortcuts in the
+   *  cells they came from meanwhile.
+   *
+   *  Only the dragged shortcut is named: the shell displaces whatever was in the cell by the same rule and
+   *  its answer is what stands. It searches the unbounded plane where the drag searched the grid, so on a
+   *  desktop with no free cell near the target the shortcut settles where the shell put it rather than
+   *  where the drag drew it (contracts.md section 10).
+   *
+   *  Both writes move the shortcuts of whatever the desktop is by then, rather than restoring a snapshot
+   *  taken before the request: a later drop, or a broadcast that landed in between, is someone else's edit
+   *  and is not this refusal's to undo. */
+  private async dropShortcut(
+    app: string,
+    launch: string,
+    cell: GridCell,
+    shown: readonly PlacedShortcut[],
+  ): Promise<void> {
+    if (this.refuseWhileViewing("move a shortcut")) return;
+    const desktop = activeDesktop(this.state);
+    if (desktop === null) return;
+    // What the room made moved, against the cells the shortcuts were already drawn in: a drop that moved
+    // nothing (back into the cell it came from) is not worth a round trip, and a cell the placement re-fitted
+    // is where that shortcut was drawn all along rather than anything this drag decided.
+    const restingCellByKey = new Map(this.restingShortcuts().map((entry) => [placedShortcutKey(entry), entry.cell]));
+    const changes = shown.flatMap((entry) => {
+      const resting = restingCellByKey.get(placedShortcutKey(entry));
+      if (resting === undefined || isSameCell(entry.cell, resting)) return [];
+      const target = entry.shortcut.target;
+      return [{ app: target.app, launch: target.launch, cell: entry.cell, storedCell: entry.shortcut.cell }];
+    });
+    if (changes.length === 0) return;
+    this.withShortcutCells(changes);
+    try {
+      this.takeDesktop(await this.deps.api.moveDesktopShortcut(desktop.id, app, launch, cell));
+    } catch (error) {
+      this.withShortcutCells(changes.map((entry) => ({ ...entry, cell: entry.storedCell })));
+      this.toast(`Could not move the shortcut: ${(error as Error).message}`);
+    }
+  }
+
+  /** The active desktop with the named shortcuts' cells rewritten, taken as the desktop of record. */
+  private withShortcutCells(cells: readonly ShortcutCellUpdate[]): void {
+    const desktop = activeDesktop(this.state);
+    if (desktop === null) return;
+    this.takeDesktop({
+      ...desktop,
+      shortcuts: desktop.shortcuts.map((shortcut) => {
+        const wanted = cells.find((entry) => isShortcutOf(shortcut, entry.app, entry.launch));
+        return wanted === undefined ? shortcut : { ...shortcut, cell: wanted.cell };
+      }),
+    });
+  }
+
+  /** Take a shortcut off the active desktop at once, putting it back if the shell refuses. A refusal puts it back
+   *  only while the shell has said nothing of the desktops since: a broadcast in the meantime is the shell's word on
+   *  whether it is still there, and stands. */
+  async removeShortcut(app: string, launch: string): Promise<void> {
+    if (this.refuseWhileViewing("remove a shortcut")) return;
+    const desktop = activeDesktop(this.state);
+    if (desktop === null) return;
+    const removed = findShortcut(desktop, app, launch);
+    if (removed === undefined) return;
+    this.takeDesktop({ ...desktop, shortcuts: desktop.shortcuts.filter((candidate) => candidate !== removed) });
+    const revision = this.desktopsRevision;
+    try {
+      this.takeDesktop(await this.deps.api.removeDesktopShortcut(desktop.id, app, launch));
+    } catch (error) {
+      const now = desktopById(this.state, desktop.id);
+      if (this.desktopsRevision === revision && now !== null && findShortcut(now, app, launch) === undefined) {
+        this.takeDesktop({ ...now, shortcuts: [...now.shortcuts, removed] });
+      }
+      this.toast(`Could not remove the shortcut: ${(error as Error).message}`);
+    }
+  }
+
+  /** Run a shortcut in its mode: focus raises the app's most recent window and runs the launch path only when there
+   *  is none, but always runs a one-window app's POST launch path into that window (``resolveLaunchRun``). Before
+   *  the apps are known (the inventory has not answered) the user is told to wait rather than that the app is
+   *  missing. */
+  async runLaunch(app: string, launch: string, mode: ShortcutMode): Promise<void> {
+    const run = resolveLaunchRun(this.state, app, launch, mode);
+    switch (run.kind) {
+      case "raise":
+        this.restoreWindow(run.windowId);
+        return;
+      case "open":
+        // A focus shortcut whose window this client has never placed still has one on the desktop when another
+        // client opened it: the shell finds it at the launch path and raises it here rather than opening a second.
+        await this.launchAt(run.app, run.launch, {}, { kind: mode === "focus" ? "focus" : "new" });
+        return;
+      case "connecting":
+        this.toast(STILL_CONNECTING_NOTICE);
+        return;
+      case "unavailable":
+        this.toast(`Cannot open: ${run.reason}`);
+        return;
+    }
+  }
+
+  runShortcut(shortcut: DesktopShortcut): Promise<void> {
+    if (this.refuseWhileViewing("run a shortcut")) return Promise.resolve();
+    return this.runLaunch(shortcut.target.app, shortcut.target.launch, shortcut.mode);
+  }
+
+  /** The app and launch path a launcher row names, or null (told to the user) when the app declares no such path. */
+  private launchOf(appName: string, launchId: string): { app: AppRecord; launchPath: LaunchPath } | null {
+    const app = appByName(this.state, appName);
+    const launchPath = app === undefined ? null : launchPathOf(app, launchId);
+    if (app === undefined || launchPath === null) {
+      this.toast(`Cannot open: ${appName} has no launch path ${launchId}`);
+      return null;
+    }
+    return { app, launchPath };
+  }
+
+  /** Run a launch-path row (launcher plan section 3.3): a GET launch path at its app's pin path raises the pinned
+   *  window on the active desktop and opens nothing; a row of a one-window app launches into the window the
+   *  desktop already holds (whichever client opened it; the shell raises it here) and opens one only when there
+   *  is none; every other launches into a new window. */
+  async runLaunchRow(appName: string, launchId: string): Promise<void> {
+    const found = this.launchOf(appName, launchId);
+    if (found === null) return;
+    const kind = launchRowKindOf(found.app, found.launchPath);
+    if (kind === "focus") {
+      const pinned = pinnedWindowOf(this.state, found.app.name);
+      if (pinned !== null) {
+        this.restoreWindow(pinned.id);
+        return;
+      }
+    }
+    await this.launchAt(found.app.name, found.launchPath.id, {}, { kind: kind === "one" ? "focus" : "new" });
+  }
+
+  /** Run a free-text row with ``text`` (launcher plan section 3.2, post-launch-paths plan section 4.1),
+   *  pinned-first: when the app has a pinned window on the active desktop, the launch runs into this client's view
+   *  of it (the page the launch answers is pure, so a linked window is safe too) and the window is restored and
+   *  raised; otherwise the launch opens a new window. False when the text cannot go (a GET launch path over the
+   *  path bound) or the shell refused, each told to the user. */
+  async runFreeText(appName: string, launchId: string, text: string): Promise<boolean> {
+    const found = this.launchOf(appName, launchId);
+    if (found === null) return false;
+    const disabledReason = textRowDisabledReason(found.launchPath, text);
+    if (disabledReason !== null) {
+      this.toast(disabledReason);
+      return false;
+    }
+    return this.launchPinnedFirst(found.app.name, found.launchPath.id, freeTextParams(found.launchPath, text));
+  }
+
+  /** Run a launch path with ``params`` into the app's pinned window on the active desktop when there is one (the
+   *  window restored and raised), else into a new window. Whether the shell accepted the launch. */
+  private async launchPinnedFirst(
+    appName: string,
+    launchId: string,
+    params: Record<string, string>,
+  ): Promise<boolean> {
+    const pinned = pinnedWindowOf(this.state, appName);
+    if (pinned !== null) {
+      const launched = await this.launchAt(appName, launchId, params, { kind: "window", windowId: pinned.id });
+      this.restoreWindow(pinned.id);
+      return launched !== null;
+    }
+    return (await this.launchAt(appName, launchId, params, { kind: "new" })) !== null;
+  }
+
+  /** A page's ``shell:draft-text`` (element-reference-menu plan section 6): the text is drafted into the pinned
+   *  window that takes a draft, else through the first draft row of the machine; with neither the user is told. */
+  async draftText(text: string): Promise<boolean> {
+    if (draftTargetOf(this.state) !== null) return this.draftIntoPinnedWindow(text);
+    const [draftRow] = draftRowsOf(openableApps(this.state));
+    if (draftRow === undefined) {
+      this.toast(NO_DRAFT_APP_REASON);
+      return false;
+    }
+    return this.runFreeText(draftRow.app.name, draftRow.launchPath.id, text);
+  }
+
+  /** A page's ``shell:start-with-text`` (launcher plan section 3.7): the primary text action runs with the text;
+   *  with no free-text row on the machine the user is told. */
+  async startWithText(text: string): Promise<boolean> {
+    const [primary] = freeTextRowsOf(openableApps(this.state));
+    if (primary === undefined) {
+      this.toast(NO_TEXT_APP_REASON);
+      return false;
+    }
+    return this.runFreeText(primary.app.name, primary.launchPath.id, text);
+  }
+
+  /** The desktop an open goes to: the active one, or on a phone the first, where a window opened out of sight
+   *  is minimized at the bottom of every other client's stack and nobody's own desktop moves. */
+  private openingDesktopId(): string | null {
+    if (this.isPhoneLayout()) return this.state.desktops[0]?.id ?? null;
+    return this.state.activeDesktopId;
+  }
+
+  /** Every open goes through the shell's one route; the answer is applied at once and the layout
+   *  refetched for the stamp the shell wrote. A phone opens out of sight and shows the window itself. A window that
+   *  waits on the desktop because this client has only pop-outs open gets a notice to reopen the main window.
+   *  Answers the window id, or null when the shell refused. */
+  async openWindowAt(app: string, path: string, ifPresent: IfPresent): Promise<string | null> {
+    const desktopId = this.openingDesktopId();
+    if (desktopId === null) return null;
+    const isMinimized = this.isPhoneLayout();
+    // The shell writes the new placement over the stored layout, and the refetch takes that: a gesture
+    // still waiting in the debounce goes into the file first or it is lost.
+    await this.flushPendingSave();
+    let outcome: WindowOpenOutcome;
+    try {
+      outcome = await this.deps.api.openWindow(desktopId, {
+        app,
+        path,
+        clientId: this.deps.clientId,
+        ifPresent,
+        isMinimized,
+      });
+    } catch (error) {
+      this.toast(`Could not open ${app}: ${(error as Error).message}`);
+      return null;
+    }
+    this.takeOpened(desktopId, outcome.window, outcome.isNew, isMinimized);
+    if (outcome.hasNoDesktopWindow) this.toast(SHOWN_WITH_NO_DESKTOP_WINDOW_NOTICE);
+    return outcome.window.id;
+  }
+
+  /** A window the shell opened or answered for this client, applied at once; the phone shows it. */
+  private takeOpened(desktopId: string, window: WindowRecord, isNew: boolean, isMinimized: boolean): void {
+    this.dispatch({ type: "window_opened_here", desktopId, window, isNew, isMinimized });
+    void this.refetchLayout();
+    if (this.isPhoneLayout()) this.showOnPhone({ kind: "window", windowId: window.id });
+  }
+
+  /** Run a launch path through the shell's launch route (post-launch-paths plan section 5.3): the shell resolves the
+   *  page (built for a GET launch path, asked of the app for a POST one) and opens a window there, points the
+   *  named window at it, or shows it by the show rule. An opened, focused, or shown window is taken as an open
+   *  is; a navigated one (the named window, or the pinned window a show pointed at the page) as this client's own
+   *  navigation, so the page follows. Answers the window's id, or null when the shell refused (told to the user). */
+  async launchAt(
+    app: string,
+    launchId: string,
+    params: Readonly<Record<string, string>>,
+    target: LaunchTarget,
+  ): Promise<string | null> {
+    if (this.refuseWhileViewing(`open ${app}`)) return null;
+    // A launch into a named window runs on that window's desktop, a show beside one on that window's; any other on
+    // the desktop an open goes to.
+    const named =
+      target.kind === "window"
+        ? findWindow(this.state, target.windowId)
+        : target.kind === "show" && target.besideWindowId !== undefined
+          ? findWindow(this.state, target.besideWindowId)
+          : null;
+    const desktopId = named?.desktop.id ?? this.openingDesktopId();
+    if (desktopId === null) return null;
+    const isMinimized = this.isPhoneLayout();
+    await this.flushPendingSave();
+    let outcome: LaunchOutcome;
+    try {
+      outcome = await this.deps.api.launch(desktopId, {
+        app,
+        launch: launchId,
+        params,
+        clientId: this.deps.clientId,
+        target,
+        isMinimized,
+      });
+    } catch (error) {
+      this.toast(`Could not open ${app}: ${(error as Error).message}`);
+      return null;
+    }
+    if (target.kind === "window") {
+      if (named !== null) this.applyOwnNavigation(named, outcome.window);
+      return outcome.window.id;
+    }
+    if (target.kind === "show") {
+      const shown = findWindow(this.state, outcome.window.id);
+      if (shown !== null && shown.window.path !== outcome.window.path) this.applyOwnNavigation(shown, outcome.window);
+    }
+    this.takeOpened(desktopId, outcome.window, outcome.isNew, isMinimized);
+    return outcome.window.id;
+  }
+
+  /** ``shell:open {path, ifPresent}`` from a page: a window of the posting window's own app, on its desktop. */
+  async openPathFromWindow(windowId: string, path: string, ifPresent: IfPresent): Promise<void> {
+    const found = findWindow(this.state, windowId);
+    if (found === null) return;
+    if (!this.isPhoneLayout() && found.desktop.id !== this.state.activeDesktopId) {
+      await this.switchDesktop(found.desktop.id);
+    }
+    if (ifPresent === "focus") await this.focusOrOpenWindowAt(found.window.app, path);
+    else await this.openWindowAt(found.window.app, path, ifPresent);
+  }
+
+  async closeWindow(windowId: string): Promise<void> {
+    if (this.refuseWhileViewing("close a window")) return;
+    const found = findWindow(this.state, windowId);
+    if (found === null) return;
+    // The shell drops the window from this client's stored layout and stamps the rewrite, and the refetch
+    // its broadcast triggers takes that: a gesture still waiting in the debounce goes into the file first
+    // or it is lost.
+    await this.flushPendingSave();
+    try {
+      await this.deps.api.closeWindow(found.desktop.id, windowId);
+    } catch (error) {
+      this.toast(`Could not close the window: ${(error as Error).message}`);
+      return;
+    }
+    this.dispatch({ type: "window_closed_here", desktopId: found.desktop.id, windowId });
+  }
+
+  /** The Imbue Studio close chord: the focused window is told, then closed for everyone; a pinned window, which is never
+   *  closed, is minimized instead. */
+  async closeFocusedWindow(): Promise<void> {
+    // In a solo shell the chord belongs to the chrome, which closes the desktop window instead; the focused
+    // window here would be some other window of the desktop.
+    if (this.soloWindowId !== null) return;
+    // A phone's focused window is the one it shows.
+    const focused = this.isPhoneLayout() ? (shownWindowOf(this.state)?.id ?? null) : activeFocusedWindowId(this.state);
+    if (focused === null) return;
+    if (findWindow(this.state, focused)?.window.is_pinned === true) {
+      this.closePinnedWindowHere(focused);
+      return;
+    }
+    this.pageDriver?.requestClose(focused);
+    // A page that owns the chord (a browser closing one of its tabs) keeps its window.
+    if (this.pageDriver?.ownsCloseChord(focused) === true) return;
+    await this.closeWindow(focused);
+  }
+
+  /** What every human-facing Close does (the title bar's control, the two menus): close the window for everyone,
+   *  or, for a pinned window, which is never closed for everyone, close it for this client alone (minimized, and
+   *  its entry out of this client's bar until something shows it again), so the habit of reaching for the control
+   *  holds. */
+  async closeOrMinimizeWindow(windowId: string): Promise<void> {
+    if (this.refuseWhileViewing("close a window")) return;
+    if (findWindow(this.state, windowId)?.window.is_pinned === true) {
+      this.closePinnedWindowHere(windowId);
+      return;
+    }
+    await this.closeWindow(windowId);
+  }
+
+  /** Close a pinned window for this client: minimized, and its entry out of this client's bar (the shared window
+   *  is never closed; showing it again lists the entry back). The raw minimize, not ``minimizeWindow``, whose
+   *  relisting of a plain minimize would undo the very flag this writes. */
+  private closePinnedWindowHere(windowId: string): void {
+    this.dispatch({ type: "window_minimized", windowId });
+    this.setPinnedEntryShown(windowId, false);
+  }
+
+  /** Raise a window to the top of the stack, unless a move or resize of another window is in progress: the
+   *  gestured window holds the top until its gesture ends, and a raise that arrives meanwhile (a page reporting
+   *  focus as the chrome window's focus comes back mid-drag) is not the user choosing that window. Dropped
+   *  rather than deferred, since the gesture's end raises its own window again. */
+  raiseWindow(windowId: string): void {
+    if (this.refuseWhileViewing("raise a window")) return;
+    if (this.isAnotherWindowGestured(windowId)) return;
+    // Raising shows the window, so a pinned entry a close took out of the bar is listed back.
+    if (!this.isPinnedEntryShown(windowId)) this.setPinnedEntryShown(windowId, true);
+    this.dispatch({ type: "window_raised", windowId });
+  }
+
+  private isAnotherWindowGestured(windowId: string): boolean {
+    const gesture = this.gesture;
+    if (gesture === null) return false;
+    return (gesture.kind === "move" || gesture.kind === "resize") && gesture.windowId !== windowId;
+  }
+
+  minimizeWindow(windowId: string): void {
+    if (this.refuseWhileViewing("minimize a window")) return;
+    // Minimizing is not closing: a pinned window whose entry a close took out of the bar, revealed again since
+    // (a launch, the shell's show op), is relisted here, so the minimize dims its entry instead of vanishing it.
+    if (!this.isPinnedEntryShown(windowId)) this.setPinnedEntryShown(windowId, true);
+    this.dispatch({ type: "window_minimized", windowId });
+  }
+
+  /** Restore a minimized window (the taskbar's verb): raised; on a phone, shown. */
+  restoreWindow(windowId: string): void {
+    if (this.refuseWhileViewing("restore a window")) return;
+    if (this.isPhoneLayout()) {
+      this.showOnPhone({ kind: "window", windowId });
+      return;
+    }
+    this.raiseWindow(windowId);
+  }
+
+  setWindowState(windowId: string, state: WindowState): void {
+    if (this.refuseWhileViewing("resize a window")) return;
+    this.dispatch({ type: "window_state_set", windowId, state });
+  }
+
+  /** Place a window at a fraction of the backdrop -- the size menu's halves and quarters, which no
+   *  window state stands for. Normal, shown and raised, as a drag that ends away from an edge leaves it. */
+  setWindowFrame(windowId: string, frame: Frame): void {
+    this.dispatch({ type: "window_frame_set", windowId, frame });
+  }
+
+  toggleMaximized(windowId: string): void {
+    const placement = placementOf(this.state.layout, windowId);
+    if (placement.state === "MAXIMIZED") this.dispatch({ type: "window_restored", windowId });
+    else this.dispatch({ type: "window_state_set", windowId, state: "MAXIMIZED" });
+  }
+
+  /** Fill the viewport with a window (the title bar's and the menu's "Fullscreen"), or bring a fullscreen window
+   *  back to its kept frame (the strip's "Exit fullscreen"). Immersive mode is the chrome's own layer and is left
+   *  as it is (the Screen spec, D13). */
+  toggleFullscreen(windowId: string): void {
+    if (this.refuseWhileViewing("resize a window")) return;
+    const placement = placementOf(this.state.layout, windowId);
+    if (placement.state === "FULLSCREEN") this.dispatch({ type: "window_restored", windowId });
+    else this.dispatch({ type: "window_state_set", windowId, state: "FULLSCREEN" });
+  }
+
+  /** Pull a window out into a desktop window of the embedder's own without a drag (the window menu's "Open in
+   *  its own window"): the chrome opens it beside its window, at the size the window renders here. The
+   *  placement is saved first, since the chrome's new window reads it as soon as it loads. */
+  async detachWindow(windowId: string): Promise<void> {
+    if (!this.canPopOut || !this.isPopOutVerbOwn(windowId) || findWindow(this.state, windowId) === null) return;
+    this.dispatch({ type: "window_detached", windowId });
+    await this.flushPendingSave();
+    this.showDetachedWindow(windowId);
+  }
+
+  /** Show the ghost of a pulled-out window again where it stood, after ``minimizeWindow`` hid it (the ghost's
+   *  "Hide"); the window itself stays in the chrome's desktop window. */
+  showWindowGhost(windowId: string): void {
+    this.dispatch({ type: "window_detached", windowId });
+  }
+
+  /** Raise (or reopen) the desktop window a pulled-out window is shown in, at the size the window renders here. */
+  showDetachedWindow(windowId: string): void {
+    if (findWindow(this.state, windowId) === null) return;
+    const rect = this.renderedRect(placementOf(this.state.layout, windowId));
+    this.popOut.requestPopOut(this.popOutRequestFor(windowId, rect));
+  }
+
+  /** What the chrome is asked for when a window is pulled out: the window's title and the size its desktop
+   *  window is to have. */
+  private popOutRequestFor(windowId: string, size: PixelSize): PopOutRequest {
+    const found = findWindow(this.state, windowId);
+    const title =
+      found === null ? "" : effectiveWindowTitle(this.state, found.window, appByName(this.state, found.window.app));
+    return { windowId, title, width: size.width, height: size.height };
+  }
+
+  /** Tell the chrome about a title-bar drag it is to watch: the window as it renders at ``rect``, held at
+   *  ``pointer``. Sent again when the dragged window changes size (a snapped window un-snapping). */
+  private announceWindowDrag(windowId: string, rect: PixelRect, pointer: PixelPoint): void {
+    const grab = {
+      x: Math.min(Math.max(pointer.x - rect.x, 0), rect.width),
+      y: Math.min(Math.max(pointer.y - rect.y, 0), rect.height),
+    };
+    this.popOut.beginWindowDrag({ ...this.popOutRequestFor(windowId, rect), grabX: grab.x, grabY: grab.y });
+  }
+
+  /** Bring a pulled-out window back to the desktop (``minds:reattach-window``, the ghost's "Bring back", the
+   *  entry's menu): shown and raised, at ``frame`` when a drop back onto the desktop named one. The window's own
+   *  desktop is shown first when the client has moved to another meanwhile (the chrome names a window, not a
+   *  desktop). Saved at once, and in a solo shell reported only once saved: the chrome closes that shell's
+   *  desktop window on the report, which would abort a save still on its way. */
+  async reattachWindow(windowId: string, frame: Frame | null): Promise<void> {
+    if (!this.isPopOutVerbOwn(windowId)) return;
+    const found = findWindow(this.state, windowId);
+    if (found === null) return;
+    if (found.desktop.id !== this.state.activeDesktopId) await this.switchDesktop(found.desktop.id);
+    this.isReportHeldForSave = this.soloWindowId !== null;
+    this.dispatch({ type: "window_reattached", windowId, frame });
+    await this.flushPendingSave();
+    this.isReportHeldForSave = false;
+    this.reportDetachedWindows();
+  }
+
+  /** Whether a pull-out verb for ``windowId`` is this shell's to apply: any window's in a desktop shell, and only
+   *  its own window's in a solo shell, whose desktop and arrangement belong to the client's main window. Checked
+   *  before the verb's side effects (a desktop switch, an ask of the chrome), which ``dispatch`` cannot refuse. */
+  private isPopOutVerbOwn(windowId: string): boolean {
+    return this.soloWindowId === null || windowId === this.soloWindowId;
+  }
+
+  /** A taskbar entry's click: minimize the focused window, else show it as ``showWindow`` does. */
+  toggleTaskbarEntry(windowId: string): void {
+    if (activeFocusedWindowId(this.state) === windowId) this.minimizeWindow(windowId);
+    else this.showWindow(windowId);
+  }
+
+  /** Put a window on screen without ever putting it away: for a pulled-out window, show its ghost again when the
+   *  ghost is hidden, else its own desktop window; otherwise restore and raise when minimized, raise otherwise. */
+  private showWindow(windowId: string): void {
+    const placement = placementOf(this.state.layout, windowId);
+    if (placement.is_detached) {
+      if (placement.is_minimized) this.showWindowGhost(windowId);
+      else this.showDetachedWindow(windowId);
+      return;
+    }
+    if (placement.is_minimized) this.restoreWindow(windowId);
+    else this.raiseWindow(windowId);
+  }
+
+  refreshWindow(windowId: string): void {
+    this.pageDriver?.reload(windowId);
+  }
+
+  /** A page reported where it is; posted to the window's location route when it differs from the stored
+   *  record (this client's own for an independent window), and the record the route answers is taken at once,
+   *  so the stored path is the reported one before the broadcast lands (a broadcast from another cause
+   *  meanwhile must not read the report as a move to follow). Answers whether the shell took the report (or had
+   *  nothing to take); false when it refused. */
+  async reportLocation(windowId: string, path: string, title: string): Promise<boolean> {
+    // A viewed window's location is its owner's to write: the report is refused quietly (a page reports on every
+    // load, which is nobody's gesture), and the page follows the stored path again.
+    if (this.viewedDesktop() !== null) return false;
+    const found = findWindow(this.state, windowId);
+    if (found === null) return false;
+    const seen = effectiveWindow(this.state, found.window);
+    if (seen.path === path && seen.title === title) return true;
+    this.latestReportedPaths.set(windowId, path);
+    let reported: WindowRecord;
+    try {
+      reported = await this.deps.api.reportWindowLocation(found.desktop.id, windowId, this.deps.clientId, path, title);
+    } catch (error) {
+      console.warn(`[si] the shell did not take the location of ${windowId}`, error);
+      return false;
+    }
+    if (this.latestReportedPaths.get(windowId) !== path) return true;
+    this.latestReportedPaths.delete(windowId);
+    this.dispatch({ type: "window_location_reported", desktopId: found.desktop.id, window: reported });
+    return true;
+  }
+
+  async quitApp(appName: string): Promise<void> {
+    try {
+      await this.deps.api.quitApp(appName);
+    } catch (error) {
+      this.toast(`Failed to quit ${appName}: ${(error as Error).message}`);
+    }
+  }
+
+  openLauncher(): void {
+    if (this.isLauncherOpenNow) return;
+    this.isLauncherOpenNow = true;
+    this.notifyListeners();
+  }
+
+  closeLauncher(): void {
+    if (!this.isLauncherOpenNow) return;
+    this.isLauncherOpenNow = false;
+    this.notifyListeners();
+  }
+
+  /** A drag of a window's title bar began (past the threshold) at ``pointer``, in backdrop pixels. */
+  beginWindowMove(windowId: string, pointer: PixelPoint): void {
+    const placement = placementOf(this.state.layout, windowId);
+    const startRect = this.renderedRect(placement);
+    // A solo shell shows one window edge to edge; there is no desktop to pull a window out of.
+    const isWatched = this.canPopOut && this.soloWindowId === null;
+    this.releasedWatchedDrag = null;
+    this.gesture = {
+      kind: "move",
+      windowId,
+      startRect,
+      startPointer: pointer,
+      currentRect: startRect,
+      zone: null,
+      isUnsnapped: false,
+      isWatched,
+      isTearingOut: false,
+    };
+    this.raiseWindow(windowId);
+    if (isWatched) this.announceWindowDrag(windowId, startRect, pointer);
+    this.notifyListeners();
+  }
+
+  /** The pointer moved during a window drag. The gesture's rectangle and zone are updated with no
+   *  redraw (a redraw per pointer event re-renders the whole desktop and repositions every live
+   *  page): the App paints them straight onto the window, its page, and the snap preview, and
+   *  ``gestureRectFor`` and ``snapPreviewRect`` keep answering the live values, so a redraw from
+   *  any other cause mid-drag renders the same thing. */
+  updateWindowMove(pointer: PixelPoint): void {
+    const gesture = this.gesture;
+    if (gesture === null || gesture.kind !== "move") return;
+    const placement = placementOf(this.state.layout, gesture.windowId);
+    let start = gesture;
+    if (placement.state !== "NORMAL" && !gesture.isUnsnapped) {
+      const distance = Math.hypot(pointer.x - gesture.startPointer.x, pointer.y - gesture.startPointer.y);
+      if (distance < this.metrics.unsnapDistance) return;
+      // Un-snap: the kept frame's size hung under the pointer at the grab fraction, from here on a plain move.
+      const grabFraction = (gesture.startPointer.x - gesture.startRect.x) / Math.max(gesture.startRect.width, 1);
+      const grabOffsetY = (gesture.startPointer.y - gesture.startRect.y) / Math.max(this.backdrop.height, 1);
+      const pointerFraction = {
+        x: pointer.x / Math.max(this.backdrop.width, 1),
+        y: pointer.y / Math.max(this.backdrop.height, 1),
+      };
+      const frame = unsnapFrame(placement.frame, pointerFraction, grabFraction, grabOffsetY);
+      const unsnappedRect = fitFrameToBackdrop(frame, this.backdrop, this.metrics);
+      start = { ...gesture, startRect: unsnappedRect, startPointer: pointer, isUnsnapped: true };
+      // The window the chrome would pull out is a different size now, held elsewhere.
+      if (start.isWatched) this.announceWindowDrag(start.windowId, unsnappedRect, pointer);
+    }
+    const delta = { x: pointer.x - start.startPointer.x, y: pointer.y - start.startPointer.y };
+    const currentRect = movedRect(start.startRect, delta, this.backdrop, this.metrics);
+    // While the chrome has the window out, no zone is offered; whether it is out is the chrome's word
+    // (``setTearOut``), since the pointer events here stop at the chrome window's edge on some platforms.
+    const zone = start.isTearingOut ? null : snapZoneForRelease(pointer, this.backdrop, this.metrics.snapThreshold);
+    this.gesture = { ...start, currentRect, zone };
+  }
+
+  endWindowMove(pointer: PixelPoint): void {
+    const gesture = this.gesture;
+    if (gesture === null || gesture.kind !== "move") return;
+    this.updateWindowMove(pointer);
+    const settled = this.gesture;
+    this.gesture = null;
+    if (settled === null || settled.kind !== "move") return;
+    const placement = placementOf(this.state.layout, settled.windowId);
+    if (settled.isWatched) {
+      this.popOut.endWindowDrag(settled.windowId, settled.isTearingOut, false);
+      this.releasedWatchedDrag = {
+        windowId: settled.windowId,
+        isDetached: settled.isTearingOut,
+        placementAtStart: placement,
+      };
+    }
+    if (settled.isTearingOut) {
+      // Released outside, and this shell saw the release itself (a pointer that does leave the chrome's window):
+      // the window was detached and saved as it went out, so the gesture only ends.
+    } else if (settled.zone !== null) {
+      // The frame is untouched so restore returns to it (an un-snapped drag kept it too).
+      this.dispatch({ type: "window_state_set", windowId: settled.windowId, state: settled.zone });
+    } else if (placement.state === "NORMAL" || settled.isUnsnapped) {
+      this.dispatch({
+        type: "window_frame_set",
+        windowId: settled.windowId,
+        frame: frameFromPixels(settled.currentRect, this.backdrop),
+      });
+    }
+    this.notifyListeners();
+  }
+
+  beginWindowResize(windowId: string, edge: ResizeEdge): void {
+    const placement = placementOf(this.state.layout, windowId);
+    // Resizing a snapped or maximized window first un-snaps it, at the rectangle it rendered at.
+    const startRect = this.renderedRect(placement);
+    this.gesture = { kind: "resize", windowId, edge, startRect, currentRect: startRect };
+    if (placement.state !== "NORMAL") {
+      this.dispatch({ type: "window_frame_set", windowId, frame: frameFromPixels(startRect, this.backdrop) });
+    } else {
+      this.raiseWindow(windowId);
+    }
+    this.notifyListeners();
+  }
+
+  /** The pointer moved during a resize; no redraw, as for a move. */
+  updateWindowResize(delta: PixelPoint): void {
+    const gesture = this.gesture;
+    if (gesture === null || gesture.kind !== "resize") return;
+    this.gesture = { ...gesture, currentRect: resizedRect(gesture.startRect, gesture.edge, delta, this.metrics) };
+  }
+
+  endWindowResize(delta: PixelPoint): void {
+    const gesture = this.gesture;
+    if (gesture === null || gesture.kind !== "resize") return;
+    this.updateWindowResize(delta);
+    const settled = this.gesture;
+    this.gesture = null;
+    if (settled === null || settled.kind !== "resize") return;
+    this.dispatch({
+      type: "window_frame_set",
+      windowId: settled.windowId,
+      frame: frameFromPixels(settled.currentRect, this.backdrop),
+    });
+    this.notifyListeners();
+  }
+
+  /** A shortcut's icon was lifted out of the cell it is drawn in. */
+  beginShortcutDrag(app: string, launch: string, pointer: PixelPoint): void {
+    const key = shortcutKey(app, launch);
+    const origin = this.placedShortcuts().find((entry) => placedShortcutKey(entry) === key);
+    if (origin === undefined) return;
+    this.gesture = {
+      kind: "shortcut",
+      app,
+      launch,
+      originCell: origin.cell,
+      lift: { x: 0, y: 0 },
+      targetCell: cellAtPoint(pointer, this.metrics, this.gridDimensions()),
+    };
+    this.notifyListeners();
+  }
+
+  /** The pointer moved during a shortcut drag. Only a new cell under it redraws: the room made is the same
+   *  until then, and the lift itself is painted straight onto the icon (``paintShortcut``), a frame at a time. */
+  updateShortcutDrag(pointer: PixelPoint, lift: PixelPoint): void {
+    const gesture = this.gesture;
+    if (gesture === null || gesture.kind !== "shortcut") return;
+    const targetCell = cellAtPoint(pointer, this.metrics, this.gridDimensions());
+    const isSameTarget = isSameCell(targetCell, gesture.targetCell);
+    this.gesture = { ...gesture, lift, targetCell };
+    if (!isSameTarget) this.notifyListeners();
+  }
+
+  endShortcutDrag(pointer: PixelPoint, lift: PixelPoint): void {
+    const gesture = this.gesture;
+    if (gesture === null || gesture.kind !== "shortcut") return;
+    this.updateShortcutDrag(pointer, lift);
+    const settled = this.gesture;
+    this.gesture = null;
+    // The arrangement goes in BEFORE the redraw: with the gesture gone and the shortcuts still recorded
+    // in the cells they were in, a redraw here would put them both back for a frame.
+    if (settled !== null && settled.kind === "shortcut") {
+      void this.dropShortcut(settled.app, settled.launch, settled.targetCell, this.shortcutArrangement(settled));
+    }
+    this.notifyListeners();
+  }
+
+  /** Where the shortcuts sit right now: their placement over the current grid, with the room made for the
+   *  one in the hand while a drag holds it over a cell. What the backdrop draws and what a drop commits. */
+  placedShortcuts(): readonly PlacedShortcut[] {
+    const gesture = this.gesture;
+    if (gesture !== null && gesture.kind === "shortcut") return this.shortcutArrangement(gesture);
+    return this.restingShortcuts();
+  }
+
+  /** Where the shortcuts sit with nothing in the hand: their placement over the current grid. */
+  private restingShortcuts(): readonly PlacedShortcut[] {
+    const desktop = activeDesktop(this.state);
+    if (desktop === null) return [];
+    return placeShortcuts(desktop.shortcuts, this.gridDimensions());
+  }
+
+  /** The box of the cell a shortcut is placed in, or null when the desktop holds no such shortcut: what the
+   *  paint of a drop writes, as ``windowRect`` is for a window. For the one a drag holds this is the cell it
+   *  would land in rather than the box it draws in, which its lift carries it out of. */
+  shortcutRect(app: string, launch: string): PixelRect | null {
+    const key = shortcutKey(app, launch);
+    const entry = this.placedShortcuts().find((candidate) => placedShortcutKey(candidate) === key);
+    return entry === undefined ? null : cellRect(entry.cell, this.metrics);
+  }
+
+  /** The arrangement ``gesture`` has made: the placement with the held shortcut in the cell under the pointer
+   *  and the shortcut that was in it stepped aside. */
+  private shortcutArrangement(gesture: ShortcutGesture): readonly PlacedShortcut[] {
+    return withRoomMadeFor(
+      this.restingShortcuts(),
+      shortcutKey(gesture.app, gesture.launch),
+      gesture.targetCell,
+      this.gridDimensions(),
+    );
+  }
+
+  /** A floating entry was lifted; ``grabOffset`` is where inside its box the pointer pressed. Nothing moves for
+   *  an app with no pinned window on the active desktop. */
+  beginFloatingEntryDrag(app: string, pointer: PixelPoint, grabOffset: PixelPoint): void {
+    const current = this.presentationOf(app);
+    if (current === null) return;
+    const start = this.renderedFloatingEntryRect(app, current.position);
+    this.gesture = { kind: "floating-entry", app, grabOffset, currentRect: start };
+    this.updateFloatingEntryDrag(pointer);
+  }
+
+  /** The pointer moved during a floating entry drag; no redraw, as for a window move: the App paints the
+   *  entry's rectangle straight onto it, and ``renderedFloatingEntryRect`` answers the live value meanwhile. */
+  updateFloatingEntryDrag(pointer: PixelPoint): void {
+    const gesture = this.gesture;
+    if (gesture === null || gesture.kind !== "floating-entry") return;
+    const corner = { x: pointer.x - gesture.grabOffset.x, y: pointer.y - gesture.grabOffset.y };
+    const clamped = floatingPositionFromPixels(corner, this.backdrop, this.metrics);
+    this.gesture = { ...gesture, currentRect: floatingEntryRect(clamped, this.backdrop, this.metrics) };
+  }
+
+  /** The rectangle the desktop draws a floating entry at now, from the app alone: the drag's while one moves it,
+   *  else its stored position's. What the paint of a drag writes onto the entry per pointer move and when the
+   *  gesture ends, as ``windowRect`` is for a window. */
+  floatingEntryRectOf(app: string): PixelRect {
+    return this.renderedFloatingEntryRect(app, this.presentationOf(app)?.position ?? null);
+  }
+
+  /** The drag ended: the position is written to the client record, once. */
+  endFloatingEntryDrag(pointer: PixelPoint): void {
+    const gesture = this.gesture;
+    if (gesture === null || gesture.kind !== "floating-entry") return;
+    this.updateFloatingEntryDrag(pointer);
+    const settled = this.gesture;
+    this.gesture = null;
+    this.notifyListeners();
+    if (settled === null || settled.kind !== "floating-entry") return;
+    const current = this.presentationOf(settled.app);
+    if (current === null) return;
+    const position = floatingPositionFromPixels(settled.currentRect, this.backdrop, this.metrics);
+    void this.setEntryPresentation(settled.app, { ...current, position });
+  }
+
+  cancelGesture(): void {
+    if (this.gesture === null) return;
+    const cancelled = this.gesture;
+    this.gesture = null;
+    // A watched drag cancelled mid-way (Escape, the browser): the chrome drops any window it was dragging, and
+    // one that was out comes back to the desktop.
+    if (cancelled.kind === "move" && cancelled.isWatched) {
+      this.popOut.endWindowDrag(cancelled.windowId, false, true);
+      if (cancelled.isTearingOut) this.bringBackDraggedWindow(cancelled.windowId);
+    }
+    this.notifyListeners();
+  }
+
+  private scheduleSave(): void {
+    if (this.saveTimer !== null) clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      void this.save();
+    }, SAVE_DEBOUNCE_MS);
+  }
+
+  /** Save now if a gesture is waiting, and wait for any save already on its way. */
+  async flushPendingSave(): Promise<void> {
+    if (this.saveTimer !== null) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    await this.save();
+  }
+
+  private save(): Promise<void> {
+    if (this.saveInFlight !== null) return this.saveInFlight.then(() => this.save());
+    // A viewed desktop's layout is the owner's, read-only: nothing a viewing window holds is this client's to
+    // save (the multiplayer spec, section 8.3), and the next refresh resets anything that slipped through.
+    if (this.viewedDesktop() !== null) return Promise.resolve();
+    if (!isLayoutDirty(this.state) || !this.state.isLayoutLoaded || this.state.activeDesktopId === null) {
+      return Promise.resolve();
+    }
+    const desktopId = this.state.activeDesktopId;
+    const version = this.state.layoutVersion;
+    const request: PlacementsSaveRequest = {
+      clientId: this.deps.clientId,
+      saveId: this.saveIds.mint(),
+      baseUpdatedAt: this.state.layout.updated_at,
+      placements: this.state.layout.placements,
+    };
+    const inFlight = this.deps.api
+      .savePlacements(desktopId, request)
+      .then((updatedAt) => {
+        this.dispatch({ type: "layout_saved", desktopId, version, updatedAt });
+      })
+      .catch((error: unknown) => {
+        if (error instanceof StalePlacementsSaveError) {
+          // The shell holds a newer layout (an agent op, another window's save): it wins, and the
+          // gestures this window had not saved yet go with it.
+          console.warn(`[si] the layout of ${desktopId} moved under this window; taking the shell's`, error);
+          return this.refetchLayout();
+        }
+        console.warn(`[si] could not save the layout of ${desktopId}`, error);
+      })
+      .finally(() => {
+        this.saveInFlight = null;
+      });
+    this.saveInFlight = inFlight;
+    return inFlight;
+  }
+
+  /** Take the shell's layout of the active desktop when it differs from the one this window holds. While the
+   *  window is viewing a desktop that is not the viewer's own (the multiplayer spec, section 8.3), the layout
+   *  shown is the desktop owner's -- their windows as they have them -- rather than this client's own. */
+  async refetchLayout(): Promise<void> {
+    this.syncViewingRefresh();
+    const desktopId = this.state.activeDesktopId;
+    if (desktopId === null) return;
+    const sequence = ++this.layoutFetchSequence;
+    let layout: Layout;
+    let viewport: PixelSize | null = null;
+    try {
+      if (this.viewedDesktop() !== null) {
+        const owners = await this.deps.api.fetchOwnerPlacements(desktopId);
+        layout = owners.layout;
+        viewport = owners.viewport;
+      } else {
+        layout = await this.deps.api.fetchPlacements(desktopId, this.deps.clientId);
+      }
+    } catch (error) {
+      console.warn(`[si] could not fetch the layout of ${desktopId}`, error);
+      return;
+    }
+    if (sequence !== this.layoutFetchSequence || desktopId !== this.state.activeDesktopId) return;
+    // The size the owner arranged the desktop in comes with every read of their layout, so it follows their
+    // window as the layout does; every branch below redraws, which lays the letterbox out at the new size.
+    this.viewedViewport = viewport;
+    // An unchanged stamp says the placements file did not move (this window's own save, or a broadcast that
+    // carried nothing new for it): only the client's window paths, which change without moving the stamp, are
+    // taken, and a gesture still waiting to be saved is kept rather than thrown away with a reload. A viewed
+    // desktop's layout is reloaded whole on every answer instead: nothing this window holds of it is a gesture
+    // worth keeping, and whatever slipped past the guards is reset by the next poll.
+    const isViewing = this.viewedDesktop() !== null;
+    if (!isViewing && this.state.isLayoutLoaded && layout.updated_at === this.state.layout.updated_at) {
+      this.layoutLoadsRevision += 1;
+      if (isSameWindowPaths(layout.window_paths, this.state.layout.window_paths)) {
+        // Nothing to take, but the pages still follow: the shell handing back the paths this window already
+        // holds is what confirms a page's own location report, so the page stops guarding the path it left.
+        this.notifyListeners();
+        return;
+      }
+      this.dispatch({ type: "window_paths_loaded", desktopId, windowPaths: layout.window_paths });
+      return;
+    }
+    this.layoutLoadsRevision += 1;
+    this.dispatch({ type: "layout_loaded", desktopId, layout });
+    this.healSoloWindowOnFirstLoad();
+  }
+
+  /** A solo shell exists because its window is pulled out; the first layout it loads may say otherwise. A
+   *  desktop window the chrome reopened (a relaunch, a reopen of the app, a backend retry) takes the layout as the
+   *  truth at once: the window was brought back while it was away, and the report without it closes this
+   *  window. A freshly torn-out one cannot: during a drag the desktop's shell writes the detach as the window
+   *  goes out and that save is on its way while this shell boots, so a load that does not yet say it waits for
+   *  the desktop's word (the broadcast's refetch is another load, which settles this). Only when no word comes
+   *  within the grace (a detach whose save was refused) does this shell take its own existence as the truth
+   *  and detach the window itself. Until then the report is held: one without the solo window would close this
+   *  window. A later load that says the window is back is the desktop's word, and the chrome closes it. */
+  private healSoloWindowOnFirstLoad(): void {
+    if (!this.isSoloFirstLayoutPending || this.soloWindowId === null) return;
+    const found = findWindow(this.state, this.soloWindowId);
+    const isAttachedHere =
+      found !== null &&
+      found.desktop.id === this.state.activeDesktopId &&
+      !placementOf(this.state.layout, this.soloWindowId).is_detached;
+    if (!isAttachedHere || this.deps.isSoloReopened === true) {
+      this.settleSoloFirstLoad();
+      return;
+    }
+    if (this.soloHealTimer !== null) return;
+    this.soloHealTimer = setTimeout(() => this.detachSoloWindowAfterGrace(), SOLO_HEAL_GRACE_MS);
+  }
+
+  /** The first load's question is answered (the layout says the window is out, or it is not here at all): the
+   *  report the first load owed goes out. */
+  private settleSoloFirstLoad(): void {
+    this.isSoloFirstLayoutPending = false;
+    if (this.soloHealTimer !== null) {
+      clearTimeout(this.soloHealTimer);
+      this.soloHealTimer = null;
+    }
+    this.reportDetachedWindows();
+  }
+
+  /** No load within the grace said the window is out: this shell's existence is the truth, and it writes it. */
+  private detachSoloWindowAfterGrace(): void {
+    this.soloHealTimer = null;
+    if (!this.isSoloFirstLayoutPending || this.soloWindowId === null) return;
+    this.isSoloFirstLayoutPending = false;
+    this.dispatch({ type: "window_detached", windowId: this.soloWindowId });
+    void this.flushPendingSave();
+  }
+
+  /** The move or resize of a window in progress, else null. */
+  windowGesture(): MoveGesture | ResizeGesture | null {
+    const gesture = this.gesture;
+    return gesture !== null && (gesture.kind === "move" || gesture.kind === "resize") ? gesture : null;
+  }
+
+  /** The frame a placement renders at while a gesture moves or resizes it, else its own. */
+  gestureRectFor(windowId: string): PixelRect | null {
+    const gesture = this.windowGesture();
+    if (gesture === null || gesture.windowId !== windowId) return null;
+    return gesture.currentRect;
+  }
+
+  /** The rectangle the desktop draws a window at now: the gesture's while one moves or resizes it, else
+   *  its placement's. What a render positions the window by, and what the paint of a gesture writes
+   *  onto it when the gesture ends or is cancelled, so the DOM already equals what the next render
+   *  answers (a render diffs against the last render, not the DOM, and writes nothing it finds equal). */
+  windowRect(windowId: string): PixelRect {
+    return this.gestureRectFor(windowId) ?? this.renderedRect(placementOf(this.state.layout, windowId));
+  }
+
+  /** The rectangle the snap preview draws, or null when the drag is in no zone. */
+  snapPreviewRect(): PixelRect | null {
+    const gesture = this.gesture;
+    if (gesture === null || gesture.kind !== "move" || gesture.zone === null) return null;
+    return frameToPixels(snapFrame(gesture.zone), this.backdrop);
+  }
+}
+
+/** What the notice that a visitor's desktop was deleted names: the deleted desktop, and the one the shell seeded
+ *  in its place (not necessarily the one this client landed on: a deep link's desktop wins the landing). */
+export interface ReplacedDesktop {
+  readonly replacedName: string;
+  readonly seededName: string;
+}
+
+/** The replaced desktop an arrival reports, when it does; the shell names the deleted desktop only alongside the
+ *  one it seeded, so an answer with one but not the other reports nothing. */
+export function replacedDesktopOf(arrival: ClientArrival | null): ReplacedDesktop | null {
+  if (arrival === null || arrival.replaced_desktop_name === null || arrival.created_desktop === null) return null;
+  return { replacedName: arrival.replaced_desktop_name, seededName: arrival.created_desktop.name };
+}
+
+/** The desktop a fresh window lands on: the deep link's when it exists, else the one the shell's arrival answer
+ *  named when it exists, else the first; null with no desktops. */
+export function chooseInitialDesktopId(
+  desktops: readonly Desktop[],
+  deepLinkDesktopId: string | null,
+  arrivalDesktopId: string | null,
+): string | null {
+  if (desktops.length === 0) return null;
+  const ids = new Set(desktops.map((desktop) => desktop.id));
+  if (deepLinkDesktopId !== null && ids.has(deepLinkDesktopId)) return deepLinkDesktopId;
+  if (arrivalDesktopId !== null && ids.has(arrivalDesktopId)) return arrivalDesktopId;
+  return desktops[0].id;
+}

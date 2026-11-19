@@ -1,21 +1,14 @@
 import json
 import re
 from collections.abc import Sequence
-from typing import Final
+from typing import Any, Final
 
-from loguru import logger
-from pydantic import BaseModel
-from pydantic import Field
-from pydantic import ValidationError
-
-from litellm import completion
-from litellm import completion_cost
+from litellm import completion, completion_cost
 from litellm.exceptions import OpenAIError
+from loguru import logger
+from pydantic import BaseModel, Field, ValidationError
 
-from rosette.claude_p import ClaudeCLIError
-from rosette.claude_p import ClaudeResult
-from rosette.claude_p import Usage
-from rosette.claude_p import claude_p_completion
+from rosette.claude_p import ClaudeCLIError, ClaudeResult, Usage, claude_p_completion
 from rosette.data_types import Analysis
 
 
@@ -97,13 +90,23 @@ This holds however short it is: a single word, a bare verb like "to look up", a 
 noun phrase like "recommendation algorithms", or a full sentence are ALL \
 translate. The student wrote English because they want the {language}; never \
 hand back an English restatement of what they already wrote.
-- "gloss" -- the line is in {language} and too short to judge as a sentence (a \
-single word, or a bare noun or verb phrase). Give its English meaning.
-- "assess" -- the line is in {language} with enough substance to judge (a clause \
-or more). Check it, and correct it if it needs correcting.
+- "gloss" -- the line is in {language} and written as something to look up \
+rather than as a sentence to be marked: a single word, a noun or verb phrase, \
+or any short phrase of a few words that carries no closing punctuation. Give \
+its English meaning.
+- "assess" -- the line is in {language} and written as a sentence: it closes \
+with punctuation (. ! ?), or it runs past a short phrase, or it is more than \
+one clause. Check it, and correct it if it needs correcting.
 
 So a short English phrase is "translate", never "gloss"; "gloss" is only ever \
 for {language} the student is looking up.
+
+**Closing punctuation is what makes a short {language} phrase a sentence to \
+mark.** Without it, a short phrase is being looked up: "ho fame" is "gloss" \
+(I'm hungry), "in ritardo" is "gloss" (late), "a che ora" is "gloss" (at what \
+time). With it, the same words are "assess": "Ho fame." is a sentence the \
+student wrote and wants checked. A line that runs past a short phrase is \
+"assess" either way, full stop or no full stop.
 
 Answer with this JSON object:
 
@@ -470,7 +473,7 @@ def ask_the_model(prompt: str, system_prompt: str, api_key: str | None) -> Claud
     return _result_from_completion(response)
 
 
-def _result_from_completion(response: object) -> ClaudeResult:
+def _result_from_completion(response: Any) -> ClaudeResult:
     choice = response.choices[0]
     text = choice.message.content or ""
     # A reply that runs past the limit comes back EMPTY rather than truncated,

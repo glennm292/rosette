@@ -9,13 +9,15 @@ generates the structure; this is what goes in the FILL-IN blocks.
 1. **A hero graphic.** Already wired up: the README embeds `template.svg`,
    the bespoke thumbnail designed during assembly. A hand-authored SVG scales
    best, which is what that file already is.
-2. **The "Open in Mind" call-to-action.** Generated, not written by hand. It is
-   deliberately prose-free -- a large centered button plus a one-line copyable
-   fallback beneath it, nothing else. The button points at the HTTPS trampoline
-   (`https://boweiliu.github.io/open-in-minds/?git_url=...`), NEVER a bare
-   `minds://` link, which GitHub renders dead. Both the button and the fallback
-   carry the `MINDS_TEMPLATE_REPO_URL` placeholder until the lead substitutes
-   the real owner/repo in §7; do not fill it in yourself and do not remove it.
+2. **The "Open in Imbue Studio" call-to-action.** Generated, not written by
+   hand. It is deliberately prose-free -- a large centered button plus a
+   one-line copyable fallback beneath it, nothing else. The button points at
+   the Studio trampoline page (`https://studio.imbue.com/open?git_url=...`),
+   NEVER a bare `imbue-studio://` link, which GitHub renders dead. Both the
+   button and the fallback carry the `MINDS_TEMPLATE_REPO_URL` placeholder
+   until the repo exists and `github_repo.py create` fills in the real
+   owner/repo; do not fill it in
+   yourself and do not remove it.
 3. **Why you care.** One or two plain sentences on the problem it solves. Not
    how it is built -- why someone would want it.
 4. **How to use it.** How someone actually uses the thing once it is running:
@@ -46,7 +48,7 @@ list of defects.
 The README is a page, so the user reviews it as one. Paste its full text as
 your chat message -- the chat renders markdown, so they see the headings, the
 table, the hero, and the badge as a page rather than as source. This happens at
-the publish flow's §6 confirmation gate and is driven by the LEAD -- never by
+the publish flow's publish gate and is driven by the LEAD -- never by
 the assembly worker, whose worktree is background work and whose output the
 user has not asked to see yet.
 
@@ -62,16 +64,16 @@ reporting them as faults:
 - **The hero image will not appear.** The README points at `template.svg` by a
   relative path, which resolves on GitHub and does not resolve in a chat
   message. Tell them the image is the thumbnail they already approved.
-- **The "Open in Mind" button renders as a link or as nothing.** It is an HTML
-  anchor around an image; GitHub shows the button.
+- **The "Open in Imbue Studio" button renders as a link or as nothing.** It is
+  an HTML anchor around an image; GitHub shows the button.
 
 **If they say no, rewrite and show them again** -- that is the entire point of
 asking. Edit `$WT/README.md` and paste the new text. Keep the generated
 structure: their objection is almost always about the WORDS, not the shape, and
-the hero, the Open in Mind call-to-action, and its `MINDS_TEMPLATE_REPO_URL`
-placeholder must all survive any rewrite -- the lead substitutes that
-placeholder in §7 and §8 blocks the push if it is missing. Loop until they are
-happy.
+the hero, the Open in Imbue Studio call-to-action, and its
+`MINDS_TEMPLATE_REPO_URL` placeholder must all survive any rewrite: creating
+the repo fills the placeholder in, and the pre-push gate blocks a push that
+still has it. Loop until they are happy.
 
 ## Verify the published page
 
@@ -82,11 +84,13 @@ Chromium (drive it with the `agentic-browser-fleet` skill) and confirm:
 - the hero graphic and any screenshots render, with no broken images. This is
   the real check: a relative path that is correct in the source tree can still
   404 on github.com, and only the published page shows it;
-- the **Open in Mind** badge loads and its link goes to the trampoline.
-  Clicking it opens the trampoline page; the final `minds://` hop only completes
-  on a machine with Mind installed, so do not treat that as a failure;
+- the **Open in Imbue Studio** badge loads and its link goes to the trampoline
+  page on `studio.imbue.com`. Clicking it opens that page; the final
+  `imbue-studio://` hop only completes on a machine with Studio installed, so
+  do not treat that as a failure;
 - the copyable ` /use-template` line names the right repo (its leading space is
   deliberate -- a pasted `/...` can be read as a slash command), and every other
   link resolves.
 
-Fix and re-push until the live page is clean.
+Fix and re-push until the live page is clean; `publish-template`'s step 9 says
+how to re-push onto the version just published.

@@ -1,73 +1,99 @@
 # Verifying an app
 
-Run both checks. `curl` confirms the backend answers on its registered
-port; Playwright catches rendering bugs that `curl` misses (a blank
-page, JS errors, a marker that never appears).
+Run verification against `http://127.0.0.1:<port>/` (the port registered with
+`forward_port.py`). The browser-facing origin (`http://<name>.<workspace-host>/`)
+is served by the host-side forwarder and is **not reachable from inside the container**,
+so in-container verification targets the local port directly.
 
-Both checks run against `http://127.0.0.1:<port>/` -- the URL you
-registered with `forward_port.py`. The browser-facing origin
-(`http://<name>.<workspace-host>/`) is served by the host-side
-forwarder and is **not reachable from inside the container**, so
-in-container verification targets the local port directly. That is an
-honest proxy for the tab: nothing rewrites or transforms traffic
-between the origin and your port, so a page that renders correctly at
-`http://127.0.0.1:<port>/` renders identically in the tab. What it
-cannot prove is the registration itself, so check that too (step 0).
+## Quick verification with verify_app.py (Recommended)
 
-## Step 0: confirm the registration
+Use `system/scripts/workspace_scripts/verify_app.py` for instant verification (<0.1s for HTTP/marker checks,
+~1.3s for browser rendering & screenshots). It resolves the port automatically from
+the app name, and it restarts and surfaces the app too, so one call covers the whole
+apply-check-show loop:
+
+```bash
+# After a code change: restart (no 30 s wait), check, render, and open the window beside the chat:
+uv run --no-sync system/scripts/workspace_scripts/verify_app.py <name> --restart --marker "<expected-heading-or-text>" --screenshot /tmp/app_mock.png --open
+
+# The same for an app already on the user's screen (reloads its windows instead):
+uv run --no-sync system/scripts/workspace_scripts/verify_app.py <name> --restart --marker "<expected-heading-or-text>" --refresh
+
+# Fast HTTP readiness & content marker check only (<0.1s):
+uv run --no-sync system/scripts/workspace_scripts/verify_app.py <name> --marker "<expected-heading-or-text>"
+
+# Full headless browser render + visual screenshot (~1.3s):
+uv run --no-sync system/scripts/workspace_scripts/verify_app.py <name> --marker "<expected-heading-or-text>" --screenshot /tmp/app_mock.png
+```
+
+While the app is still a mock, it is shown only inside the mock frame, so the call
+drops `--open` / `--refresh` and ends with `&& uv run --no-sync
+.agents/skills/build-app/python/build_app_skill/mock_frame.py up --app <name> --note
+"<what is not real yet>" --open` the first time and `mock_frame.py refresh --app
+<name>` after that; see SKILL.md Step 1.
+
+`--restart` asks supervisord to stop the program and start it again *without*
+waiting (the `supervisorctl restart` command would block for the program's
+`startsecs=30`), then polls the port, which answers within a second; while it
+polls it watches the program's state, so a crash on start fails the call at
+once with the last lines of `/var/log/supervisor/<name>-stderr.log`.
+
+
+## Alternative / Manual Checks
+
+### Step 0: confirm the registration
 
 ```bash
 grep -A1 '<name>' data/.state/apps.toml
 ```
 
-The service name must appear with the URL you expect. If it is
-missing, `forward_port.py` was not run, failed (e.g. an invalid,
-non-DNS-safe name), or registered a different name (the manifest's
-`name` for a `--manifest` line, the `--name` flag otherwise) -- the tab
-would show the forwarder's loading page forever.
+The service name must appear with the URL you expect. If it is missing, `forward_port.py`
+was not run or failed.
 
-## Step 1: curl the registered backend
+### Step 1: active retry curl
+
+Rather than hardcoded `sleep` calls, use active connection retries to answer instantly:
 
 ```bash
-curl -sf http://127.0.0.1:<port>/ -o /dev/null -w "%{http_code}\n"
+curl --retry 20 --retry-connrefused --retry-delay 0.1 -sf http://127.0.0.1:<port>/ -o /dev/null -w "%{http_code}\n"
 ```
 
 `<port>` is the port in the service's `forward_port.py --url` (see
 `system/supervisord.conf.d/<name>.conf` or `data/.state/apps.toml`). Expected: `200`.
 
 Common failures:
-
 - **Connection refused** -- the app crashed or never came up. Check
-  `supervisorctl status <name>` and
-  `/var/log/supervisor/<name>-stderr.log`.
-- **200 here but the tab shows the loading page** -- the registered
-  URL doesn't match the port the app actually bound, or the name in
-  `apps.toml` doesn't match the tab's service name. See
-  cross-flow-gotchas.md.
+  `supervisorctl status <name>` and `/var/log/supervisor/<name>-stderr.log`.
+- **200 here but the tab shows the loading page** -- the registered URL doesn't match
+  the port the app actually bound, or the name in `apps.toml` doesn't match the tab's
+  service name. See cross-flow-gotchas.md.
 
-## Step 2: Playwright assertion
+### Step 2: Headless Playwright script (if not using verify_app.py)
 
-`curl` alone does not catch rendering bugs. Use Playwright
-(preinstalled in the root venv per `CLAUDE.md`):
+If writing a custom Playwright script, use optimized flags and `domcontentloaded`
+to avoid slow cold-start and `networkidle` timeouts:
 
 ```python
 # /tmp/verify_<name>.py
+from pathlib import Path
 from playwright.sync_api import sync_playwright
 
+fortress = Path("/opt/fortress/tilion-fortress/tilion")
+kwargs = {
+    "args": ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--single-process"],
+    "headless": True,
+}
+if fortress.exists():
+    kwargs["executable_path"] = str(fortress)
+
 with sync_playwright() as p:
-    browser = p.chromium.launch()
+    browser = p.chromium.launch(**kwargs)
     page = browser.new_page()
-    page.goto("http://127.0.0.1:<port>/", wait_until="networkidle")
-    title = page.title()
+    page.goto("http://127.0.0.1:<port>/", wait_until="domcontentloaded", timeout=5000)
     body = page.content()
-    print("title:", title)
-    print("body len:", len(body))
     assert "<your-expected-marker>" in body, body[:500]
     browser.close()
 ```
 
-Run with `uv run python /tmp/verify_<name>.py`.
+Run with `uv run --no-sync python /tmp/verify_<name>.py`.
 
-Pick a marker that **only** appears when your app rendered correctly
--- a heading, a data-driven element. Do not assert on `<html>` or
-`<body>`; those appear in error pages too.

@@ -4,9 +4,7 @@ import threading
 from pathlib import Path
 from typing import Final
 
-from pydantic import BaseModel
-from pydantic import Field
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from rosette.tutor import RosetteError
 

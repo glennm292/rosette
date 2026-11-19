@@ -14,9 +14,11 @@ survives is the `[[lineage]]` chain, which records each predecessor's repo URL
 and commit hash so the superseded manifest stays retrievable where it is
 authoritative.
 
-**Who imports this, and why it lives here.** One caller: the publish gate,
-`validate_template.py`, which loads it *by file path* rather than as a package.
-Nothing on the adopt side comes through here at all -- an agent reads the TOML
+**Who imports this, and why it lives here.** Two callers, both in the publish
+flow and both loading it *by file path* rather than as a package: the gate,
+`validate_template.py`, and the manifest writer, `write_template_manifest.py`,
+which shares its secret-reference scan so the two cannot disagree about what a
+template runs under. Nothing on the adopt side comes through here at all -- an agent reads the TOML
 and makes what it can of it -- and `env_converge` itself does not import it
 either. It sits in this package because the declaration is written in
 env_converge's vocabulary: `[environment]` is source-for-source the shape of
@@ -43,13 +45,15 @@ asserts this module's import set stays within stdlib + pydantic so the
 constraint cannot silently rot.
 """
 
+import configparser
 import re
 import tomllib
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 # The three files a template publishes at its repo root. No slug in any of
 # them: one template per repo, overriding rather than accumulating.
@@ -80,6 +84,19 @@ class TemplateManifestNotFoundError(TemplateManifestError, FileNotFoundError):
     def __init__(self, path: Path) -> None:
         self.path = path
         super().__init__(f"No template manifest at {path}")
+
+
+class InvalidSecretRequirementError(TemplateManifestError, ValueError):
+    """Raised (inside validation, so it surfaces as a parse error) when a secret requirement
+    names neither a file with variables nor a legacy bare name, or names both."""
+
+
+class SecretReferenceScanError(TemplateManifestError, ValueError):
+    """Raised when an included supervisord program config cannot be parsed."""
+
+    def __init__(self, relative_path: str, reason: str) -> None:
+        self.relative_path = relative_path
+        super().__init__(f"Cannot parse {relative_path}: {reason}")
 
 
 class TemplateManifestParseError(TemplateManifestError, ValueError):
@@ -181,10 +198,37 @@ class PermissionRequirement(FrozenManifestModel):
 
 
 class SecretRequirement(FrozenManifestModel):
-    """One secret the adopter must supply."""
+    """One data/.secrets/<file>.env the adopter must supply, with the variables it sets.
 
-    name: NonEmptyString = Field(description="Environment variable or config key")
-    note: str = Field(default="", description="What it is for and where it goes")
+    Aggregated by the publish flow from the included apps' and skills' declarations;
+    the adopting agent files one secret card per entry (the connect-external-service
+    skill) and activates what runs under the file once it is stored.
+    """
+
+    file: NonEmptyString | None = Field(
+        default=None,
+        description="The <file> of data/.secrets/<file>.env the card writes",
+    )
+    variables: tuple[NonEmptyString, ...] = Field(
+        default=(), description="The variables the card asks for, in order"
+    )
+    # CLEANUP: drop `name` (and the either/or rule below) once no published template
+    # predates the file-and-variables shape; until then a manifest naming one bare
+    # variable still loads, and use-template asks for it by name.
+    name: NonEmptyString | None = Field(
+        default=None, description="Legacy: a bare environment variable or config key"
+    )
+    note: str = Field(default="", description="What it is for and where to get it")
+
+    @model_validator(mode="after")
+    def _one_shape(self) -> "SecretRequirement":
+        if self.file is not None and self.variables and self.name is None:
+            return self
+        if self.file is None and not self.variables and self.name is not None:
+            return self
+        raise InvalidSecretRequirementError(
+            "a secret requirement names a file with at least one variable (or, legacy, a bare name), not both"
+        )
 
 
 class LlmRequirement(FrozenManifestModel):
@@ -315,7 +359,7 @@ class EnvironmentDeclaration(FrozenManifestModel):
 
 
 class LineageEntry(FrozenManifestModel):
-    """One template this mind used on the way to producing this one.
+    """One template this agent used on the way to producing this one.
 
     The commit hash is what makes overriding non-destructive: the superseded
     manifest stays readable by fetching that repo at that commit.
@@ -329,7 +373,7 @@ class LineageEntry(FrozenManifestModel):
         description="Exact commit of the predecessor that was used"
     )
     used_on: date | None = Field(
-        default=None, description="Date this mind adopted or built on it"
+        default=None, description="Date this agent adopted or built on it"
     )
 
 
@@ -337,13 +381,13 @@ class ManifestOrigin(FrozenManifestModel):
     """Where THIS COPY of the manifest was obtained from.
 
     Written by the adopt paths -- `use-template` knows the fetch URL and
-    `FETCH_HEAD`, and a mind created from a template repo knows its parent
+    `FETCH_HEAD`, and an agent created from a template repo knows its parent
     -- and read by the publish flow, which turns it into the newest
     `[[lineage]]` entry when a new manifest overrides this one. Without it an
     override would lose the address of what it replaced, which is the one thing
     that makes overriding safe.
 
-    Absent in a manifest a mind published itself (nothing was adopted) and in
+    Absent in a manifest an agent published itself (nothing was adopted) and in
     any v1 manifest (the field did not exist), so consumers treat absence as
     "unknown provenance", never as an error.
     """
@@ -353,7 +397,7 @@ class ManifestOrigin(FrozenManifestModel):
     )
     commit: CommitHash = Field(description="Exact commit this copy was taken at")
     adopted_on: date | None = Field(
-        default=None, description="Date this mind adopted it"
+        default=None, description="Date this agent adopted it"
     )
 
 
@@ -452,7 +496,7 @@ def lineage_after_override(
 
     The chain is transitive: the predecessor's own lineage comes through first
     (oldest first), then the predecessor itself. A predecessor with no
-    `[origin]` -- one this mind published rather than adopted, or a v1 manifest
+    `[origin]` -- one this agent published rather than adopted, or a v1 manifest
     from before the field existed -- contributes no link of its own, because
     there is no address to record; its inherited chain still carries through
     rather than being dropped.
@@ -532,6 +576,14 @@ def _parse_markdown_front_matter(markdown_text: str) -> dict[str, str]:
     return front_matter
 
 
+def is_covered_by(relative_path: str, include_paths: Sequence[str]) -> bool:
+    """Whether a repo-relative path is one of the include paths or lies under one."""
+    return any(
+        relative_path == path or relative_path.startswith(f"{path.rstrip('/')}/")
+        for path in include_paths
+    )
+
+
 def check_env_d_units(manifest: TemplateManifest) -> tuple[str, ...]:
     """Problems with the declared env.d units, if any.
 
@@ -559,9 +611,7 @@ def check_env_d_units(manifest: TemplateManifest) -> tuple[str, ...]:
                 f"env.d unit {unit!r} must sort at or after {ENV_D_TEMPLATE_MINIMUM_ORDER}, "
                 "which is reserved for template-carried units"
             )
-        if not any(
-            unit == path or unit.startswith(f"{path}/") for path in include_paths
-        ):
+        if not is_covered_by(unit, include_paths):
             problems.append(
                 f"env.d unit {unit!r} is declared but not covered by the recipe's include paths, "
                 "so it would not ship in the snapshot"
@@ -628,6 +678,82 @@ def check_markdown_agreement(
     return tuple(problems)
 
 
+# A secret file an MCP server or supervisord program runs under; the file's slug is
+# what a `[[requirements.secret]]` entry is keyed by.
+SECRET_REFERENCE_PATTERN = re.compile(r"data/\.secrets/([a-z0-9][a-z0-9-]*)\.env")
+MCP_SERVERS_FILE_NAME = "mcp-servers.json"
+SUPERVISORD_DROPIN_DIRECTORY = "system/supervisord.conf.d"
+
+
+def _supervisord_config_values(text: str) -> list[str]:
+    """Every option value in a supervisord config, read the way supervisord reads it.
+
+    Same parser settings as supervisor's own `UnhosedConfigParser`, so a comment --
+    a whole `#`/`;` line or a whitespace-preceded inline one -- never counts.
+    """
+    parser = configparser.RawConfigParser(
+        inline_comment_prefixes=(";", "#"), strict=False
+    )
+    parser.read_string(text)
+    return [
+        value for section in parser.sections() for _, value in parser.items(section)
+    ]
+
+
+def secret_references_in(
+    repo_root: Path, include_paths: Sequence[str]
+) -> dict[str, list[str]]:
+    """Every secret file the template's own MCP servers and supervisord programs run under, with where.
+
+    Only what the include paths cover: the snapshot also carries the base's own
+    programs, which run under files Imbue Studio provides rather than anything a
+    template could declare.
+    """
+    candidates = [repo_root / MCP_SERVERS_FILE_NAME]
+    dropins = repo_root / SUPERVISORD_DROPIN_DIRECTORY
+    if dropins.is_dir():
+        candidates.extend(sorted(dropins.glob("*.conf")))
+    sources_by_file: dict[str, list[str]] = {}
+    for path in candidates:
+        relative = path.relative_to(repo_root).as_posix()
+        if not path.is_file() or not is_covered_by(relative, include_paths):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if path.name != MCP_SERVERS_FILE_NAME:
+            try:
+                text = "\n".join(_supervisord_config_values(text))
+            except configparser.Error as e:
+                raise SecretReferenceScanError(relative, str(e)) from e
+        for file in sorted(set(SECRET_REFERENCE_PATTERN.findall(text))):
+            sources_by_file.setdefault(file, []).append(relative)
+    return sources_by_file
+
+
+def check_secret_references(
+    repo_root: Path, manifest: TemplateManifest
+) -> tuple[str, ...]:
+    """Problems where the template runs under a secret file the manifest does not declare.
+
+    An adopter is asked for exactly the declared files, so a program or MCP server
+    that names an undeclared one starts with no credential and fails silently.
+    """
+    declared = {
+        item.file for item in manifest.requirements.secret if item.file is not None
+    }
+    try:
+        sources_by_file = secret_references_in(
+            repo_root, manifest.recipe.include + manifest.recipe.data_include
+        )
+    except SecretReferenceScanError as e:
+        return (str(e),)
+    return tuple(
+        f"{source} runs under data/.secrets/{file}.env, which no [[requirements.secret]] entry declares"
+        for file, sources in sorted(sources_by_file.items())
+        if file not in declared
+        for source in sources
+    )
+
+
 def check_unfinished_placeholders(*texts: str) -> tuple[str, ...]:
     """Problems where a generated FILL-IN block was never replaced.
 
@@ -643,6 +769,24 @@ def check_unfinished_placeholders(*texts: str) -> tuple[str, ...]:
         if "minds-placeholder-thumbnail" in text:
             problems.append("the generated placeholder thumbnail was never replaced")
     return tuple(problems)
+
+
+# What makes an SVG active rather than a picture: script, embedded HTML, and
+# event-handler attributes.
+_UNSAFE_SVG_PATTERN = re.compile(
+    r"<script|<foreignObject|\bon[a-z]+\s*=", re.IGNORECASE
+)
+
+
+def check_thumbnail_safety(thumbnail_text: str) -> tuple[str, ...]:
+    """Problems that would make the thumbnail run code where it is displayed."""
+    match = _UNSAFE_SVG_PATTERN.search(thumbnail_text)
+    if match is None:
+        return ()
+    return (
+        f"the thumbnail contains {match.group(0)!r}; it must have no <script>, "
+        "no <foreignObject> and no on*= event attributes",
+    )
 
 
 def validate_template_tree(
@@ -681,7 +825,9 @@ def validate_template_tree(
     else:
         thumbnail_text = thumbnail_path.read_text(encoding="utf-8", errors="replace")
 
+    problems.extend(check_thumbnail_safety(thumbnail_text))
     problems.extend(check_env_d_units(manifest))
+    problems.extend(check_secret_references(repo_root, manifest))
     # `check_env_d_units` proves a unit is named right and WOULD ship if it
     # existed; only the assembled tree can prove it does. A declared unit with
     # a typo in its path passes every name check and then simply never runs on

@@ -1,0 +1,172 @@
+/**
+ * Launch paths (desktop-interface plan section 3.1, launcher-and-getting-started plan section 3, the
+ * post-launch-paths plan): the pure helpers over an app's declared ways of starting something. The
+ * shell names no app: which launch paths take typed or drafted text is read from each one's
+ * ``text_param`` or ``draft_param``, which app's window a focus row raises from its pin, and the
+ * launcher leads with the apps that declare a ``launcher_rank``. The shell backend builds or asks for
+ * every page a launch opens; nothing here builds a URL.
+ */
+
+import type { AppRecord, DefaultShortcut, LaunchPath } from "./records";
+
+/** One launch path of one app: what a launcher row runs. */
+export interface AppLaunch {
+  readonly app: AppRecord;
+  readonly launchPath: LaunchPath;
+}
+
+// A window's path is at most this long (desktop contracts.md section 1, the shell's ``MAX_WINDOW_PATH_LENGTH``);
+// a free-text row of a GET launch path whose path would be longer is disabled rather than refused by the shell.
+export const MAX_WINDOW_PATH_LENGTH = 2048;
+
+/** Why a free-text row stands down: the typed text, once encoded into the path, is over the path bound. */
+export const TEXT_TOO_LONG_REASON = "Too long to send from here";
+
+/** Why a text cannot be started anywhere: no app declares a launch path that takes typed text. */
+export const NO_TEXT_APP_REASON = "No app in this workspace can start a chat";
+/** Why a page's ``shell:draft-text`` went nowhere. */
+export const NO_DRAFT_APP_REASON = "No app in this workspace can take a draft";
+
+/** The launch paths of the openable apps that ``isWanted`` picks, in registry and manifest order. */
+function launchesWhere(apps: readonly AppRecord[], isWanted: (launchPath: LaunchPath) => boolean): AppLaunch[] {
+  const launches: AppLaunch[] = [];
+  for (const app of apps) {
+    if (app.internal) continue;
+    for (const launchPath of app.launch_paths) {
+      if (isWanted(launchPath)) launches.push({ app, launchPath });
+    }
+  }
+  return launches;
+}
+
+/** Every launch path of every openable app, in registry and manifest order, but the ones that take a mention of a
+ *  person or are about an app: those are the tray's and the title bar's to run (the multiplayer spec, sections 7.5
+ *  and 9.2), never a row of anything. */
+export function appLaunchesOf(apps: readonly AppRecord[]): AppLaunch[] {
+  return launchesWhere(apps, (launchPath) => launchPath.mention_param === null && launchPath.app_params === null);
+}
+
+/** The launch path a window's "Chat about this app" button runs (the multiplayer spec, section 9.2): the first of
+ *  the machine that declares ``app_params``, in launcher order; null when no app declares one. */
+export function appChatLaunchOf(apps: readonly AppRecord[]): AppLaunch | null {
+  return orderAppLaunches(launchesWhere(apps, (launchPath) => launchPath.app_params !== null))[0] ?? null;
+}
+
+/** The params an app-chat launch runs with: the app's name and display name in the params the path declares. */
+export function appChatParams(launchPath: LaunchPath, about: AppRecord): Record<string, string> {
+  if (launchPath.app_params === null) return {};
+  return { [launchPath.app_params.name]: about.name, [launchPath.app_params.display_name]: about.display_name };
+}
+
+/** The launch paths that take a mention of a person, in launcher order: the first is what a click on a person's
+ *  tray entry runs, with ``@<handle> `` as the param. */
+export function mentionRowsOf(apps: readonly AppRecord[]): AppLaunch[] {
+  return orderAppLaunches(launchesWhere(apps, (launchPath) => launchPath.mention_param !== null));
+}
+
+/** The params a mention launch runs with: the mention as its mention param. */
+export function mentionParams(launchPath: LaunchPath, mention: string): Record<string, string> {
+  return launchPath.mention_param === null ? {} : { [launchPath.mention_param]: mention };
+}
+
+/** The launches in launcher order: the apps that declare a ``launcher_rank``, lowest first (registry
+ *  order breaks a tie), then every other app in registry order; manifest order within an app. */
+export function orderAppLaunches(launches: readonly AppLaunch[]): AppLaunch[] {
+  const ranked = launches.filter((launch) => launch.app.launcher_rank !== null);
+  const leading = [...ranked].sort((left, right) => (left.app.launcher_rank ?? 0) - (right.app.launcher_rank ?? 0));
+  return [...leading, ...launches.filter((launch) => launch.app.launcher_rank === null)];
+}
+
+/** The param a free-text row fills with the field's text: the launch path's ``text_param``, else its
+ *  ``draft_param``; null for a launch path that takes no text. */
+export function fillParamOf(launchPath: LaunchPath): string | null {
+  return launchPath.text_param ?? launchPath.draft_param;
+}
+
+/**
+ * What running a launch path comes to (plan sections 3.1 and 3.3), decided by the manifest alone and in this
+ * order: ``text`` for a launch path with a ``text_param`` or a ``draft_param`` (a free-text row, whatever its
+ * path); ``focus`` for a GET launch path at its app's pin path (the pinned window is raised, nothing opens);
+ * ``one`` for every launch path of an unpinned app whose first default shortcut focuses (a one-window app such as
+ * the Screen: the launch lands in the window the desktop already holds, whichever client opened it, and opens one
+ * only when there is none; a pinned app's rows follow its pin instead); ``new`` for every other.
+ */
+export type LaunchRowKind = "text" | "focus" | "one" | "new";
+
+export function launchRowKindOf(app: AppRecord, launchPath: LaunchPath): LaunchRowKind {
+  if (fillParamOf(launchPath) !== null) return "text";
+  if (app.pin !== null && launchPath.method === "GET" && launchPath.path === app.pin.path) return "focus";
+  if (app.pin === null && app.default_shortcuts[0]?.mode === "focus") return "one";
+  return "new";
+}
+
+/** The free-text rows of the machine (plan section 3.1): every launch path with a ``text_param`` or a
+ *  ``draft_param``, in launcher order; the first is the primary text action, the second the secondary. */
+export function freeTextRowsOf(apps: readonly AppRecord[]): AppLaunch[] {
+  return orderAppLaunches(appLaunchesOf(apps)).filter(
+    (launch) => launchRowKindOf(launch.app, launch.launchPath) === "text",
+  );
+}
+
+/** The draft rows of the machine (element-reference-menu plan section 6): the free-text rows whose launch path
+ *  takes text to be drafted rather than sent, in launcher order. */
+export function draftRowsOf(apps: readonly AppRecord[]): AppLaunch[] {
+  return freeTextRowsOf(apps).filter((launch) => launch.launchPath.draft_param !== null);
+}
+
+/** The launch path of ``app`` with ``launchId``, or null when the app declares none by that id. */
+export function launchPathOf(app: AppRecord, launchId: string): LaunchPath | null {
+  return app.launch_paths.find((candidate) => candidate.id === launchId) ?? null;
+}
+
+/** The app's desktop shortcuts, by the rule the shell seeds desktops with (desktop-interface plan section 3.6): each
+ *  of its ``default_shortcuts`` that names a launch path it offers, whether or not that path takes text; else, for an
+ *  app a program runs that declares none, its first launch path taking no text, no mention, and no app, or its first
+ *  when every one takes one, focusing. An internal app has none, and so does a row with no program (a preview frame,
+ *  an isolated test server) that declares none. */
+export function appShortcutsOf(app: AppRecord): readonly DefaultShortcut[] {
+  if (app.internal) return [];
+  if (app.default_shortcuts.length > 0) {
+    return app.default_shortcuts.filter((shortcut) => launchPathOf(app, shortcut.launch) !== null);
+  }
+  if (app.program === "") return [];
+  const first =
+    app.launch_paths.find(
+      (launchPath) =>
+        fillParamOf(launchPath) === null && launchPath.mention_param === null && launchPath.app_params === null,
+    ) ?? app.launch_paths[0];
+  return first === undefined ? [] : [{ launch: first.id, mode: "focus" }];
+}
+
+/** The params a free-text row launches with: the text as its fill param; none for empty text. */
+export function freeTextParams(launchPath: LaunchPath, text: string): Record<string, string> {
+  const fillParam = fillParamOf(launchPath);
+  if (fillParam === null || text === "") return {};
+  return { [fillParam]: text };
+}
+
+/** The length of the page path a GET launch path opens at with ``params`` as its query (what the shell builds). */
+function getLaunchPathLength(launchPath: LaunchPath, params: Readonly<Record<string, string>>): number {
+  const query = new URLSearchParams();
+  for (const [name, value] of Object.entries(launchPath.presets)) query.set(name, value);
+  for (const [name, value] of Object.entries(params)) query.set(name, value);
+  const encoded = query.toString();
+  return encoded === "" ? launchPath.path.length : launchPath.path.length + 1 + encoded.length;
+}
+
+/**
+ * Why a free-text row stands down for ``text``, or null while it can run (plan section 3.2): a launch path with
+ * no text or draft param is disabled outright, and a GET launch path whose page path with the text would be over
+ * the window-path bound is disabled too. The bound is on the encoded path, since encoding can triple a non-ASCII
+ * text; a POST launch path carries the text in a body and has no such bound.
+ */
+export function textRowDisabledReason(launchPath: LaunchPath, text: string): string | null {
+  if (fillParamOf(launchPath) === null) return NO_TEXT_APP_REASON;
+  if (
+    launchPath.method === "GET" &&
+    getLaunchPathLength(launchPath, freeTextParams(launchPath, text)) > MAX_WINDOW_PATH_LENGTH
+  ) {
+    return TEXT_TOO_LONG_REASON;
+  }
+  return null;
+}

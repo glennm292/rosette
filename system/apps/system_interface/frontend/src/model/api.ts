@@ -1,0 +1,490 @@
+/**
+ * The shell's desktop routes (desktop-interface contracts.md section 5), as the frontend calls
+ * them: every function posts or fetches one route and answers the parsed record, throwing with
+ * the shell's own ``detail`` on a refusal. A placements save refused as stale throws
+ * ``StalePlacementsSaveError`` so the caller can refetch rather than retry.
+ */
+
+import { apiUrl } from "@imbue/workspace-ui/src/base-path";
+import { HttpError, errorDetailFromResponse, postJson } from "@imbue/workspace-ui/src/models/http";
+import {
+  parseClientArrival,
+  parseAvatarCatalog,
+  parseClientRecord,
+  parseClientRecords,
+  parseDesktop,
+  parseDesktops,
+  parseInventory,
+  parseLayout,
+  parseMessageRelay,
+  parseOwnerLayout,
+  parseWallpaperListings,
+  parseWindow,
+} from "./records";
+import type {
+  ClientArrival,
+  AvatarCatalog,
+  AvatarMood,
+  ClientRecord,
+  Desktop,
+  DesktopShortcut,
+  EntryPresentation,
+  GridCell,
+  IfPresent,
+  Inventory,
+  Layout,
+  MessageRelay,
+  OwnerLayout,
+  Placement,
+  Viewport,
+  Wallpaper,
+  WallpaperListing,
+  WindowRecord,
+} from "./records";
+import { parseThemeCatalog, type ThemeCatalog } from "./themes";
+
+const HTTP_CONFLICT = 409;
+
+/** The shell refused a placements save because the stored layout is newer than the one it was based on. */
+export class StalePlacementsSaveError extends Error {}
+
+async function getJson(url: string): Promise<unknown> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(await errorDetailFromResponse(response));
+  return (await response.json()) as unknown;
+}
+
+function desktopUrl(desktopId: string, suffix: string = ""): string {
+  return apiUrl(`/api/desktops/${encodeURIComponent(desktopId)}${suffix}`);
+}
+
+/** Create a desktop named ``name``, owned by this client's participant (the multiplayer spec, section 8.1); the
+ *  shell picks its colour and glyph, which nothing draws any more. */
+export async function createDesktop(name: string): Promise<Desktop> {
+  return parseDesktop(await postJson<unknown>(apiUrl("/api/desktops"), { name }));
+}
+
+export async function renameDesktop(desktopId: string, name: string): Promise<Desktop> {
+  return parseDesktop(await postJson<unknown>(desktopUrl(desktopId, "/settings"), { name }));
+}
+
+/** Put this client's participant's own desktops in ``desktopIds``' order (every one of theirs, once each); the
+ *  others keep their places. Answers every desktop in the new order. */
+export async function reorderDesktops(desktopIds: readonly string[]): Promise<Desktop[]> {
+  const data = (await postJson<unknown>(apiUrl("/api/desktops/order"), { desktop_ids: desktopIds })) as {
+    desktops?: unknown;
+  };
+  return parseDesktops(data.desktops);
+}
+
+export async function setDesktopWallpaper(desktopId: string, wallpaper: Wallpaper | null): Promise<Desktop> {
+  return parseDesktop(await postJson<unknown>(desktopUrl(desktopId, "/wallpaper"), { wallpaper }));
+}
+
+/** The theme a desktop wears by its own choice; null wears the workspace's default. */
+export async function setDesktopTheme(desktopId: string, theme: string | null): Promise<Desktop> {
+  return parseDesktop(await postJson<unknown>(desktopUrl(desktopId, "/theme"), { theme }));
+}
+
+/** The workspace's themes and its default (docs/system/blueprint/workspace-themes/, section 5.2). */
+export async function fetchThemes(): Promise<ThemeCatalog> {
+  return parseThemeCatalog(await getJson(apiUrl("/api/themes")));
+}
+
+/** Turn a themeable app's theming on or off. */
+export async function setAppTheming(app: string, isOn: boolean): Promise<void> {
+  await postJson<unknown>(apiUrl(`/api/apps/${encodeURIComponent(app)}/theming`), { is_on: isOn });
+}
+
+/** The workspace's default theme; null wears the standard one. */
+export async function setDefaultTheme(theme: string | null): Promise<void> {
+  await postJson<unknown>(apiUrl("/api/themes/default"), { theme });
+}
+
+/** One action of the keybindings catalog, resolved for this requester. */
+export interface KeybindingActionView {
+  id: string;
+  label: string;
+  default_chords: string[];
+  chords: string[];
+  source: "default" | "account" | "unsent" | "workspace";
+}
+
+export interface KeybindingAppView {
+  app: string;
+  display_name: string;
+  actions: KeybindingActionView[];
+}
+
+export interface UnsentKeybindingView {
+  app: string;
+  action: string;
+  chords: string[];
+}
+
+/** Everything the Keyboard settings renders (user-profile-state spec, section 10.3). */
+export interface KeybindingsCatalog {
+  apps: KeybindingAppView[];
+  is_owner: boolean;
+  can_save_everywhere: boolean;
+  has_pending_permission: boolean;
+  unsent: UnsentKeybindingView[];
+}
+
+export interface KeybindingsDeliveryOutcome {
+  status: string;
+  detail: string;
+}
+
+export interface SavedKeybinding {
+  chords: string[];
+  delivery: KeybindingsDeliveryOutcome | null;
+}
+
+export async function fetchKeybindingsCatalog(): Promise<KeybindingsCatalog> {
+  return (await getJson(apiUrl("/api/keybindings/catalog"))) as KeybindingsCatalog;
+}
+
+/** Save one assignment: the requester's override here, or (the owner's "account" scope) everywhere. */
+export async function saveKeybinding(
+  app: string,
+  action: string,
+  chords: string[],
+  scope: "workspace" | "account",
+): Promise<SavedKeybinding> {
+  return (await postJson<unknown>(apiUrl("/api/keybindings"), { app, action, chords, scope })) as SavedKeybinding;
+}
+
+/** Drop one undelivered "everywhere" save (and its optimistic copy here). */
+export async function discardKeybinding(app: string, action: string): Promise<void> {
+  await postJson<unknown>(apiUrl("/api/keybindings/discard"), { app, action });
+}
+
+/** Drop the requester's workspace override of one action, so the account value (or default) answers again. */
+export async function resetKeybinding(app: string, action: string): Promise<void> {
+  await postJson<unknown>(apiUrl("/api/keybindings/reset"), { app, action });
+}
+
+/** Retry the undelivered "everywhere" saves, with the permission verdicts the page observed. */
+export async function deliverKeybindings(
+  resolutions: { request_id: string; resolution: "granted" | "denied" }[],
+): Promise<KeybindingsDeliveryOutcome> {
+  return (await postJson<unknown>(apiUrl("/api/keybindings/deliver"), {
+    resolutions,
+  })) as KeybindingsDeliveryOutcome;
+}
+
+/** Delete a desktop; answers the desktop its clients fall back to. The last desktop is refused. */
+export async function deleteDesktop(desktopId: string): Promise<string> {
+  const data = await postJson<{ fallback_desktop_id: string }>(desktopUrl(desktopId, "/delete"), {});
+  return data.fallback_desktop_id;
+}
+
+export async function setDesktopShortcut(desktopId: string, shortcut: DesktopShortcut): Promise<Desktop> {
+  return parseDesktop(await postJson<unknown>(desktopUrl(desktopId, "/shortcuts"), shortcut));
+}
+
+export async function moveDesktopShortcut(
+  desktopId: string,
+  app: string,
+  launch: string,
+  cell: GridCell,
+): Promise<Desktop> {
+  return parseDesktop(await postJson<unknown>(desktopUrl(desktopId, "/shortcuts/move"), { app, launch, cell }));
+}
+
+export async function removeDesktopShortcut(desktopId: string, app: string, launch: string): Promise<Desktop> {
+  return parseDesktop(await postJson<unknown>(desktopUrl(desktopId, "/shortcuts/remove"), { app, launch }));
+}
+
+export interface WindowOpenRequest {
+  readonly app: string;
+  readonly path: string;
+  readonly clientId: string;
+  readonly ifPresent: IfPresent;
+  /** Placed out of sight for this client, so no other client finds it placed either. */
+  readonly isMinimized: boolean;
+}
+
+export interface WindowOpenOutcome {
+  readonly window: WindowRecord;
+  /** True for an open, false when an existing window was answered and raised instead. */
+  readonly isNew: boolean;
+  /** The client has only pop-outs open, so the window waits on its desktop for a desktop window. */
+  readonly hasNoDesktopWindow: boolean;
+}
+
+export async function openWindow(desktopId: string, request: WindowOpenRequest): Promise<WindowOpenOutcome> {
+  const body: Record<string, unknown> = {
+    app: request.app,
+    path: request.path,
+    client_id: request.clientId,
+    if_present: request.ifPresent,
+    minimized: request.isMinimized,
+  };
+  const data = await postJson<{ window: unknown; is_new: boolean; has_no_desktop_window?: boolean }>(
+    desktopUrl(desktopId, "/windows"),
+    body,
+  );
+  return {
+    window: parseWindow(data.window),
+    isNew: data.is_new === true,
+    hasNoDesktopWindow: data.has_no_desktop_window === true,
+  };
+}
+
+export interface PageShowRequest {
+  readonly app: string;
+  readonly path: string;
+  /** The app's pages whose on-screen window the shell may point at ``path`` (contracts.md section 8, ``show``). */
+  readonly repoint: readonly string[];
+}
+
+export interface PageShowOutcome {
+  /** The client has only pop-outs open, so the page waits on its desktop for a desktop window. */
+  readonly hasNoDesktopWindow: boolean;
+}
+
+/** Put a page of an app on this client's screen through the shell's ``show`` (contracts.md section 5.3): a window
+ *  already there is raised, else the app's window on a ``repoint`` page or its pinned window is pointed at it, else
+ *  one is opened. */
+export async function showPage(clientId: string, request: PageShowRequest): Promise<PageShowOutcome> {
+  const data = await postJson<{ has_no_desktop_window?: boolean }>(
+    apiUrl(`/api/clients/${encodeURIComponent(clientId)}/show`),
+    { app: request.app, path: request.path, repoint: request.repoint },
+  );
+  return { hasNoDesktopWindow: data.has_no_desktop_window === true };
+}
+
+/** Where a launch's page goes (post-launch-paths plan section 3.3): a new window, a window already at the path (else
+ *  a new one), or a named window this client points at it. */
+export type LaunchTarget =
+  | { readonly kind: "new" }
+  | { readonly kind: "focus" }
+  | {
+      readonly kind: "window";
+      readonly windowId: string;
+      /** False for a text that is not about the window's page: the app is not told which page it shows. */
+      readonly sendsWindowPath?: boolean;
+    }
+  | {
+      /** Wherever the ``show`` op's rule puts the page: a window already there raised, else the app's pinned window
+       *  navigated, else a new window; laid out beside ``besideWindowId`` when one is named (the multiplayer spec,
+       *  section 9.2). */
+      readonly kind: "show";
+      readonly besideWindowId?: string;
+    };
+
+export interface LaunchRequest {
+  readonly app: string;
+  readonly launch: string;
+  readonly params: Readonly<Record<string, string>>;
+  readonly clientId: string;
+  readonly target: LaunchTarget;
+  /** A window the launch opens is placed out of sight for this client. */
+  readonly isMinimized: boolean;
+}
+
+export interface LaunchOutcome {
+  /** The window showing the page, as this client sees it. */
+  readonly window: WindowRecord;
+  /** The page path the launch resolved to. */
+  readonly path: string;
+  /** True when a window was opened for the page. */
+  readonly isNew: boolean;
+}
+
+/** Run a launch path for this client (post-launch-paths plan section 5.3): the shell resolves the page (built for a
+ *  GET launch path, asked of the app for a POST one) and opens or navigates a window there. */
+export async function launch(desktopId: string, request: LaunchRequest): Promise<LaunchOutcome> {
+  const target: Record<string, unknown> = { kind: request.target.kind };
+  if (request.target.kind === "window") {
+    target.window_id = request.target.windowId;
+    if (request.target.sendsWindowPath === false) target.sends_window_path = false;
+  }
+  if (request.target.kind === "show" && request.target.besideWindowId !== undefined) {
+    target.beside = request.target.besideWindowId;
+  }
+  const data = await postJson<{ window: unknown; path: string; is_new: boolean }>(desktopUrl(desktopId, "/launch"), {
+    app: request.app,
+    launch: request.launch,
+    params: request.params,
+    client_id: request.clientId,
+    target,
+    minimized: request.isMinimized,
+  });
+  return { window: parseWindow(data.window), path: data.path, isNew: data.is_new === true };
+}
+
+export async function closeWindow(desktopId: string, windowId: string): Promise<void> {
+  await postJson<void>(desktopUrl(desktopId, `/windows/${encodeURIComponent(windowId)}/close`), {});
+}
+
+/** Report where a page is; the answer is the window as this client sees it (an independent window at the
+ *  client's own path). */
+export async function reportWindowLocation(
+  desktopId: string,
+  windowId: string,
+  clientId: string,
+  path: string,
+  title: string,
+): Promise<WindowRecord> {
+  return parseWindow(
+    await postJson<unknown>(desktopUrl(desktopId, `/windows/${encodeURIComponent(windowId)}/location`), {
+      client_id: clientId,
+      path,
+      title,
+    }),
+  );
+}
+
+export async function fetchPlacements(desktopId: string, clientId: string): Promise<Layout> {
+  const query = `client=${encodeURIComponent(clientId)}`;
+  return parseLayout(await getJson(apiUrl(`/api/placements/${encodeURIComponent(desktopId)}?${query}`)));
+}
+
+/** The desktop as its owner last arranged it (the multiplayer spec, section 8.3): what a window viewing a desktop
+ *  that is not the viewer's own shows in place of its own layout, with the backdrop size it was arranged at. */
+export async function fetchOwnerPlacements(desktopId: string): Promise<OwnerLayout> {
+  return parseOwnerLayout(await getJson(apiUrl(`/api/placements/${encodeURIComponent(desktopId)}?of=owner`)));
+}
+
+export interface PlacementsSaveRequest {
+  readonly clientId: string;
+  readonly saveId: string;
+  readonly baseUpdatedAt: string | null;
+  readonly placements: readonly Placement[];
+}
+
+/** Save this client's layout of a desktop; answers the stamp written, or null when nothing changed. */
+export async function savePlacements(desktopId: string, request: PlacementsSaveRequest): Promise<string | null> {
+  let data: { updated_at: string | null };
+  try {
+    data = await postJson<{ updated_at: string | null }>(apiUrl(`/api/placements/${encodeURIComponent(desktopId)}`), {
+      client_id: request.clientId,
+      save_id: request.saveId,
+      base_updated_at: request.baseUpdatedAt,
+      placements: request.placements,
+    });
+  } catch (error) {
+    if (error instanceof HttpError && error.status === HTTP_CONFLICT)
+      throw new StalePlacementsSaveError(error.message);
+    throw error;
+  }
+  return data.updated_at ?? null;
+}
+
+/** Tell the shell this client's page has loaded; it answers the desktop to land on (a first-time user's is seeded). */
+export async function arriveClient(clientId: string): Promise<ClientArrival> {
+  return parseClientArrival(
+    await postJson<unknown>(apiUrl(`/api/clients/${encodeURIComponent(clientId)}/arrive`), {}),
+  );
+}
+
+/** The desktops, the apps, and the clients in one read: what a page boots from once it has arrived. */
+export async function fetchInventory(): Promise<Inventory> {
+  return parseInventory(await getJson(apiUrl("/api/inventory")));
+}
+
+/** Record what this client's phone layout shows: a window, or the home grid for null. Answers the client record. */
+export async function recordShown(clientId: string, windowId: string | null): Promise<ClientRecord> {
+  return parseClientRecord(
+    await postJson<unknown>(apiUrl(`/api/clients/${encodeURIComponent(clientId)}/shown`), { window_id: windowId }),
+  );
+}
+
+/** Tell the shell the backdrop size this client's desktop layout draws its frames in, so a window viewing one of
+ *  its desktops can draw the layout at that size; answers the client record. */
+export async function reportViewport(clientId: string, viewport: Viewport): Promise<ClientRecord> {
+  return parseClientRecord(
+    await postJson<unknown>(apiUrl(`/api/clients/${encodeURIComponent(clientId)}/viewport`), {
+      width: viewport.width,
+      height: viewport.height,
+    }),
+  );
+}
+
+export async function fetchClients(): Promise<ClientRecord[]> {
+  const data = (await getJson(apiUrl("/api/clients"))) as { clients?: unknown };
+  return parseClientRecords(data.clients);
+}
+
+/** Write how this client shows one pinned entry; answers the client record. */
+export async function setEntryPresentation(
+  clientId: string,
+  app: string,
+  presentation: EntryPresentation,
+): Promise<ClientRecord> {
+  return parseClientRecord(
+    await postJson<unknown>(
+      apiUrl(`/api/clients/${encodeURIComponent(clientId)}/entries/${encodeURIComponent(app)}`),
+      presentation,
+    ),
+  );
+}
+
+export async function fetchWallpapers(): Promise<WallpaperListing[]> {
+  const data = (await getJson(apiUrl("/api/wallpapers"))) as { wallpapers?: unknown };
+  return parseWallpaperListings(data.wallpapers);
+}
+
+/** Where a wallpaper reference's image is served. */
+function wallpaperImageUrl(wallpaper: Wallpaper): string {
+  return apiUrl(`/wallpapers/${wallpaper.kind}/${encodeURIComponent(wallpaper.name)}`);
+}
+
+/**
+ * The `background-image` a desktop's chosen wallpaper paints: the image itself, and the default
+ * under it.
+ *
+ * A reference outlives the file it names -- a bundled wallpaper the shell stops shipping, a file
+ * taken back out of the wallpapers directory -- and the desktop keeps holding it, since the choice
+ * is still the choice and the file may come back. A layer whose image does not load is simply not
+ * painted, so the default shows through in the meantime, which is what a desktop with no wallpaper
+ * of its own already wears. Without the second layer that desktop would fall all the way to the
+ * flat page colour, which reads as a broken shell rather than as a wallpaper that went missing.
+ */
+export function wallpaperBackgroundImage(wallpaper: Wallpaper): string {
+  return `url("${wallpaperImageUrl(wallpaper)}"), var(--desk-default-wallpaper)`;
+}
+
+export async function fetchAvatars(): Promise<AvatarCatalog> {
+  return parseAvatarCatalog(await getJson(apiUrl("/api/avatars")));
+}
+
+/** Write the workspace's avatar design; the ``avatar_selection_changed`` push that follows reaches every window. */
+export async function selectAvatar(design: string): Promise<void> {
+  await postJson<unknown>(apiUrl("/api/avatar-selection"), { design });
+}
+
+/** Where a design's image wearing ``mood`` is served; a preview holds the pose still. */
+export function avatarImageUrl(design: string, mood: AvatarMood, isPreview: boolean = false): string {
+  const query = new URLSearchParams({ mood });
+  if (isPreview) query.set("preview", "1");
+  return apiUrl(`/api/avatars/${encodeURIComponent(design)}/image.svg?${query.toString()}`);
+}
+
+/** Where a design's original SVG is served, as an attachment. */
+export function avatarSourceUrl(design: string): string {
+  return apiUrl(`/api/avatars/${encodeURIComponent(design)}/source.svg`);
+}
+
+/** Quit an app: the shell closes every window of it and stops its program; the ``desktops_updated`` and
+ *  ``apps_updated`` pushes that follow carry the result. */
+export async function quitApp(appName: string): Promise<void> {
+  await postJson<void>(apiUrl(`/api/apps/${encodeURIComponent(appName)}/quit`), {});
+}
+
+/** Ask the shell to deliver a message this client's page received, from the Imbue Studio chrome or from an app's frame
+ *  (``sender`` says which: ``embedder`` or the app), to the apps registered for its type (contracts.md section 5.6);
+ *  answers what each app did with it, and throws with the shell's detail when an app did not take it. */
+export async function relayEmbedderMessage(
+  type: string,
+  clientId: string,
+  payload: Readonly<Record<string, unknown>>,
+  sender: string,
+): Promise<MessageRelay> {
+  return parseMessageRelay(
+    await postJson<unknown>(apiUrl("/api/embedder-messages"), { type, client_id: clientId, payload, sender }),
+  );
+}

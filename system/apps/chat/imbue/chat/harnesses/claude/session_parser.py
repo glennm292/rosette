@@ -17,6 +17,8 @@ from pydantic import Field
 
 from imbue.chat.harnesses.claude.error_notice import ErrorNotice
 from imbue.chat.harnesses.claude.error_notice import classify_error_notice
+from imbue.chat.harnesses.claude.tool_labels import action_note
+from imbue.chat.harnesses.claude.tool_labels import action_parts
 from imbue.chat.harnesses.claude.tool_labels import shell_command
 from imbue.chat.harnesses.claude.tool_labels import tool_labels
 from imbue.chat.harnesses.error_patterns import is_provider_fault
@@ -24,9 +26,9 @@ from imbue.chat.harnesses.events import DisplayKind
 from imbue.chat.harnesses.message_display import stamp_user_message_display
 from imbue.chat.harnesses.tool_output import classify_tool_call_display
 from imbue.chat.harnesses.tool_output import error_snippet
-from imbue.chat.harnesses.tool_output import find_permission_request
 from imbue.chat.harnesses.tool_output import is_pure_tk_lifecycle_command
 from imbue.chat.harnesses.tool_output import is_tk_lifecycle_anywhere
+from imbue.chat.harnesses.tool_output import stamp_echoed_requests
 from imbue.chat.harnesses.tool_output import tk_stamp
 from imbue.imbue_common.enums import UpperCaseStrEnum
 from imbue.imbue_common.frozen_model import FrozenModel
@@ -343,6 +345,18 @@ def _parse_assistant_message(
                 "header_label": header_label,
                 "caption_label": caption_label,
             }
+            # What the call DID, for the transcript's tool chips. The two halves ride
+            # separately because the chip sets them in different type, and a joined
+            # label could not be split back without guessing where a multi-word verb
+            # ends. The note is the agent's OWN words, which only the shell and
+            # delegation tools record -- absent elsewhere rather than inferred.
+            action_verb, action_target = action_parts(tool_name, raw_input)
+            tool_call["action_verb"] = action_verb
+            if action_target:
+                tool_call["action_target"] = action_target
+            note = action_note(tool_name, raw_input)
+            if note:
+                tool_call["action_note"] = note
             # The render decision ships with the call (a hidden tk marker, or the
             # permission card), recognised from the full input backend-side; the
             # frontend never re-derives it from the command text.
@@ -380,7 +394,7 @@ def _parse_assistant_message(
     # A failed turn surfaces as a synthetic assistant message (e.g. "API Error: 529
     # Overloaded", "You've hit your monthly spend limit"). Classify it so the frontend can
     # style it as an error and, for a provider-side failure (5xx / overloaded), add a "not
-    # Mind's fault" note. Gated on the synthetic model: only Claude Code's own
+    # Imbue Studio's fault" note. Gated on the synthetic model: only Claude Code's own
     # framework-generated notices are failures, so a REAL assistant message that quotes
     # "API Error: 500" or an error JSON (routine in a coding chat) is not mistaken for an
     # outage, and an agent helping with a credential does not get its own reply painted as
@@ -460,11 +474,11 @@ def _parse_user_message(
                 existing_event_ids.add(event_id)
                 new_events.append((timestamp, event))
         else:
-            is_compaction = _is_compaction_command(raw_text, text) or _is_compaction_output(raw_text)
-            if not is_compaction and text and not is_interrupt_sentinel_text(text):
+            is_compaction_command = _is_compaction_command(raw_text, text)
+            if not _is_compaction_output(raw_text) and text and not is_interrupt_sentinel_text(text):
                 event_id = _make_event_id(uuid, "user")
                 if event_id not in existing_event_ids:
-                    event = {
+                    event: dict[str, Any] = {
                         "timestamp": timestamp,
                         "type": "user_message",
                         "event_id": event_id,
@@ -473,16 +487,28 @@ def _parse_user_message(
                         "content": text,
                         "message_uuid": uuid,
                     }
-                    # Claude Code's own markers (``isMeta`` for framework-injected,
-                    # model-only messages) are read HERE and become the shared render decision
-                    # -- the raw flags never cross the wire. Explicit detectors win over
-                    # isMeta (Stop-hook feedback deliberately surfaces as a chip). (The
-                    # interrupt sentinel above is NOT isMeta, so it keeps its own guard.)
-                    stamp_user_message_display(
-                        event,
-                        text,
-                        is_meta=bool(raw.get("isMeta")),
-                    )
+                    if is_compaction_command:
+                        # Claude Code runs /compact itself and no reply follows, so it is not a turn
+                        # tail. It records the command twice: the typed "/compact" as it is
+                        # submitted, which renders as the user's bubble, and the command's expansion
+                        # once the compaction ends, which repeats it and renders nowhere. The typed
+                        # one is the transcript arrival that retires the page's "Sending..." bubble
+                        # for the /compact, which would otherwise take the arrival of the next
+                        # message and leave that message showing twice.
+                        event["non_turn_tail"] = True
+                        if _COMMAND_NAME_PATTERN.search(raw_text) is not None:
+                            event["display"] = DisplayKind.HIDDEN
+                    else:
+                        # Claude Code's own markers (``isMeta`` for framework-injected,
+                        # model-only messages) are read HERE and become the shared render decision;
+                        # the raw flags never cross the wire. Explicit detectors win over
+                        # isMeta (Stop-hook feedback deliberately surfaces as a chip). (The
+                        # interrupt sentinel above is NOT isMeta, so it keeps its own guard.)
+                        stamp_user_message_display(
+                            event,
+                            text,
+                            is_meta=bool(raw.get("isMeta")),
+                        )
                     if session_id is not None:
                         event["session_id"] = session_id
                     existing_event_ids.add(event_id)
@@ -519,12 +545,11 @@ def _parse_user_message(
             tool_name = tool_name_by_call_id.get(tool_call_id, "unknown")
 
             # The structured facts lifted from the full output (which itself stays off
-            # the event): the subagent linkage trailer and the permission-request object
-            # the card renders from.
+            # the event): the subagent linkage trailer and the request objects the
+            # permission and secret cards render from.
             extracted_subagent_id: str | None = None
             if tool_name == "Agent":
                 extracted_subagent_id = _extract_subagent_id(structured_agent_id, result_content)
-            permission_request = find_permission_request(result_content)
 
             is_error = bool(block.get("is_error", False))
             event = {
@@ -551,8 +576,7 @@ def _parse_user_message(
 
             if extracted_subagent_id:
                 event["subagent_id"] = extracted_subagent_id
-            if permission_request is not None:
-                event["permission_request"] = permission_request.details
+            stamp_echoed_requests(event, result_content)
 
             existing_event_ids.add(event_id)
             new_events.append((timestamp, event))
@@ -612,7 +636,7 @@ def _parse_queued_command_attachment(
     new_events.append((timestamp, event))
 
 
-# --- On-demand payload reconstruction (the detail endpoint's parse half) ---
+# On-demand payload reconstruction (the detail endpoint's parse half)
 
 
 def parse_line_detail(raw_line: str) -> dict[str, dict[str, Any]]:
@@ -692,11 +716,13 @@ def parse_line_detail(raw_line: str) -> dict[str, dict[str, Any]]:
 # live queue as out-of-band ``queue-operation`` records that carry no ``uuid`` and
 # so are dropped by ``parse_lines`` at the DAG guard. They obey a conservation
 # law: ``enqueue = dequeue + remove + popAll`` -- every parked message leaves the
-# queue through exactly one dequeue/remove/popAll record. In the real Mind flow
-# EVERY message is delivered via mngr (typed into the TUI), so a mid-turn message
+# queue through exactly one dequeue/remove/popAll record. In the real Imbue Studio flow
+# EVERY message is delivered via mngr (typed into the TUI), so a parked message
 # commits as a ``dequeue`` whose ``promptSource`` is "typed" (NOT "queued"), and
 # slash commands / task-notifications also leave via dequeue/remove -- none of
-# which the user record or the ``queued_command`` attachment reliably marks. So
+# which the user record or the ``queued_command`` attachment reliably marks. (A
+# message Claude folds into the running turn at a tool result leaves as a
+# ``remove`` beside a ``queued_command`` attachment instead.) So
 # resolution keys off the ledger's LEAVE ops ONLY (one record = one leave), never
 # ``promptSource`` or the attachment. ``parse_queue_signals`` therefore recognizes
 # ONLY the four ``queue-operation`` ops. The ``queued_command`` attachment and the
@@ -714,6 +740,10 @@ _LEAVE_OPERATIONS = frozenset({"dequeue", "remove", "popAll"})
 # starts with this marker (or is blank) is added as a PHANTOM slot: it occupies a
 # FIFO position so leaves stay aligned, but it is filtered from the snapshot.
 TASK_NOTIFICATION_CONTENT_PREFIX = "<task-notification>"
+_TASK_NOTIFICATION_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
+_TASK_NOTIFICATION_STATUS_RE = re.compile(r"<status>\s*([^<\s]+)\s*</status>")
+# The statuses Claude Code gives a task that is over; any other one leaves its marker standing.
+_FINISHED_TASK_STATUSES = frozenset({"completed", "failed", "killed"})
 
 
 class QueueSignalKind(UpperCaseStrEnum):
@@ -782,3 +812,18 @@ def parse_queue_signals(line: str) -> QueueSignal | None:
     if operation in _LEAVE_OPERATIONS:
         return QueueSignal(kind=QueueSignalKind.LEAVE, session_id=_record_session_id(raw))
     return None
+
+
+def finished_task_id(content: str) -> str | None:
+    """The background task a ``<task-notification>`` reports as over, or None for any other content.
+
+    Claude Code enqueues the notice the moment the task ends, whatever then happens to the turn it
+    wakes, so it is the one record of the end that an interrupted or failed turn cannot lose.
+    """
+    if not content.lstrip().startswith(TASK_NOTIFICATION_CONTENT_PREFIX):
+        return None
+    task_id = _TASK_NOTIFICATION_ID_RE.search(content)
+    status = _TASK_NOTIFICATION_STATUS_RE.search(content)
+    if task_id is None or status is None or status.group(1) not in _FINISHED_TASK_STATUSES:
+        return None
+    return task_id.group(1)

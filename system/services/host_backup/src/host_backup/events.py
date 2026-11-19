@@ -1,17 +1,25 @@
-"""Structured event types + writer for the host_backup service.
+"""Structured event types, writer and in-flight reader for the host_backup service.
 
 Events land at `$MNGR_AGENT_STATE_DIR/events/backup/events.jsonl`, one
 JSONL line per event, with the standard envelope (timestamp, type,
-event_id, source) plus event-specific fields. The full stdout/stderr of
-each restic command is embedded in the matching event so operators can
-diagnose failures without rerunning anything.
+event_id, source) plus event-specific fields. The stdout/stderr of each
+restic command is embedded in the matching event so operators can diagnose
+failures without rerunning anything, with each field capped at write time
+(see `_truncated_for_storage`). The runner rotates the file between ticks
+(see `rotate_events_log_if_over`).
+
+`scan_recent_ticks` reads the log back for the tick still running and the newest
+tick outcomes, which `host-backup-now` waits on and checks; at startup the runner
+records the tick its previous run was killed in as `TICK_ABANDONED` (see
+`record_abandoned_tick`).
 """
 
 import json
+import os
 from datetime import datetime, timezone
 from enum import auto
 from pathlib import Path
-from typing import Final
+from typing import Final, NamedTuple
 from uuid import uuid4
 
 from imbue.imbue_common.enums import UpperCaseStrEnum
@@ -22,10 +30,22 @@ from imbue.imbue_common.event_envelope import (
     EventType,
     IsoTimestamp,
 )
+from imbue.imbue_common.logging import (
+    ROTATED_JSONL_PATTERN,
+    cleanup_old_rotated_files,
+    generate_rotation_timestamp,
+)
 from loguru import logger
 from pydantic import Field
 
 BACKUP_EVENT_SOURCE: Final[EventSource] = EventSource("backup")
+
+EVENTS_FILENAME: Final[str] = "events.jsonl"
+
+# The size at which the runner moves the events log aside. It checks only at the
+# start of a tick, so the log can grow past this until the next tick starts.
+EVENTS_LOG_ROTATION_BYTES: Final[int] = 8 * 1024 * 1024
+MAX_ROTATED_EVENTS_LOGS: Final[int] = 2
 
 
 class BackupEventType(UpperCaseStrEnum):
@@ -39,7 +59,9 @@ class BackupEventType(UpperCaseStrEnum):
     SNAPSHOT_DELETED = auto()
     RESTIC_BACKUP_SUCCEEDED = auto()
     RESTIC_BACKUP_FAILED = auto()
+    BACKUP_SKIPPED_OVER_QUOTA = auto()
     BACKUP_REPEATEDLY_FAILING = auto()
+    BACKUP_SLOW = auto()
     FORGET_COMPLETED = auto()
     RESTORE_MARKERS_FORGOTTEN = auto()
     PRUNE_COMPLETED = auto()
@@ -49,21 +71,31 @@ class BackupEventType(UpperCaseStrEnum):
     REPO_INIT_SUCCEEDED = auto()
     TICK_SKIPPED_DUE_TO_MISSING_SECRETS = auto()
     TICK_ERROR = auto()
+    TICK_ABANDONED = auto()
 
 
 # Every event type that ends a tick -- including the endings that never reach
-# restic (secrets absent, snapshot step aborted) and the loop's outer catch.
+# restic (secrets absent, snapshot step aborted), the loop's outer catch, and the
+# restarted service's record of a tick it was killed out of.
 # `host-backup-now` waits for one of these, so a new way for a tick to end must
 # be added here or the command polls until its timeout for a tick that is over.
 TICK_TERMINAL_EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
         BackupEventType.RESTIC_BACKUP_SUCCEEDED.value,
         BackupEventType.RESTIC_BACKUP_FAILED.value,
+        BackupEventType.BACKUP_SKIPPED_OVER_QUOTA.value,
         BackupEventType.SNAPSHOT_FAILED.value,
         BackupEventType.TICK_SKIPPED_DUE_TO_MISSING_SECRETS.value,
         BackupEventType.TICK_ERROR.value,
+        BackupEventType.TICK_ABANDONED.value,
     }
 )
+
+# How much of the end of the events log the in-flight scan may read. Comfortably
+# more than the events of one tick, and small enough that a scan cannot be the
+# reason the workspace runs out of memory.
+_TAIL_READ_MAX_BYTES: Final[int] = EVENTS_LOG_ROTATION_BYTES
+_INFLIGHT_SCAN_MAX_LINES: Final[int] = 200
 
 
 class BackupEvent(EventEnvelope):
@@ -111,7 +143,7 @@ class SnapshotCreatedEvent(BackupEvent):
 
 
 class EnvRecordCaptureCompletedEvent(BackupEvent):
-    """The pre-snapshot `env-converge capture` refresh finished (success or not).
+    """The pre-snapshot environment record capture finished (success or not).
 
     Runs before the snapshot is taken so the environment record inside the
     backup describes the packages installed at backup time (the probe-based
@@ -121,13 +153,9 @@ class EnvRecordCaptureCompletedEvent(BackupEvent):
 
     tick_id: str
     success: bool
-    exit_code: int | None = Field(
-        default=None,
-        description="env-converge exit code; None when the process could not run or timed out",
-    )
     duration_seconds: float
-    stderr: str = Field(
-        description="Trailing stderr from env-converge (empty on clean success)"
+    error_message: str = Field(
+        description="Why the capture failed, trimmed to its tail (empty on success)"
     )
 
 
@@ -168,6 +196,11 @@ class ResticBackupSucceededEvent(BackupEvent):
     stderr: str
 
 
+# The `reason` values a RESTIC_BACKUP_FAILED event can carry; the runner stamps
+# them and the system monitor and the desktop read them.
+BACKUP_FAILURE_REASON_QUOTA_EXCEEDED: Final[str] = "quota_exceeded"
+
+
 class ResticBackupFailedEvent(BackupEvent):
     """`restic backup` returned non-zero."""
 
@@ -180,6 +213,31 @@ class ResticBackupFailedEvent(BackupEvent):
     consecutive_failures: int = Field(
         default=0,
         description="How many ticks in a row have now failed (1 on the first failure)",
+    )
+    reason: str = Field(
+        default="",
+        description=(
+            "Why the backup failed, when the runner can tell from restic's output: "
+            "'quota_exceeded' when the backup store refused an upload (507); empty otherwise"
+        ),
+    )
+
+
+class BackupSkippedOverQuotaEvent(BackupEvent):
+    """The tick took no backup because the account is over its backup storage quota.
+
+    The backup store's usage probe said the account is past the soft limit, so the
+    tick ran the retention forget and a bounded prune to free space instead of
+    uploading more. Ends the tick like a backup outcome does; the next tick asks
+    again and backs up once the account is under the limit.
+    """
+
+    tick_id: str
+    used_bytes: int = Field(description="Bytes stored in this repository")
+    account_used_bytes: int = Field(description="Bytes stored across the account")
+    quota_bytes: int = Field(description="The soft limit the account is over")
+    hard_limit_bytes: int = Field(
+        description="The limit the store refuses uploads past"
     )
 
 
@@ -196,6 +254,27 @@ class BackupRepeatedlyFailingEvent(BackupEvent):
     threshold: int = Field(
         description="The consecutive-failure count that triggers the alarm"
     )
+
+
+class BackupSlowEvent(BackupEvent):
+    """A successful `restic backup` took longer than the configured threshold.
+
+    Recorded at most once a day. restic's time follows the number of files and
+    directories it walks, so the counts from its summary are carried here, with
+    a hint naming the command that shows which directories hold them.
+    """
+
+    tick_id: str
+    duration_seconds: float
+    threshold_seconds: float
+    total_files_processed: int | None = Field(
+        default=None, description="From restic's summary; None when it had none"
+    )
+    files_new: int | None = None
+    files_changed: int | None = None
+    files_unmodified: int | None = None
+    dirs_unmodified: int | None = None
+    hint: str = Field(description="What to run and read next")
 
 
 class ForgetCompletedEvent(BackupEvent):
@@ -276,6 +355,13 @@ class TickSkippedDueToMissingSecretsEvent(BackupEvent):
     missing_keys: tuple[str, ...]
 
 
+class TickAbandonedEvent(BackupEvent):
+    """The service started with a tick in its log that never ended: the process running
+    it was killed (an OOM shed, a services restart), so it never will."""
+
+    tick_id: str
+
+
 class TickErrorEvent(BackupEvent):
     """An unhandled (or otherwise unexpected) error was caught in the tick loop."""
 
@@ -315,6 +401,28 @@ def make_event(event_type: BackupEventType, **fields: object) -> dict[str, objec
     return payload
 
 
+# How much of any one string field survives into the log. Generous for a restic
+# command's output while keeping a single event small: `restic backup --json`
+# emits one progress document per tick, which ran to hundreds of kilobytes per
+# event. Head and tail are both kept, so the command's opening lines and the
+# final summary -- the two things an operator reads -- both survive.
+_MAX_FIELD_CHARS: Final[int] = 16384
+_TRUNCATION_MARKER: Final[str] = "\n...[{dropped} characters dropped]...\n"
+
+
+def _truncated_for_storage(event: dict[str, object]) -> dict[str, object]:
+    """`event` with any over-long string field reduced to its head and tail."""
+    truncated: dict[str, object] = {}
+    for key, value in event.items():
+        if isinstance(value, str) and len(value) > _MAX_FIELD_CHARS:
+            keep = _MAX_FIELD_CHARS // 2
+            marker = _TRUNCATION_MARKER.format(dropped=len(value) - 2 * keep)
+            truncated[key] = value[:keep] + marker + value[-keep:]
+        else:
+            truncated[key] = value
+    return truncated
+
+
 def write_event(events_dir: Path | None, event: dict[str, object]) -> None:
     """Append `event` as a JSONL line to events_dir/events.jsonl.
 
@@ -332,10 +440,185 @@ def write_event(events_dir: Path | None, event: dict[str, object]) -> None:
     except OSError as e:
         logger.warning("Cannot create events dir {}: {}", events_dir, e)
         return
-    events_path = events_dir / "events.jsonl"
+    events_path = events_dir / EVENTS_FILENAME
     try:
         with events_path.open("a") as fh:
-            fh.write(json.dumps(event, default=str))
+            fh.write(json.dumps(_truncated_for_storage(event), default=str))
             fh.write("\n")
     except OSError as e:
         logger.warning("Cannot append to {}: {}", events_path, e)
+
+
+def rotate_events_log_if_over(events_dir: Path | None) -> None:
+    """Move the events log aside once it reaches `EVENTS_LOG_ROTATION_BYTES`.
+
+    The log becomes `events.jsonl.<timestamp>` (the name `mngr events` discovers
+    rotated logs by) and only the newest `MAX_ROTATED_EVENTS_LOGS` are kept; the
+    next `write_event` starts a fresh file.
+    """
+    if events_dir is None:
+        return
+    events_path = events_dir / EVENTS_FILENAME
+    try:
+        size = events_path.stat().st_size
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        logger.warning("Cannot stat {} to decide on rotation: {}", events_path, e)
+        return
+    if size < EVENTS_LOG_ROTATION_BYTES:
+        return
+    rotated_path = events_path.with_name(
+        f"{EVENTS_FILENAME}.{generate_rotation_timestamp()}"
+    )
+    try:
+        events_path.rename(rotated_path)
+    except OSError as e:
+        logger.warning("Cannot rotate {}: {}", events_path, e)
+        return
+    logger.info("Rotated the backup events log to {}", rotated_path)
+    try:
+        cleanup_old_rotated_files(events_dir, MAX_ROTATED_EVENTS_LOGS)
+    except OSError as e:
+        logger.warning("Cannot remove old rotated logs in {}: {}", events_dir, e)
+
+
+def _read_tail_lines(events_path: Path, *, max_lines: int, max_bytes: int) -> list[str]:
+    """The last `max_lines` lines of `events_path`, reading at most `max_bytes` from its end.
+
+    Reads `max_bytes` at most, however large the file is. A log written before the
+    runner rotated it and capped each event's fields runs to gigabytes on an old
+    workspace, one line to hundreds of kilobytes -- reading it whole is what got
+    `host-backup-now` killed by the OOM watchdog before it did anything at all.
+
+    The byte ceiling binds first on such a workspace, yielding fewer than `max_lines`
+    events. The reads `scan_recent_ticks` makes still land inside the window: the
+    events a tick emits before it completes are the small ones (the large ones all
+    report a finished restic command), so an in-flight tick is always there, and the
+    newest outcomes are the last lines written.
+    """
+    try:
+        with events_path.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - max_bytes))
+            blob = fh.read()
+    except OSError:
+        return []
+    lines = blob.decode(errors="replace").splitlines()
+    # A window that started mid-file almost certainly cut its first line in half.
+    if size > max_bytes and lines:
+        lines = lines[1:]
+    return lines[-max_lines:]
+
+
+class RecentTicks(NamedTuple):
+    """What the end of the events log says about the ticks: the one in flight, if any,
+    the newest event that ended a tick, and the newest `RESTIC_BACKUP_SUCCEEDED`."""
+
+    inflight_tick_id: str | None
+    newest_terminal_event: dict[str, object] | None
+    newest_success_event: dict[str, object] | None
+
+
+def scan_recent_ticks(
+    events_path: Path,
+    *,
+    max_lines: int = _INFLIGHT_SCAN_MAX_LINES,
+    max_bytes: int = _TAIL_READ_MAX_BYTES,
+) -> RecentTicks:
+    """Read the ticks back from the last `max_lines` events that fit in the final
+    `max_bytes` of the log.
+
+    Only the newest tick to start can be in flight: the runner runs one tick at a time,
+    so an earlier tick with no terminal event was killed mid-run (an OOM shed, a
+    services restart) and will never emit one; the restarted runner records the
+    newest such tick as `TICK_ABANDONED` (`record_abandoned_tick`).
+    """
+    if not events_path.exists():
+        return RecentTicks(None, None, None)
+    lines = _read_tail_lines(events_path, max_lines=max_lines, max_bytes=max_bytes)
+    newest_started: str | None = None
+    newest_terminal: dict[str, object] | None = None
+    newest_success: dict[str, object] | None = None
+    finished: set[str] = set()
+    for raw in lines:
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("source") != BACKUP_EVENT_SOURCE:
+            continue
+        tick_id = event.get("tick_id")
+        if not isinstance(tick_id, str):
+            continue
+        event_type = event.get("type")
+        if event_type == BackupEventType.BACKUP_STARTED.value:
+            newest_started = tick_id
+        elif event_type in TICK_TERMINAL_EVENT_TYPES:
+            finished.add(tick_id)
+            newest_terminal = event
+            if event_type == BackupEventType.RESTIC_BACKUP_SUCCEEDED.value:
+                newest_success = event
+    inflight = None if newest_started in finished else newest_started
+    return RecentTicks(inflight, newest_terminal, newest_success)
+
+
+def scan_recent_ticks_across_rotation(events_path: Path) -> RecentTicks:
+    """`scan_recent_ticks`, taking the outcomes from the newest rotated log when the
+    current one holds no success yet.
+
+    The runner rotates the log as a tick starts, so until that tick succeeds the newest
+    success is in the file it rotated away. The tick in flight is always the current
+    log's: a rotation happens before its BACKUP_STARTED.
+    """
+    current = scan_recent_ticks(events_path)
+    if current.newest_success_event is not None:
+        return current
+    rotated = _newest_rotated_events_log(events_path.parent)
+    if rotated is None:
+        return current
+    previous = scan_recent_ticks(rotated)
+    return RecentTicks(
+        current.inflight_tick_id,
+        current.newest_terminal_event or previous.newest_terminal_event,
+        previous.newest_success_event,
+    )
+
+
+def _newest_rotated_events_log(events_dir: Path) -> Path | None:
+    try:
+        rotated = [
+            child
+            for child in events_dir.iterdir()
+            if ROTATED_JSONL_PATTERN.match(child.name)
+        ]
+    except OSError as e:
+        logger.warning(
+            "Cannot list rotated backup events logs in {}: {}", events_dir, e
+        )
+        return None
+    if not rotated:
+        return None
+    return max(rotated, key=lambda child: child.name)
+
+
+def find_inflight_tick_id(events_path: Path) -> str | None:
+    """The tick_id of the tick in flight, or None when none is (`scan_recent_ticks`)."""
+    return scan_recent_ticks(events_path).inflight_tick_id
+
+
+def record_abandoned_tick(events_dir: Path | None) -> None:
+    """Record the tick a previous run of the service left in flight as `TICK_ABANDONED`.
+
+    Called once at startup, before the first tick: whatever tick the log shows in
+    flight then belongs to a process that no longer runs.
+    """
+    if events_dir is None:
+        return
+    tick_id = find_inflight_tick_id(events_dir / EVENTS_FILENAME)
+    if tick_id is None:
+        return
+    logger.info("Recording backup tick {} as abandoned by a restart", tick_id)
+    write_event(events_dir, make_event(BackupEventType.TICK_ABANDONED, tick_id=tick_id))

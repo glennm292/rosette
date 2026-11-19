@@ -1,0 +1,101 @@
+/**
+ * The small glyphs the desktop's chrome draws that the shared icon set does not carry: the
+ * window controls (minimize, maximize, restore, fullscreen and its exit), the kebab, the size menu's zone pictograms,
+ * the launcher's plus and app fallback, and the phone bar's home. Same Feather-style 24x24 frame as ``icons.ts``,
+ * produced as SVG strings for ``m.trust``.
+ *
+ * Some of these are Lucide's own shapes as well as its frame -- the plus, the minus the minimize
+ * control draws -- copied rather than imported; its notice is in THIRD_PARTY_NOTICES.md at the root.
+ */
+
+import { appIconMarkupForApp } from "./components/appIcon";
+import type { AppRecord, Frame } from "../model/records";
+import { partAttrs, partAttrsMarkup } from "@imbue/workspace-ui/src/themes/parts";
+import { themedIconFor, type IconSource, type ThemedIcon } from "./themeIcons";
+
+const XMLNS = "http://www.w3.org/2000/svg";
+
+const GLYPH_PATHS = {
+  minimize: '<path d="M5 12h14"/>',
+  maximize: '<rect x="4" y="4" width="16" height="16" rx="2"/>',
+  restore:
+    '<rect x="3" y="8" width="13" height="13" rx="2"/><path d="M8 8V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-3"/>',
+  // The four corners of the viewport, pointing out; and pointing back in for the way out of fullscreen.
+  fullscreen:
+    '<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/>' +
+    '<path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>',
+  "exit-fullscreen":
+    '<path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/>' +
+    '<path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/>',
+  // A dot reads lighter than a line of the same width, so these are fatter than the 2px strokes
+  // the rest of the set is drawn with.
+  kebab:
+    '<circle cx="12" cy="5" r="2" fill="currentColor" stroke="none"/>' +
+    '<circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/>' +
+    '<circle cx="12" cy="19" r="2" fill="currentColor" stroke="none"/>',
+  plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+  home: '<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>',
+  // Lucide's message-circle: the speech balloon of the title bar's "Chat about this app".
+  balloon: '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
+  app: '<rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/>',
+} as const;
+
+export type GlyphName = keyof typeof GLYPH_PATHS;
+
+export function glyph(name: GlyphName, size: number): string {
+  return (
+    `<svg xmlns="${XMLNS}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" ` +
+    `stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">` +
+    `${GLYPH_PATHS[name]}</svg>`
+  );
+}
+
+// The pictogram a size-menu tile draws: the backdrop as the ``maximize`` glyph's rounded square,
+// with the part of it the zone fills shaded in. Drawn FROM the zone's own frame, so the picture
+// and the placement it performs cannot say different things.
+const ZONE_GLYPH_ORIGIN = 4;
+const ZONE_GLYPH_EXTENT = 16;
+
+/** The pictogram for a window zone, drawn from the fractional frame it places a window at. */
+export function zoneGlyph(frame: Frame, size: number): string {
+  const at = (fraction: number): number => ZONE_GLYPH_ORIGIN + ZONE_GLYPH_EXTENT * fraction;
+  const span = (fraction: number): number => ZONE_GLYPH_EXTENT * fraction;
+  return (
+    `<svg xmlns="${XMLNS}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" ` +
+    `stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">` +
+    `<rect x="${ZONE_GLYPH_ORIGIN}" y="${ZONE_GLYPH_ORIGIN}" width="${ZONE_GLYPH_EXTENT}" ` +
+    `height="${ZONE_GLYPH_EXTENT}" rx="2"/>` +
+    `<rect x="${at(frame.x)}" y="${at(frame.y)}" width="${span(frame.width)}" height="${span(frame.height)}" ` +
+    `rx="1" fill="currentColor" stroke="none"/></svg>`
+  );
+}
+
+/** The glyph an app wears everywhere: its own icon (or its monogram, or the generic app glyph), or under a theme
+ *  the icon the theme draws for it (`themeIcons.ts`). Either way it is the contract's `app-icon` part, saying which
+ *  kind of icon it is. */
+export function appGlyph(app: Pick<AppRecord, "name" | "icon"> | undefined, size: number): string {
+  const standardAt = (pixels: number): string => appIconMarkupForApp(app, pixels, glyph("app", pixels));
+  const themed = themedIconFor(app?.name ?? "app", standardAt);
+  if (themed === null) return standardAt(size).replace(/^<svg\b/, `<svg ${iconPartMarkup("standard")}`);
+  return themedIconMarkup(themed, size);
+}
+
+/** The `app-icon` part's attributes, saying where the icon came from, as markup. */
+function iconPartMarkup(source: IconSource): string {
+  return partAttrsMarkup({ ...partAttrs("app-icon"), "data-icon-source": source });
+}
+
+/** Text written into a double-quoted attribute of markup the page trusts. */
+function attributeText(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** A theme's icon (served by the shell itself, or derived in this page) as the svg every icon slot sizes. */
+function themedIconMarkup(icon: ThemedIcon, size: number): string {
+  const rendering = icon.isPixelated ? ' style="image-rendering: pixelated"' : "";
+  return (
+    `<svg xmlns="${XMLNS}" ${iconPartMarkup(icon.source)} width="${size}" ` +
+    `height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true">` +
+    `<image href="${attributeText(icon.url)}" width="${size}" height="${size}"${rendering}/></svg>`
+  );
+}

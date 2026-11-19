@@ -1,41 +1,51 @@
 /**
  * The chat page's side of the workspace shell: the contract connection, and the two things a
- * chat page asks the shell for -- a sibling chat, and a subagent view -- both through
- * `shell:open`, since the page lives in its own document.
+ * chat page asks the shell for -- a sibling chat, and a subagent view -- both through the path
+ * form of `shell:open` (desktop-interface contracts.md section 7), since the page lives in its
+ * own document. A sibling chat is asked for at the chat root's path for it, so the shell opens a
+ * root window showing it (the root that frames this page intercepts the request and selects the
+ * chat in place instead, see root/relay.ts).
  */
 
 import m from "mithril";
-import { apiUrl } from "@imbue/workspace-ui/src/base-path";
-import { postJson } from "@imbue/workspace-ui/src/models/http";
 import { adoptClientIdentity } from "@imbue/workspace-ui/src/models/ClientIdentity";
-import { addressFor } from "@imbue/workspace-ui/src/addresses";
-import { createChat, getChatById } from "./models/Chats";
+import { addChatsUpdatedListener, createChat, getChatById } from "./models/Chats";
+import { refreshKeybindings } from "./models/keybindings";
 import type { CreatedChat } from "./models/Chats";
 import type { ModelIdentity } from "./models/ModelSettings";
-import { isEverythingView } from "@imbue/workspace-ui/src/views";
+import { ensureParticipants } from "./models/Participants";
+import { reportChatOnScreen } from "@imbue/workspace-ui/src/embed";
 import { connectToShell } from "@imbue/workspace-ui/src/app_contract";
 import type { ShellConnection, ShellHandshake } from "@imbue/workspace-ui/src/app_contract";
-import { currentPresenceState, reportPresence, startPresenceReporting } from "./presence";
+import { currentPresenceState, reportFocusChange, reportPresence, startPresenceReporting } from "./presence";
+import type { ChatPageEmbedApi } from "./embedApi";
+import { setCompactFromRoot } from "./compactLayout";
+import { rootPathFor } from "./root/selection";
+import { focusComposer, prependToComposer, setComposerHint, stopDictationWhenHidden } from "./views/MessageInput";
+import { mirrorParentTheme, wearThemeFromMessage } from "@imbue/workspace-ui/src/themes/themeClient";
 
-/** The chat app's registered name: what its own pages address their instances under. */
-const CHAT_APP_NAME = "chat";
-
-export function chatAddress(instanceKey: string): string {
-  return addressFor(CHAT_APP_NAME, instanceKey);
+/** The path of a sub-agent view: the chat, the agent whose session it is, and the session. */
+export function subagentViewPath(key: string): string {
+  return `/${key}`;
 }
 
 let connection: ShellConnection | null = null;
-let handshake: ShellHandshake | null = null;
+let lastHandshake: ShellHandshake | null = null;
+
+/** The shell's last handshake to this page (or the root's, handed down), null before one. */
+export function getShellHandshake(): ShellHandshake | null {
+  return lastHandshake;
+}
 // Whether the shell says this page is on screen: true until told otherwise on a top-level
 // visit, and false from the moment a framed page connects, until the shell says shown.
 let isShown = true;
 
 /**
  * Whether the frame's document is laid out at all: what the transcript's scroll management
- * keys on. A pane that stops showing this page hides the frame with `display: none`, which
- * drops the document's layout in the same pass that the page's scroll container starts
- * reporting zero sizes (the frame's viewport, `innerHeight`, keeps its old value); the
- * shell's `shell:shown` and `shell:hidden` follow a redraw later and feed presence instead.
+ * keys on. A frame hidden with `display: none` (the chat root's held frames) drops the
+ * document's layout in the same pass that the page's scroll container starts reporting zero
+ * sizes (the frame's viewport, `innerHeight`, keeps its old value); the shell keeps a hidden
+ * window's page laid out at its size, and its `shell:shown` and `shell:hidden` feed presence.
  * Reading the layout keeps the panel's visibility in lockstep with the element, so a redraw
  * while hidden (a streamed event) never runs the scroll management against a zero-height
  * element.
@@ -44,50 +54,93 @@ export function isFrameRendered(): boolean {
   return document.documentElement.getBoundingClientRect().height > 0;
 }
 
-/** The view (project id, or Everything) the shell says this page's tab is in; "" until the handshake. */
-export function shellViewId(): string {
-  return handshake?.viewId ?? "";
+let isChatOnScreenReported = false;
+
+/**
+ * After a draw of this chat's transcript: tell the Imbue Studio chrome, once per page, that the chat is on screen.
+ * The chrome keeps its wash over a new workspace until the welcome chat says this, so a transcript still loading or a
+ * page the shell has not shown yet does not count.
+ */
+export function reportChatOnScreenOnce(chatId: string, isTranscriptLoaded: boolean): void {
+  if (isChatOnScreenReported || !isTranscriptLoaded || !isShown || !isFrameRendered()) return;
+  isChatOnScreenReported = true;
+  reportChatOnScreen(chatId);
 }
 
 export interface ChatShellOptions {
   /**
    * Whether this page reports its presence for `chatId`. A chat's own page does; a subagent
-   * view does not, because the chat app keeps one report per chat and client, and a second
-   * page of the same chat in the same client would overwrite the chat page's own.
+   * view does not: it is not the chat, so its being on screen says nothing about whether the
+   * user is reading the chat.
    */
   isPresenceReported: boolean;
+  /** The path this page is served at, which it reports as its location (contracts.md section 7). */
+  path: string;
 }
 
 /**
  * Connect the page for `chatId`: adopt the client identity the shell hands over, follow the
- * tab's visibility for the panel and (when this page reports it) for presence, and forward
- * focus so the shell activates the tab.
+ * window's visibility for the panel and (when this page reports it) for presence, forward
+ * focus so the shell raises the window, and (when this page reports presence) report the
+ * document's focus as it comes and goes, framed or visited directly.
  */
 export function connectChatToShell(chatId: string, options: ChatShellOptions): ShellConnection {
   const { isPresenceReported } = options;
+  const onHandshake = (received: ShellHandshake): void => {
+    lastHandshake = received;
+    adoptClientIdentity({ clientId: received.clientId, desktopId: received.desktopId });
+    // Hidden until the shell says shown: a page can load into a background tab, and open
+    // (any page's unexpired visible or hidden report) is what a hidden report keeps.
+    if (isPresenceReported) startPresenceReporting(chatId, received.clientId, isShown ? "visible" : "hidden");
+    m.redraw();
+  };
+  const onShown = (): void => {
+    isShown = true;
+    if (isPresenceReported) reportPresence("visible");
+    // Whoever joined while the page was out of view is drawn right once it is back.
+    void ensureParticipants();
+    m.redraw();
+  };
+  const onHidden = (): void => {
+    isShown = false;
+    if (isPresenceReported) reportPresence("hidden");
+    // A page out of view stops dictating and keeps its words (the workspace-voice-input spec, D5).
+    stopDictationWhenHidden();
+    m.redraw();
+  };
+  // A chat page wears its desktop's theme: told by the shell when it frames the page itself, read off the chat
+  // root when the root frames it (the shell never messages those).
   connection = connectToShell({
-    onHandshake: (received) => {
-      handshake = received;
-      adoptClientIdentity({ clientId: received.clientId, deviceKind: received.deviceKind, viewId: received.viewId });
-      // Hidden until the shell says shown: a page can load into a background tab, and open
-      // (any client's unexpired report) is what a hidden report keeps.
-      if (isPresenceReported) startPresenceReporting(chatId, received.clientId, isShown ? "visible" : "hidden");
-      m.redraw();
-    },
-    onShown: () => {
-      isShown = true;
-      if (isPresenceReported) reportPresence("visible");
-      m.redraw();
-    },
-    onHidden: () => {
-      isShown = false;
-      if (isPresenceReported) reportPresence("hidden");
-      m.redraw();
-    },
+    onHandshake,
+    onShown,
+    onHidden,
+    onTheme: (theme, revision, isPreview) => void wearThemeFromMessage({ theme, revision, isPreview }),
+    onKeybindingsChanged: () => void refreshKeybindings(),
   });
+  void refreshKeybindings();
+  mirrorParentTheme();
+  if (connection.isFramed) {
+    // The chat root frames chat pages from this same origin and drives them by calling in
+    // rather than by messaging (of the shell's messages, only the handshake comes down as one);
+    // the shell's own frames ignore this, since a cross-origin parent cannot reach it.
+    const embedApi: ChatPageEmbedApi = {
+      shown: onShown,
+      hidden: onHidden,
+      prependDraft: (text) => prependToComposer(chatId, text),
+      hintComposer: (hint) => setComposerHint(chatId, hint),
+      setCompact: (isCompact) => {
+        setCompactFromRoot(isCompact);
+        m.redraw();
+      },
+      focus: () => {
+        if (!focusComposer()) window.focus();
+      },
+    };
+    window.chatPageEmbed = embedApi;
+  }
   if (!connection.isFramed) {
     // A direct visit has no shell to say when the page is showing; the document's own
-    // visibility is the closest fact, and there is no shell-handed client id to key on.
+    // visibility is the closest fact, and there is no shell-handed client id to report.
     if (isPresenceReported) {
       startPresenceReporting(chatId, "direct-visit", document.visibilityState === "visible" ? "visible" : "hidden");
       document.addEventListener("visibilitychange", () => {
@@ -101,56 +154,63 @@ export function connectChatToShell(chatId: string, options: ChatShellOptions): S
     window.addEventListener("pagehide", () => {
       if (currentPresenceState() !== "closed") reportPresence("closed");
     });
+    window.addEventListener("focus", reportFocusChange);
+    window.addEventListener("blur", reportFocusChange);
   }
-  window.addEventListener("focus", () => connection?.focused());
+  window.addEventListener("focus", () => {
+    connection?.focused();
+    void ensureParticipants();
+  });
+  reportChatLocation(chatId, options.path);
   return connection;
+}
+
+/** Report where this page is and what it is called, now and whenever the chat's title changes.
+ *
+ * A chat's own page is titled after the chat; a sub-agent view reports no title, so the shell
+ * titles its window after the app. */
+function reportChatLocation(chatId: string, path: string): void {
+  let reportedTitle: string | null = null;
+  const report = (): void => {
+    const title = getChatById(chatId)?.title ?? "";
+    if (title === reportedTitle) return;
+    reportedTitle = title;
+    if (title !== "") document.title = title;
+    connection?.location(path, title);
+  };
+  report();
+  addChatsUpdatedListener(report);
 }
 
 /**
  * Open a new chat on `accountId` beside this one, with ``message`` as its first message when
  * given and ``pick`` as the model it runs on (null for the harness's default). The switch
  * dialog's "Start a new chat" calls this with the draft and the pick, and the failed-switch
- * notice with neither. A chat started inside a project carries that project's id in its label;
- * the shell files its tab when it docks the page.
+ * notice with neither. The chat is filed in no project: the desktop has none.
  */
 export async function startChatOnAccount(
   accountId: string,
   message: string = "",
   pick: ModelIdentity | null = null,
 ): Promise<boolean> {
-  const viewId = shellViewId();
-  const projectId = viewId !== "" && !isEverythingView(viewId) ? viewId : "";
   let created: CreatedChat;
   try {
-    created = await createChat(projectId, accountId, message, pick);
+    created = await createChat("", accountId, message, pick);
   } catch (e) {
     alert(`Failed to create chat: ${(e as Error).message}`);
     return false;
   }
-  connection?.open(chatAddress(created.chatId));
+  connection?.openPath(rootPathFor(created.chatId), "focus");
   m.redraw();
   return true;
 }
 
 /**
- * Open the subagent view for `sessionId` of this page's chat beside it. The instance is
- * created first through the chat app's own instances API (its `subagent` action, on this
- * page's origin), which nudges the shell, so the shell lists it before it is asked to dock it.
- * The session belongs to the chat's active agent, which is what the app keys the view on.
+ * Open the subagent view for `sessionId` of this page's chat beside it, by its path alone: the
+ * view's key names the chat, the agent whose harness session it is (the chat's active agent,
+ * else the chat's own id), and the session.
  */
-export async function openSubagentTab(chatId: string, sessionId: string, description: string): Promise<void> {
-  // The app keys the view on the chat's active agent and answers the key it made; the page's
-  // own guess (the listed active agent, else the chat's own id) stands in only when the create
-  // failed, so the open still names the view the app would have made.
-  let key = `${chatId}.${getChatById(chatId)?.active_agent.agent_id ?? chatId}.${sessionId}`;
-  try {
-    const record = await postJson<{ key?: string }>(apiUrl("/_instances"), {
-      action: "subagent",
-      params: { parent: chatId, session: sessionId, description },
-    });
-    if (record?.key) key = record.key;
-  } catch (error) {
-    console.warn(`[chat] could not create the subagent instance ${key}`, error);
-  }
-  connection?.open(chatAddress(key));
+export function openSubagentView(chatId: string, sessionId: string): void {
+  const key = `${chatId}.${getChatById(chatId)?.active_agent.agent_id ?? chatId}.${sessionId}`;
+  connection?.openPath(subagentViewPath(key), "focus");
 }

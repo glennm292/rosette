@@ -1,6 +1,14 @@
+import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
+
+from share_gateway.caddyfile import RegisteredApp
 from share_gateway.caddyfile import build_frame_ancestors_policy
+from share_gateway.caddyfile import build_grantable_service_names
 from share_gateway.caddyfile import build_label_to_name
 from share_gateway.caddyfile import parse_registered_apps
 from share_gateway.caddyfile import render_caddyfile
@@ -39,6 +47,7 @@ def _render(apps_toml: str = _APPS_TOML, chrome_origin: str = _CHROME_ORIGIN) ->
         https_port=8443,
         gateway_port=8791,
         chrome_origin=chrome_origin,
+        access_log_path=Path("/state/share_gateway/access.log"),
     )
 
 
@@ -84,6 +93,57 @@ label = "orphan-99999999"
     assert parse_registered_apps("not toml [[") == []
 
 
+def test_parse_registered_apps_carries_the_description_and_the_api_schema_path() -> None:
+    (described, bare) = parse_registered_apps(
+        """
+[[apps]]
+name = "notes"
+url = "http://localhost:5001"
+label = "notes-11111111"
+description = "Keeps the person's notes."
+api_schema_path = "/api/schema"
+
+[[apps]]
+name = "ttyd"
+url = "http://localhost:5002"
+label = "ttyd-22222222"
+description = 7
+"""
+    )
+    assert (described.description, described.api_schema_path) == ("Keeps the person's notes.", "/api/schema")
+    assert (bare.description, bare.api_schema_path) == ("", "")
+
+
+def test_every_registered_row_but_an_internal_one_is_grantable() -> None:
+    apps = parse_registered_apps(
+        """
+[[apps]]
+name = "notes"
+url = "http://localhost:5001"
+label = "notes-11111111"
+
+[[apps]]
+name = "chat"
+url = "http://localhost:5002"
+label = "chat-22222222"
+system = true
+
+[[apps]]
+name = "terminal-pty"
+url = "http://localhost:5003"
+label = "terminal-pty-33333333"
+internal = true
+
+[[apps]]
+name = "odd"
+url = "http://localhost:5004"
+label = "odd-44444444"
+internal = "no"
+"""
+    )
+    assert build_grantable_service_names(apps) == frozenset({"notes", "chat"})
+
+
 def test_build_label_to_name_maps_labels_back_to_names() -> None:
     apps = parse_registered_apps(_APPS_TOML)
     assert build_label_to_name(apps) == {
@@ -125,8 +185,7 @@ def test_caddyfile_appends_frame_ancestors_allowing_own_family_and_chrome() -> N
     rendered = _render()
 
     assert (
-        f"header Content-Security-Policy \"frame-ancestors 'self' https://*.{_DOMAIN} {_CHROME_ORIGIN}\""
-        in rendered
+        f"header Content-Security-Policy \"frame-ancestors 'self' https://*.{_DOMAIN} {_CHROME_ORIGIN}\"" in rendered
     )
 
 
@@ -144,14 +203,12 @@ def test_caddyfile_routes_health_site_wide_and_unauthenticated() -> None:
     # behind forward_auth) so the chrome can probe any workspace origin it has.
     assert "handle /_health {" in rendered
     health_idx = rendered.index("handle /_health {")
-    forward_auth_idx = rendered.index("forward_auth")
+    forward_auth_idx = rendered.index("forward_auth 127.0.0.1:8791")
     assert health_idx < forward_auth_idx
 
 
 def test_build_frame_ancestors_policy_shapes() -> None:
-    assert build_frame_ancestors_policy(_DOMAIN, _CHROME_ORIGIN) == (
-        f"'self' https://*.{_DOMAIN} {_CHROME_ORIGIN}"
-    )
+    assert build_frame_ancestors_policy(_DOMAIN, _CHROME_ORIGIN) == (f"'self' https://*.{_DOMAIN} {_CHROME_ORIGIN}")
     assert build_frame_ancestors_policy(_DOMAIN, "") == f"'self' https://*.{_DOMAIN}"
 
 
@@ -168,11 +225,125 @@ def test_caddyfile_wires_forward_auth_and_loading_fallback() -> None:
     # Inbound copies of the gateway's identity headers are stripped before the
     # request reaches a backend, and only the verified /_auth/verify values are
     # injected -- so a client can never forge ownership or an email.
-    assert "request_header -X-Share-Owner" in rendered
-    assert "request_header -X-Share-Email" in rendered
-    assert "copy_headers X-Share-Filtered-Cookie>Cookie X-Share-Owner X-Share-Email" in rendered
+    assert "request_header -X-Imbue-Identity" in rendered
+    assert "X-Share-Owner" not in rendered
+    assert "copy_headers X-Share-Filtered-Cookie>Cookie X-Imbue-Identity" in rendered
+    # Textual position inside a handle block does NOT decide when the strip
+    # runs: caddy sorts directives by its own order, which puts forward_auth
+    # before request_header. Only the global order override makes the strip
+    # run first.
+    assert "order request_header before forward_auth" in rendered
     assert "rewrite * /_auth/loading" in rendered
     assert "auto_https off" in rendered
     # h1/h2 only: h3 is UDP and cannot traverse the SNI-passthrough relay, so
     # it must not be advertised via Alt-Svc.
     assert "protocols h1 h2" in rendered
+
+
+def test_caddyfile_serves_the_loading_page_for_a_backend_it_cannot_reach() -> None:
+    rendered = _render()
+
+    assert "handle_errors 502 {" in rendered
+    assert rendered.count("rewrite * /_auth/loading") == 2
+
+
+def test_render_caddyfile_routes_the_agent_surface_and_strips_the_admission_token() -> None:
+    rendered = render_caddyfile(
+        workspace_domain="alpha.example.com",
+        apps=[RegisteredApp("chat", "chat-ch111111", "127.0.0.1", 8010, is_grantable=True)],
+        auth_label="auth-x7k9q2w1",
+        tls_cert_path=Path("/tmp/cert.pem"),
+        tls_key_path=Path("/tmp/key.pem"),
+        https_port=8443,
+        gateway_port=8791,
+        chrome_origin="",
+        access_log_path=Path("/tmp/access.log"),
+    )
+    auth_block = rendered[rendered.index("@auth host auth-x7k9q2w1.alpha.example.com") :]
+    assert "handle /_agent/* {" in auth_block.split("handle {")[0]
+    service_block = rendered[rendered.index("@service_chat host") :]
+    assert "header_up -Authorization" in service_block.split("handle {")[0]
+
+
+def _hardening_block(indent: str) -> str:
+    return "\n".join(
+        f"{indent}{line}"
+        for line in (
+            "header {",
+            '    Strict-Transport-Security "max-age=31536000; includeSubDomains"',
+            "    X-Content-Type-Options nosniff",
+            "    -Server",
+            "    defer",
+            "}",
+        )
+    )
+
+
+def test_caddyfile_hardens_every_response_including_the_error_path() -> None:
+    rendered = _render()
+
+    assert _hardening_block("    ") in rendered
+    # handle_errors runs a handler chain of its own, so the 502 loading page
+    # needs the block of its own.
+    error_block_start = rendered.index("handle_errors 502 {")
+    error_block_end = rendered.index("rewrite * /_auth/loading", error_block_start)
+    assert _hardening_block("        ") in rendered[error_block_start:error_block_end]
+    # The appended frame-ancestors policy stays a plain (non-deferred) add: a
+    # deferred set would overwrite a service's own CSP instead of composing.
+    assert rendered.count("Content-Security-Policy") == 1
+
+
+def test_caddyfile_writes_a_bounded_access_log_without_headers_or_query_strings() -> None:
+    rendered = _render()
+
+    log_block = rendered[rendered.index("    log {") : rendered.index("    # Labels are semi-secret")]
+    assert "output file /state/share_gateway/access.log {" in log_block
+    assert "roll_size 8MiB" in log_block and "roll_keep 4" in log_block and "roll_keep_for 720h" in log_block
+    assert "wrap json" in log_block
+    assert "request>headers delete" in log_block
+    assert "resp_headers delete" in log_block
+    assert 'request>uri regexp `\\?.*$` ""' in log_block
+    # The log sits inside the site block, so it covers every origin of the share.
+    assert rendered.index("https://*.") < rendered.index("    log {")
+
+
+def _caddy_binary() -> str | None:
+    configured = os.environ.get("CADDY_BINARY", "")
+    if configured and Path(configured).exists():
+        return configured
+    return shutil.which("caddy")
+
+
+def test_the_rendered_caddyfile_adapts_with_the_access_log_filters_in_place(tmp_path: Path) -> None:
+    """The log block's syntax is caddy's to judge: ``caddy adapt`` parses the rendered file exactly as the gateway
+    would start it. Skipped where no caddy is installed (CI); a workspace, where the gateway runs, has one."""
+    caddy = _caddy_binary()
+    if caddy is None:
+        pytest.skip("no caddy binary on PATH or in CADDY_BINARY")
+    caddyfile = tmp_path / "Caddyfile"
+    caddyfile.write_text(_render())
+
+    adapted = subprocess.run(
+        [caddy, "adapt", "--config", str(caddyfile), "--adapter", "caddyfile"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert adapted.returncode == 0, adapted.stderr
+    logs = json.loads(adapted.stdout)["logging"]["logs"]
+    (access_log,) = [log for name, log in logs.items() if name != "default"]
+    assert access_log["writer"] == {
+        "filename": "/state/share_gateway/access.log",
+        "output": "file",
+        "roll_keep": 4,
+        "roll_keep_days": 30,
+        "roll_size_mb": 8,
+    }
+    assert access_log["encoder"]["format"] == "filter" and access_log["encoder"]["wrap"] == {"format": "json"}
+    assert access_log["encoder"]["fields"] == {
+        "request>headers": {"filter": "delete"},
+        "request>tls": {"filter": "delete"},
+        "resp_headers": {"filter": "delete"},
+        "request>uri": {"filter": "regexp", "regexp": "\\?.*$"},
+    }

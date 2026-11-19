@@ -1,40 +1,102 @@
-import os
+import time
 import tomllib
 from pathlib import Path
 from typing import Final
 
-from imbue.imbue_common.frozen_model import FrozenModel
-from imbue.imbue_common.primitives import NonEmptyStr
+from app_registration import forward_port
 from loguru import logger
+from pydantic import AliasChoices
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import ValidationError
+from pydantic import field_validator
 
+from app_manifest.errors import AppRegistrationError
 from app_manifest.errors import RegistryReadError
+from app_manifest.manifest import AppParams
 from app_manifest.manifest import DEFAULT_PRIORITY
 from app_manifest.manifest import DefaultShortcut
+from app_manifest.manifest import KeybindingAction
+from app_manifest.manifest import LaunchPathMethod
+from app_manifest.manifest import MessageHandler
+from app_manifest.manifest import Pin
+from app_manifest.manifest import ThemingMode
+from app_manifest.manifest import as_default_shortcut_list
 from app_manifest.manifest import describe_validation_error
-from app_manifest.primitives import ActionId
+from app_manifest.primitives import AppDescription
 from app_manifest.primitives import AppName
 from app_manifest.primitives import AppUrl
 from app_manifest.primitives import DisplayName
-from app_manifest.primitives import InstancesUrl
+from app_manifest.primitives import LaunchParamName
+from app_manifest.primitives import LaunchPathId
+from app_manifest.primitives import LaunchPathValue
 from app_manifest.primitives import PriorityName
+from app_manifest.registry_location import registry_path
+from imbue.imbue_common.frozen_model import FrozenModel
+from imbue.imbue_common.primitives import NonEmptyStr
 
-# The registry's location, exactly as system/scripts/forward_port.py and
-# system/scripts/layout.py resolve it: relative to the cwd (the repo root under
-# supervisord) unless MINDS_APPS_FILE points elsewhere.
-DEFAULT_APPS_FILE: Final[str] = "data/.state/apps.toml"
-ENV_APPS_FILE: Final[str] = "MINDS_APPS_FILE"
+# The browser-side app contract module (desktop-interface contracts.md section 7), where the
+# shell's frontend build writes it, relative to the repo root every supervised program runs
+# from. An app page imports it from its own origin, so every app serves this one file at
+# ``APP_CONTRACT_ROUTE`` itself: a module import is a fetch without cookies, which the desktop
+# client's forwarder and the share gateway refuse across origins.
+SHELL_APP_CONTRACT_PATH: Final[Path] = Path(
+    "system/apps/system_interface/imbue/system_interface/static/_static/app_contract.js"
+)
+APP_CONTRACT_ROUTE: Final[str] = "/_static/app_contract.js"
+# The element context menu module (the element-reference-menu plan, section 9), built beside the
+# contract and served by every app the same way, at ``CONTEXT_MENU_ROUTE``.
+SHELL_CONTEXT_MENU_PATH: Final[Path] = Path(
+    "system/apps/system_interface/imbue/system_interface/static/_static/context_menu.js"
+)
+CONTEXT_MENU_ROUTE: Final[str] = "/_static/context_menu.js"
+# Every shell module an app's pages import.
+SHELL_MODULE_PATHS: Final[tuple[Path, ...]] = (
+    SHELL_APP_CONTRACT_PATH,
+    SHELL_CONTEXT_MENU_PATH,
+)
+
+# Registration is one local file write; past this it is suspicious.
+REGISTRATION_SLOW_SECONDS: Final[float] = 2.0
 
 
-class RegistryAction(FrozenModel):
-    """An action as copied onto a registry row: the id, the label, and the names of its params."""
+class RegistryLaunchPath(FrozenModel):
+    """A launch path as copied onto a registry row: the id, the label, the path and its method, the names of its
+    params, its presets, and which param takes typed or drafted text, or a mention. A row an older release wrote
+    lacks the method, the presets, the draft param, and the mention param, and reads as the GET launch path it
+    was."""
 
-    id: ActionId = Field(description="The declared action id")
-    label: NonEmptyStr = Field(description="The action's user-facing label")
-    params: tuple[NonEmptyStr, ...] = Field(
-        default=(), description="The names of the create body's documented params, in manifest order"
+    id: LaunchPathId = Field(description="The declared launch path id")
+    label: NonEmptyStr = Field(description="The launch path's user-facing label")
+    path: LaunchPathValue = Field(description="The path under the app origin")
+    method: LaunchPathMethod = Field(
+        default=LaunchPathMethod.GET,
+        description="GET opens at the path; POST posts to it for the path to open",
+    )
+    params: tuple[LaunchParamName, ...] = Field(
+        default=(),
+        description="The names of the params a caller may supply, in manifest order",
+    )
+    presets: dict[LaunchParamName, str] = Field(
+        default_factory=dict,
+        description="The fixed name-value pairs sent with every launch of the path",
+    )
+    text_param: LaunchParamName | None = Field(
+        default=None,
+        description="The param the launcher fills with typed text; absent means the path takes none",
+    )
+    draft_param: LaunchParamName | None = Field(
+        default=None,
+        description="The param the shell fills with text to be drafted; absent means the path takes none",
+    )
+    mention_param: LaunchParamName | None = Field(
+        default=None,
+        description="The param the shell fills with a mention of a clicked person; absent means the path takes none",
+    )
+    app_params: AppParams | None = Field(
+        default=None,
+        description="The params the shell fills with an app's name and display name when its window's \"Chat about "
+        'this app" button is pressed; absent means the path is about no app',
     )
 
 
@@ -52,21 +114,79 @@ class RegistryRow(FrozenModel):
     label: str = Field(default="", description="The unguessable origin label; never an identifier")
     icon: str | None = Field(default=None, description="The registered SVG markup, verbatim")
     internal: bool = Field(default=False, description="Hidden from every open surface")
-    program: str | None = Field(default=None, description="The supervisord program that runs the app, when supervised")
+    system: bool = Field(
+        default=False,
+        description="Part of the workspace itself rather than an app built on it: the minds Share tab lists it under "
+        "its System group instead of offering it up front",
+    )
+    program: str | None = Field(
+        default=None,
+        description="The supervisord program that runs the app, when supervised",
+    )
     display_name: DisplayName | None = Field(default=None, description="What users see; absent on manifest-less rows")
-    instances: bool = Field(default=False, description="Whether the app serves the instances API")
-    instances_url: InstancesUrl | None = Field(default=None, description="Where the instances API is served; absent reads as url")
-    critical: bool = Field(default=False, description="No Stop verb; snapshot-and-rollback target in the update apply")
+    description: AppDescription | None = Field(
+        default=None,
+        description="One line saying what the app is for, when its manifest declares one",
+    )
+    api_schema_path: LaunchPathValue | None = Field(
+        default=None,
+        description="The path under the app's origin answering its OpenAPI document, when it declares one",
+    )
+    critical: bool = Field(
+        default=False,
+        description="No Quit verb; never stopped or parked by the shell; snapshot-and-rollback target in the "
+        "update apply",
+    )
+    stop_when_no_windows: bool = Field(
+        default=False,
+        description="Whether the shell may stop the app's program once no window shows it",
+    )
+    uses_microphone: bool = Field(
+        default=False,
+        description="Whether the shell delegates the microphone to the app's frames",
+    )
     priority: PriorityName = Field(default=DEFAULT_PRIORITY, description="The memory-shedding band name")
-    default_shortcut: DefaultShortcut | None = Field(default=None, description="The rail row a new project is seeded with")
-    actions: tuple[RegistryAction, ...] = Field(default=(), description="The declared create actions")
+    # CLEANUP: drop the ``default_shortcut`` alias and ``_read_one_default_shortcut_as_a_list`` once no registry row
+    # predates the ``default_shortcuts`` key; every app rewrites its row when it next starts.
+    default_shortcuts: tuple[DefaultShortcut, ...] = Field(
+        default=(),
+        validation_alias=AliasChoices("default_shortcuts", "default_shortcut"),
+        description="The shortcuts a new desktop is seeded with, in order; an older row's one ``default_shortcut`` "
+        "reads as a list of one",
+    )
+    launch_paths: tuple[RegistryLaunchPath, ...] = Field(
+        default=(), description="The paths the desktop interface opens windows at"
+    )
     launcher_rank: int | None = Field(
-        default=None, description="The app's place among the New Tab page's leading tiles; absent reads as none"
+        default=None,
+        description="The app's place among the launcher's leading tiles; absent reads as none",
+    )
+    pin: Pin | None = Field(
+        default=None,
+        description="The app's pinned taskbar entry, when its manifest declares one",
+    )
+    window_closed_path: LaunchPathValue | None = Field(
+        default=None,
+        description="Where the shell posts a closed window of the app; absent means no post",
+    )
+    message_handlers: tuple[MessageHandler, ...] = Field(
+        default=(),
+        description="The messages the app takes and where the shell posts each; absent means none",
+    )
+    keybindings: tuple[KeybindingAction, ...] = Field(
+        default=(),
+        description="The actions a person may re-bind, with their default chords; absent means none",
+    )
+    theming_mode: ThemingMode | None = Field(
+        default=None,
+        description="How the app takes part in workspace themes, when its manifest declares [theming]; absent means "
+        "the app does not wear them yet and can be made themeable",
     )
 
-
-def registry_path() -> Path:
-    return Path(os.environ.get(ENV_APPS_FILE, DEFAULT_APPS_FILE))
+    @field_validator("default_shortcuts", mode="before")
+    @classmethod
+    def _read_one_default_shortcut_as_a_list(cls, value: object) -> object:
+        return as_default_shortcut_list(value)
 
 
 def read_registry(path: Path) -> list[RegistryRow]:
@@ -100,3 +220,38 @@ def read_registry(path: Path) -> list[RegistryRow]:
                 describe_validation_error(e),
             )
     return rows
+
+
+def read_origin_label(path: Path, name: AppName) -> str:
+    """The origin label of the app registered as ``name``, or "" when none is, or the registry cannot be read.
+
+    Read per page load rather than watched: a label is minted once per workspace and the
+    registry is one small file, and an unreadable registry costs the page the origin it wanted
+    to derive, never the page.
+    """
+    try:
+        rows = read_registry(path)
+    except RegistryReadError as e:
+        logger.warning("Could not read the app registry for the origin label of {}: {}", name, e)
+        return ""
+    for row in rows:
+        if row.name == name:
+            return row.label
+    return ""
+
+
+def register_app(manifest_path: Path, app_url: AppUrl) -> None:
+    """Upsert the app's registry row from its manifest, as ``forward_port.py --manifest`` does; raises
+    AppRegistrationError when the manifest or the registration is refused.
+
+    Every app's entry point calls this at startup, from the repo root (the supervisord program lines
+    of apps with no entry point run the script directly).
+    """
+    started_at = time.monotonic()
+    try:
+        forward_port.register_manifest(registry_path(), manifest_path, app_url)
+    except (forward_port.RegistryError, OSError, ValueError) as e:
+        raise AppRegistrationError(f"registration of {manifest_path} failed: {e}") from e
+    elapsed = time.monotonic() - started_at
+    if elapsed > REGISTRATION_SLOW_SECONDS:
+        logger.warning("Registered {} slowly, in {:.1f}s", manifest_path, elapsed)

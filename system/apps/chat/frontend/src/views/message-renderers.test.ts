@@ -1,33 +1,83 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import m from "mithril";
-import type { ToolCall, ToolResultEvent, TranscriptEvent } from "../models/Response";
+import type { ToolCall, TranscriptEvent } from "../models/Response";
 import type { AssistantMessageEvent } from "../models/Response";
 import {
   buildToolResultsWithSkillExpansions,
   renderAssistantMessageChildren,
+  renderAssistantRun,
   renderSubagentCard,
-  renderToolCallBlock,
 } from "./message-renderers";
 import { isSkillExpansionUserMessage } from "./message-classification";
 import { setBlockExpanded } from "./expansion-state";
+import { resetResendStatesForTesting } from "./auth-recovery";
+import { getOutgoingMessages } from "../models/OutgoingMessages";
+import { chatSnapshotFixture } from "../models/chatSnapshotFixture";
+import {
+  closeProviderChooser,
+  getUnpickableAccount,
+  isPickingAccount,
+  isProviderChooserOpen,
+  pickAccount,
+  takeChooserAccountId,
+} from "../models/Providers";
+import { startChatOnAccount } from "../shell";
 
 // Avoid importing the shell connection (chat/shell.ts, which pulls in the agents store) and
 // the DOM-dependent markdown renderer (dompurify) at test time; renderSubagentCard only
-// needs openSubagentTab, and the card path never calls MarkdownContent.
-vi.mock("../shell", () => ({ openSubagentTab: vi.fn(), startChatOnAccount: vi.fn() }));
+// needs openSubagentView, and the card path never calls MarkdownContent.
+vi.mock("../shell", () => ({ openSubagentView: vi.fn(), startChatOnAccount: vi.fn() }));
 vi.mock("../markdown", () => ({ MarkdownContent: () => null }));
+
+// The auth-error note moves the chat through the switch dialog's entry point and reads the chat
+// from its model; the chooser's open/pick state is the real module's.
+const switching = vi.hoisted(() => {
+  // Opening the chooser redraws, and mithril schedules a redraw on an animation frame.
+  globalThis.requestAnimationFrame ??= ((cb: FrameRequestCallback): number =>
+    setTimeout(() => cb(0), 0) as unknown as number) as typeof globalThis.requestAnimationFrame;
+  return {
+    chat: undefined as unknown,
+    beginSwitchToAccountId: vi.fn(),
+    // The account ids the page lists as signed in, and whether it has read that list yet; the rest
+    // of the providers module is real.
+    signedInAccountIds: new Set<string>(),
+    // When each signed-in account last finished a sign-in; absent reads as never stamped.
+    signedInAtById: new Map<string, string>(),
+    areAccountsLoaded: true,
+  };
+});
+vi.mock("./SwitchDialog", () => ({ beginSwitchToAccountId: switching.beginSwitchToAccountId }));
+vi.mock("../models/Providers", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../models/Providers")>()),
+  accountForAgent: (accountId?: string) =>
+    accountId !== undefined && switching.signedInAccountIds.has(accountId)
+      ? { id: accountId, signed_in_at: switching.signedInAtById.get(accountId) ?? null }
+      : null,
+  areAccountsLoaded: () => switching.areAccountsLoaded,
+}));
+vi.mock("../models/Chats", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../models/Chats")>()),
+  getChatById: () => switching.chat,
+}));
 
 // The render paths ask the detail cache for on-demand payloads (and kick off fetches);
 // stub those three so tests control the state machine without mithril's XHR.
-const { mockDetailState, mockRequestDetail } = vi.hoisted(() => ({
+const { mockDetailState, mockRequestDetail, transcript } = vi.hoisted(() => ({
   mockDetailState: vi.fn(),
   mockRequestDetail: vi.fn(),
+  // The chat's held transcript, and the send the recovered sign-in note makes.
+  transcript: {
+    events: [] as unknown[],
+    sendMessage: vi.fn(async () => "ok"),
+  },
 }));
 vi.mock("../models/Response", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../models/Response")>()),
   getEventDetailState: mockDetailState,
   getEventDetailVersion: () => 0,
   requestEventDetail: mockRequestDetail,
+  getEventsForChat: () => transcript.events,
+  sendMessage: transcript.sendMessage,
 }));
 
 function skillToolCall(ts: string, callId: string): TranscriptEvent {
@@ -113,7 +163,7 @@ describe("renderAssistantMessageChildren API errors", () => {
     const classes = collectClasses(children);
     expect(classes).toContain("message-api-error");
     expect(classes).toContain("message-api-error-note");
-    expect(allText(children)).toContain("isn't Mind's fault");
+    expect(allText(children)).toContain("isn't Imbue Studio's fault");
     expect(allText(children)).toContain("overloaded");
   });
 
@@ -365,43 +415,94 @@ describe("renderSubagentCard", () => {
   });
 });
 
-describe("renderToolCallBlock", () => {
-  // A real codex code-mode call: tool_name is always "exec"; the operation is buried
-  // in the JS input as tools.<fn>(...). The header should surface what it ran.
-  const execCall: ToolCall = {
-    tool_call_id: "c1",
-    tool_name: "exec",
-    input_chars: 72,
-    header_label: "Tool: Bash",
-  };
-
-  it("renders the parser's header label", () => {
-    const text = allText(renderToolCallBlock(execCall, null, "agent-x", "a-1"));
-    // A codex exec is headed by what it actually did, never the bare "Tool: exec".
-    expect(text).toContain("Tool: Bash");
-    expect(text).not.toContain("Tool: exec");
-  });
-
-  it("falls back to 'Tool: <name>' for a call parsed before labels existed", () => {
-    const bash: ToolCall = { tool_call_id: "c2", tool_name: "Bash", input_chars: 6 };
-    expect(allText(renderToolCallBlock(bash, null, "agent-x", "a-1"))).toContain("Tool: Bash");
-  });
-
-  it("keeps a failed call glanceable via the resident error snippet", () => {
-    const call: ToolCall = { tool_call_id: "c3", tool_name: "Bash", input_chars: 6 };
-    const failed: ToolResultEvent = {
+describe("renderAssistantRun", () => {
+  function assistantEvent(id: string, text: string, calls: ToolCall[]): AssistantMessageEvent {
+    return {
       timestamp: "t",
-      type: "tool_result",
-      event_id: "r-c3",
+      type: "assistant_message",
+      event_id: id,
       source: "test",
-      tool_call_id: "c3",
-      tool_name: "Bash",
-      output_chars: 5000,
-      is_error: true,
-      error_snippet: "FileNotFoundError: no such file",
+      model: "m",
+      text,
+      tool_calls: calls,
+      stop_reason: null,
+      usage: null,
+      is_auth_error: false,
+      is_api_error: false,
+      api_error_kind: null,
+      is_provider_fault: false,
     };
-    const text = allText(renderToolCallBlock(call, failed, "agent-x", "a-1"));
-    expect(text).toContain("FileNotFoundError: no such file");
+  }
+
+  function call(id: string, name = "Read"): ToolCall {
+    return { tool_call_id: id, tool_name: name, input_chars: 10 };
+  }
+
+  /** The chips of each ToolChipGroup in a rendered run, in order. */
+  function chipRows(children: unknown[]): string[][] {
+    return children
+      .filter((c): c is m.Vnode<{ chips: { call: ToolCall }[] }> => {
+        const v = c as { attrs?: { chips?: unknown } };
+        return Array.isArray(v?.attrs?.chips);
+      })
+      .map((group) => group.attrs.chips.map((chip) => chip.call.tool_call_id));
+  }
+
+  it("merges consecutive tool calls into one row, across event boundaries", () => {
+    // A harness emits one event per model response, so a run of tool calls is
+    // usually a run of EVENTS -- the case that matters most and the one that
+    // grouping within a single event would miss entirely.
+    const children = renderAssistantRun(
+      [
+        assistantEvent("a1", "", [call("t1")]),
+        assistantEvent("a2", "", [call("t2", "Bash")]),
+        assistantEvent("a3", "", [call("t3")]),
+      ],
+      new Map(),
+      "agent-x",
+    );
+    expect(chipRows(children)).toEqual([["t1", "t2", "t3"]]);
+  });
+
+  it("breaks the row where the agent speaks", () => {
+    const children = renderAssistantRun(
+      [assistantEvent("a1", "", [call("t1")]), assistantEvent("a2", "and now the other file", [call("t2")])],
+      new Map(),
+      "agent-x",
+    );
+    expect(chipRows(children)).toEqual([["t1"], ["t2"]]);
+  });
+
+  it("keeps each chip pointing at the event that issued it", () => {
+    const children = renderAssistantRun(
+      [assistantEvent("a1", "", [call("t1")]), assistantEvent("a2", "", [call("t2")])],
+      new Map(),
+      "agent-x",
+    );
+    const group = children.find((c) =>
+      Array.isArray((c as { attrs?: { chips?: unknown } })?.attrs?.chips),
+    ) as m.Vnode<{
+      chips: { eventId: string }[];
+    }>;
+    // The input of a call is fetched from ITS event, so a merged row cannot
+    // collapse them onto one id.
+    expect(group.attrs.chips.map((chip) => chip.eventId)).toEqual(["a1", "a2"]);
+  });
+
+  it("breaks the row for a sub-agent card, which is a conversation rather than an action", () => {
+    const agentCall: ToolCall = {
+      tool_call_id: "t2",
+      tool_name: "Agent",
+      input_chars: 10,
+      description: "explore foo",
+      subagent_type: "Explore",
+    };
+    const children = renderAssistantRun(
+      [assistantEvent("a1", "", [call("t1"), agentCall, call("t3")])],
+      new Map(),
+      "agent-x",
+    );
+    expect(chipRows(children)).toEqual([["t1"], ["t3"]]);
   });
 });
 
@@ -536,70 +637,337 @@ describe("thinking disclosure", () => {
   });
 });
 
-// Walk a mithril vnode tree and return the first element vnode whose class contains `name`.
-function findByClass(node: unknown, name: string): { attrs?: Record<string, unknown> } | null {
-  if (node == null) return null;
+interface VnodeLike {
+  tag?: unknown;
+  text?: unknown;
+  children?: unknown;
+  attrs?: Record<string, unknown>;
+}
+
+// Walk a mithril vnode tree and return the first vnode `isMatch` accepts. A match is not
+// descended into, so the outermost of a nest of matches wins.
+function findVnode(node: unknown, isMatch: (vnode: VnodeLike) => boolean): VnodeLike | null {
+  if (node == null || typeof node !== "object") return null;
   if (Array.isArray(node)) {
     for (const child of node) {
-      const found = findByClass(child, name);
-      if (found) return found;
+      const found = findVnode(child, isMatch);
+      if (found !== null) return found;
     }
     return null;
   }
-  if (typeof node === "object") {
-    const v = node as { attrs?: { className?: unknown }; children?: unknown };
-    if (typeof v.attrs?.className === "string" && v.attrs.className.split(" ").includes(name)) {
-      return v as { attrs?: Record<string, unknown> };
-    }
-    return findByClass(v.children, name);
-  }
-  return null;
+  const v = node as VnodeLike;
+  if (isMatch(v)) return v;
+  return findVnode(v.children, isMatch);
 }
 
-describe("expanded tool row payload states", () => {
-  const call: ToolCall = { tool_call_id: "pc-1", tool_name: "Bash", input_chars: 20 };
-  const result: ToolResultEvent = {
-    timestamp: "t",
-    type: "tool_result",
-    event_id: "r-pc-1",
-    source: "test",
-    tool_call_id: "pc-1",
-    tool_name: "Bash",
-    output_chars: 5000,
-    is_error: false,
-  };
+// The first element vnode whose class contains `name`.
+function findByClass(node: unknown, name: string): { attrs?: Record<string, unknown> } | null {
+  return findVnode(node, (v) => {
+    const className = v.attrs?.className;
+    return typeof className === "string" && className.split(" ").includes(name);
+  });
+}
+
+describe("the auth-error note's switch link", () => {
+  const OPENAI_ID = "acct-openai";
+  const ANTHROPIC_ID = "acct-anthropic";
+
+  function authErrorEvent(): AssistantMessageEvent {
+    return { ...apiErrorEvent("API Error: 401 invalid api key", null, false, true), is_auth_error: true };
+  }
+
+  function findButton(node: unknown, label: string): { attrs: { onclick: () => void } } | null {
+    const found = findVnode(node, (v) => v.tag === "button" && allText(v).trim() === label);
+    return found === null ? null : (found as { attrs: { onclick: () => void } });
+  }
 
   beforeEach(() => {
-    mockDetailState.mockReset();
-    mockRequestDetail.mockReset();
-    setBlockExpanded("tc:pc-1", true);
+    closeProviderChooser();
+    switching.beginSwitchToAccountId.mockClear();
+    vi.mocked(startChatOnAccount).mockClear();
+    switching.chat = chatSnapshotFixture("chat-1", { active_agent: { harness: "codex", account_id: OPENAI_ID } });
+    switching.signedInAccountIds = new Set([OPENAI_ID, ANTHROPIC_ID]);
+    switching.signedInAtById = new Map();
+    switching.areAccountsLoaded = true;
   });
 
-  it("shows loading notes and requests the payloads while nothing is cached", () => {
-    mockDetailState.mockReturnValue(undefined);
-    const text = allText(renderToolCallBlock(call, result, "agent-x", "a-pc-1"));
-    expect(text).toContain("Loading");
-    expect(mockRequestDetail).toHaveBeenCalledWith("agent-x", "a-pc-1");
-    expect(mockRequestDetail).toHaveBeenCalledWith("agent-x", "r-pc-1");
+  it("signs the chat's own account in again in place while that account is still signed in", () => {
+    const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+    findButton(children, "Sign in again")!.attrs.onclick();
+
+    expect(isProviderChooserOpen()).toBe(true);
+    expect(isPickingAccount()).toBe(false);
+    expect(takeChooserAccountId()).toBe(OPENAI_ID);
+    closeProviderChooser();
   });
 
-  it("renders the full fetched input and output once loaded", () => {
-    mockDetailState.mockImplementation((_chatId: string, eventId: string) =>
-      eventId === "a-pc-1"
-        ? {
-            state: "loaded",
-            detail: { inputs_by_tool_call_id: { "pc-1": "the whole input" }, output: null, thinking: null },
-          }
-        : { state: "loaded", detail: { inputs_by_tool_call_id: {}, output: "the whole output", thinking: null } },
-    );
-    const text = allText(renderToolCallBlock(call, result, "agent-x", "a-pc-1"));
-    expect(text).toContain("the whole input");
-    expect(text).toContain("the whole output");
+  it("moves a chat whose account is gone onto the account signed in again, rather than leaving it unbound", () => {
+    // Signed out and signed in again: the new sign-in is a new account, and the chat's label still
+    // names the old one.
+    switching.signedInAccountIds = new Set([ANTHROPIC_ID]);
+    const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+    findButton(children, "Sign in again")!.attrs.onclick();
+
+    expect(isPickingAccount()).toBe(true);
+    expect(takeChooserAccountId()).toBeNull();
+    pickAccount(ANTHROPIC_ID);
+
+    expect(switching.beginSwitchToAccountId).toHaveBeenCalledExactlyOnceWith("chat-1", ANTHROPIC_ID);
   });
 
-  it("shows the quiet placeholder when the payload is gone", () => {
-    mockDetailState.mockReturnValue({ state: "unavailable" });
-    const text = allText(renderToolCallBlock(call, result, "agent-x", "a-pc-1"));
-    expect(text).toContain("No longer available");
+  it("signs the chat's own account in again in place while the account list has not loaded", () => {
+    switching.areAccountsLoaded = false;
+    switching.signedInAccountIds = new Set();
+    const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+    findButton(children, "Sign in again")!.attrs.onclick();
+
+    expect(isPickingAccount()).toBe(false);
+    expect(takeChooserAccountId()).toBe(OPENAI_ID);
+    closeProviderChooser();
+  });
+
+  it("switches the failed chat to the account picked, rather than starting a new chat", () => {
+    const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+    findButton(children, "switch to another provider")!.attrs.onclick();
+
+    expect(isProviderChooserOpen()).toBe(true);
+    expect(isPickingAccount()).toBe(true);
+    expect(getUnpickableAccount()).toEqual({ accountId: OPENAI_ID, reason: "failing" });
+
+    pickAccount(ANTHROPIC_ID);
+
+    expect(switching.beginSwitchToAccountId).toHaveBeenCalledExactlyOnceWith("chat-1", ANTHROPIC_ID);
+    expect(startChatOnAccount).not.toHaveBeenCalled();
+    expect(isProviderChooserOpen()).toBe(false);
+  });
+
+  describe("once the account has signed in again", () => {
+    const PROMPT = {
+      timestamp: "2026-08-05T23:59:59.000Z",
+      type: "user_message",
+      event_id: "prompt-1",
+      source: "test",
+      content: "Summarize the deploy thread",
+    };
+
+    beforeEach(() => {
+      resetResendStatesForTesting();
+      transcript.sendMessage.mockClear();
+      switching.signedInAtById = new Map([[OPENAI_ID, "2026-08-06T00:05:00.000Z"]]);
+    });
+
+    it("stops asking for a sign-in and offers the failed message again while nothing came after it", async () => {
+      transcript.events = [PROMPT, authErrorEvent()];
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+
+      expect(allText(children)).toContain("Signed in again.");
+      expect(findButton(children, "Sign in again")).toBeNull();
+      expect(collectClasses(children)).not.toContain("message-api-error");
+      findButton(children, "Send your message again")!.attrs.onclick();
+      await Promise.resolve();
+      expect(transcript.sendMessage).toHaveBeenCalledExactlyOnceWith(
+        "chat-1",
+        "Summarize the deploy thread",
+        expect.any(String),
+      );
+    });
+
+    it("sends a prompt that carried context as it was first sent, and paints only the user's words", async () => {
+      transcript.events = [
+        {
+          ...PROMPT,
+          display: "prompt_with_context",
+          content: "<context>seed</context>\nSummarize the deploy thread",
+          display_body: "Summarize the deploy thread",
+        },
+        authErrorEvent(),
+      ];
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+      const bubblesBefore = getOutgoingMessages("chat-1").length;
+
+      findButton(children, "Send your message again")!.attrs.onclick();
+      expect(
+        getOutgoingMessages("chat-1")
+          .slice(bubblesBefore)
+          .map((bubble) => bubble.content),
+      ).toEqual(["Summarize the deploy thread"]);
+      await Promise.resolve();
+      expect(transcript.sendMessage).toHaveBeenCalledExactlyOnceWith(
+        "chat-1",
+        "<context>seed</context>\nSummarize the deploy thread",
+        expect.any(String),
+      );
+    });
+
+    it("offers the message the failure refused when the failure was written ahead of it", () => {
+      transcript.events = [authErrorEvent(), PROMPT];
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+
+      expect(findButton(children, "Send your message again")).not.toBeNull();
+    });
+
+    it("says the chat app is sending the message again, and offers no send of its own, while it does", () => {
+      switching.chat = chatSnapshotFixture("chat-1", {
+        active_agent: { harness: "codex", account_id: OPENAI_ID, is_resending_after_sign_in: true },
+      });
+      transcript.events = [PROMPT, authErrorEvent()];
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+
+      expect(allText(children)).toContain("Sending your message again");
+      expect(findButton(children, "Send your message again")).toBeNull();
+    });
+
+    it("offers nothing to send for a prompt that carried no words of the user's", () => {
+      transcript.events = [
+        { ...PROMPT, display: "prompt_with_context", content: "<context>seed</context>", display_body: "" },
+        authErrorEvent(),
+      ];
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+
+      expect(allText(children)).toContain("Signed in again.");
+      expect(findButton(children, "Send your message again")).toBeNull();
+    });
+
+    it("drops the sending bubble of a resend the chat app took back", async () => {
+      transcript.events = [PROMPT, authErrorEvent()];
+      transcript.sendMessage.mockResolvedValueOnce("withdrawn");
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+
+      const bubblesBefore = getOutgoingMessages("chat-1").length;
+      findButton(children, "Send your message again")!.attrs.onclick();
+      expect(getOutgoingMessages("chat-1")).toHaveLength(bubblesBefore + 1);
+      await vi.waitFor(() => expect(getOutgoingMessages("chat-1")).toHaveLength(bubblesBefore));
+    });
+
+    it("sends none of the remaining messages once Stop took one back", async () => {
+      const second = { ...PROMPT, event_id: "prompt-2", content: "And the release notes" };
+      transcript.events = [PROMPT, second, authErrorEvent()];
+      transcript.sendMessage.mockResolvedValueOnce("withdrawn");
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+
+      findButton(children, "Send your message again")!.attrs.onclick();
+      await vi.waitFor(() =>
+        expect(allText(renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1"))).not.toContain(
+          "Send your message again",
+        ),
+      );
+      expect(transcript.sendMessage).toHaveBeenCalledExactlyOnceWith(
+        "chat-1",
+        "Summarize the deploy thread",
+        expect.any(String),
+      );
+    });
+
+    it("says the resend didn't go and offers it again when the send fails", async () => {
+      transcript.events = [PROMPT, authErrorEvent()];
+      transcript.sendMessage.mockRejectedValueOnce(new Error("offline"));
+      vi.spyOn(console, "error").mockImplementationOnce(() => {});
+      const bubblesBefore = getOutgoingMessages("chat-1").length;
+
+      findButton(
+        renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1"),
+        "Send your message again",
+      )!.attrs.onclick();
+      await vi.waitFor(() => expect(getOutgoingMessages("chat-1")).toHaveLength(bubblesBefore));
+
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+      expect(allText(children)).toContain("That didn't send.");
+      expect(findButton(children, "Try again")).not.toBeNull();
+    });
+
+    it("takes a resend the chat app had to send twice as sent", async () => {
+      transcript.events = [PROMPT, authErrorEvent()];
+      transcript.sendMessage.mockResolvedValueOnce("resent");
+      transcript.sendMessage.mockClear();
+
+      findButton(
+        renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1"),
+        "Send your message again",
+      )!.attrs.onclick();
+      await vi.waitFor(() => expect(transcript.sendMessage).toHaveBeenCalledTimes(1));
+
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+      expect(allText(children)).not.toContain("That didn't send.");
+      expect(allText(children)).not.toContain("Couldn't confirm your message arrived");
+    });
+
+    it("asks the user to check the agent before sending a resend mngr could not confirm again", async () => {
+      transcript.events = [PROMPT, authErrorEvent()];
+      transcript.sendMessage.mockRejectedValueOnce({ response: { kind: "submission_unconfirmed" } });
+      vi.spyOn(console, "error").mockImplementationOnce(() => {});
+      const bubblesBefore = getOutgoingMessages("chat-1").length;
+
+      findButton(
+        renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1"),
+        "Send your message again",
+      )!.attrs.onclick();
+      await vi.waitFor(() => expect(getOutgoingMessages("chat-1")).toHaveLength(bubblesBefore));
+
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+      expect(allText(children)).toContain("Couldn't confirm your message arrived");
+      expect(allText(children)).not.toContain("That didn't send.");
+      expect(findButton(children, "Try again")).toBeNull();
+      expect(findButton(children, "Send again")).not.toBeNull();
+    });
+
+    it("reads a resend that got no answer as unconfirmed, and sends it again under the same id", async () => {
+      transcript.events = [PROMPT, authErrorEvent()];
+      transcript.sendMessage.mockRejectedValueOnce({ code: 0, response: null });
+      vi.spyOn(console, "error").mockImplementationOnce(() => {});
+      const bubblesBefore = getOutgoingMessages("chat-1").length;
+
+      findButton(
+        renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1"),
+        "Send your message again",
+      )!.attrs.onclick();
+      await vi.waitFor(() => expect(getOutgoingMessages("chat-1")).toHaveLength(bubblesBefore));
+
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+      expect(allText(children)).toContain("Couldn't confirm your message arrived");
+      expect(findButton(children, "Try again")).toBeNull();
+      findButton(children, "Send again")!.attrs.onclick();
+      await vi.waitFor(() => expect(transcript.sendMessage).toHaveBeenCalledTimes(2));
+      const [first, second] = transcript.sendMessage.mock.calls as unknown as [string, string, string][];
+      expect(second[2]).toBe(first[2]);
+    });
+
+    it("offers nothing to send once the user has written since", () => {
+      transcript.events = [
+        PROMPT,
+        authErrorEvent(),
+        { ...PROMPT, event_id: "prompt-2", timestamp: "2026-08-06T00:01:00.000Z", content: "Never mind" },
+      ];
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+
+      expect(allText(children)).toContain("Signed in again.");
+      expect(findButton(children, "Send your message again")).toBeNull();
+    });
+
+    it("still asks for a sign-in when the account last signed in before the turn failed", () => {
+      switching.signedInAtById = new Map([[OPENAI_ID, "2026-08-05T00:00:00.000Z"]]);
+      transcript.events = [PROMPT, authErrorEvent()];
+      const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+
+      expect(findButton(children, "Sign in again")).not.toBeNull();
+      expect(allText(children)).not.toContain("Signed in again.");
+    });
+
+    it("leaves a failure of an agent the chat switched away from as it was, offering no send", () => {
+      const predecessorFailure = { ...authErrorEvent(), agent_id: "agent-before-the-switch" };
+      transcript.events = [{ ...PROMPT, agent_id: "agent-before-the-switch" }, predecessorFailure];
+      const children = renderAssistantMessageChildren(predecessorFailure, new Map(), "chat-1");
+
+      expect(allText(children)).not.toContain("Signed in again.");
+      expect(findButton(children, "Send your message again")).toBeNull();
+      expect(findButton(children, "Sign in again")).not.toBeNull();
+    });
+  });
+
+  it("is not offered until the chat itself is known", () => {
+    switching.chat = undefined;
+    const children = renderAssistantMessageChildren(authErrorEvent(), new Map(), "chat-1");
+
+    expect(findButton(children, "switch to another provider")).toBeNull();
+    expect(findButton(children, "Sign in again")).not.toBeNull();
   });
 });

@@ -1,17 +1,21 @@
 # system/
 
 The machinery that runs this workspace. Users don't need anything in here
-day-to-day, but every part is inspectable and the mind maintains it.
+day-to-day, but every part is inspectable and the agent maintains it.
 
 - `apps/` - Everything you can open as a tab: the built-in apps and the apps
-  your mind builds for you.
-- `services/` - Standalone background services (supervised or cron-driven).
+  your agent builds for you.
+- `services/` - Standalone background services, supervised by supervisord (scheduled work is a routine).
+- `routines/` - One TOML file per routine: everything that runs on a schedule
+  and exits (the root `routines/` symlink points here). The Routines app shows
+  them; the `manage-routines` skill writes them.
 - `libs/` - Support libraries, including the first-boot bootstrap and the
-  automations machinery.
+  routines library (everything that runs on a schedule).
 - `scripts/` - Provisioning and utility scripts (image build, boot, Claude
   Code hooks).
-- `vendor/` - Vendored external repos: `mngr` (the agent manager this
-  workspace runs on) and `tk` (the ticket tracker).
+- `vendor/` - `tk` (the vendored ticket tracker) and gitignored `mngr-assets/`
+  (the few non-Python files fetched at build time from the mngr commit
+  `pyproject.toml` pins). mngr itself is installed as packages from that commit.
 - `config/` - Tracked workspace configuration (`parent.toml`, the upstream
   template pointer). Runtime-written config lives in `data/system/` instead.
 - `changelog/` - Per-change entries for template development.

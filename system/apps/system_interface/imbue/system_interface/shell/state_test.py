@@ -1,148 +1,805 @@
-"""Tests for ``ShellState``: the referenced-lifetime deletion, and that an app's list shrinking takes no tab away."""
+"""Tests for ``ShellState``: the stale-client prune it runs at start and on its interval, the close hints, the
+arrival, and the absolute-directory invariant it is built with."""
 
+import itertools
+import queue
+import socket
+import threading
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 
-from app_instances.data_types import InstanceLifetime
-from app_instances.testing import StubInstanceSource
-from app_instances.testing import wait_until
+import httpx
+import pytest
+from app_manifest.primitives import AppName
+from app_manifest.primitives import LaunchPathId
+from pydantic import ValidationError
+from workspace_layout.identity import ANONYMOUS_OWNER
+from workspace_layout.identity import RequestIdentity
+from workspace_layout.primitives import ClientId
+from workspace_layout.primitives import DesktopId
+from workspace_layout.primitives import UserId
+from workspace_layout.primitives import WindowId
+from workspace_layout.primitives import WindowPath
+from workspace_layout.primitives import WindowTitle
+from workspace_layout.records import Desktop
+from workspace_layout.records import DesktopShortcut
+from workspace_layout.records import StoredWindowPath
+from workspace_layout.windows import WindowClosedHint
+from workspace_themes.contract import WORKSPACE_THEMES_DIRECTORY
+from workspace_themes.testing import write_standard_theme
+from workspace_themes.testing import write_test_theme
 
 from imbue.imbue_common.model_update import to_update
+from imbue.mngr.utils.polling import wait_for
+from imbue.system_interface.profiles import ProfileResolver
+from imbue.system_interface.shell.app_lifecycle import AppLifecycleManager
+from imbue.system_interface.shell.app_lifecycle import WAKE_WAIT_SECONDS
 from imbue.system_interface.shell.clients import CLIENT_RETENTION
-from imbue.system_interface.shell.data_types import ClientStateReport
-from imbue.system_interface.shell.data_types import instance_panel_params_by_id
-from imbue.system_interface.shell.inventory import HttpInstanceFetcher
-from imbue.system_interface.shell.primitives import Address
-from imbue.system_interface.shell.primitives import ClientId
-from imbue.system_interface.shell.primitives import DeviceKind
-from imbue.system_interface.shell.primitives import ViewId
+from imbue.system_interface.shell.close_hints import WindowClosedHintPost
+from imbue.system_interface.shell.data_types import UserRecord
+from imbue.system_interface.shell.data_types import WindowOpenRequest
+from imbue.system_interface.shell.desktop_document import seed_desktop_shortcuts
+from imbue.system_interface.shell.desktops import DEFAULT_SHORTCUTS_OFFERED_FILENAME
+from imbue.system_interface.shell.desktops import VISITOR_DESKTOPS_ADOPTED_FILENAME
+from imbue.system_interface.shell.desktops import default_desktop
+from imbue.system_interface.shell.errors import LaunchUnavailableError
+from imbue.system_interface.shell.inventory import AppInventory
+from imbue.system_interface.shell.launches import LaunchPost
+from imbue.system_interface.shell.launches import LaunchPostOutcome
+from imbue.system_interface.shell.liveness import SupervisorProgramState
+from imbue.system_interface.shell.ownership import is_desktop_owned_by
 from imbue.system_interface.shell.state import ShellState
 from imbue.system_interface.shell.state import build_shell_state
+from imbue.system_interface.shell.testing import BUILTIN_SHORTCUT_APPS_BEFORE_CHAT
+from imbue.system_interface.shell.testing import BUILTIN_SHORTCUT_APPS_WITH_CHAT
+from imbue.system_interface.shell.testing import FakeLivenessProber
 from imbue.system_interface.shell.testing import TEST_NOW
+from imbue.system_interface.shell.testing import TEST_TERMINAL_URL
+from imbue.system_interface.shell.testing import TEST_TERMINAL_WINDOW_CLOSED_PATH
 from imbue.system_interface.shell.testing import build_inventory
-from imbue.system_interface.shell.testing import instance_record
-from imbue.system_interface.shell.testing import layout_showing
+from imbue.system_interface.shell.testing import builtin_chat_row_toml
+from imbue.system_interface.shell.testing import builtin_registry_rows
+from imbue.system_interface.shell.testing import builtin_rows_toml_before_chat
+from imbue.system_interface.shell.testing import client_report
+from imbue.system_interface.shell.testing import default_target_pairs
+from imbue.system_interface.shell.testing import drain_messages
+from imbue.system_interface.shell.testing import offered_targets_recorded
+from imbue.system_interface.shell.testing import placement_record
+from imbue.system_interface.shell.testing import read_desktops_file_in_its_released_shape
 from imbue.system_interface.shell.testing import registry_row_toml
+from imbue.system_interface.shell.testing import shortcut_apps_on
+from imbue.system_interface.shell.testing import write_desktops_file
 from imbue.system_interface.shell.testing import write_registry
+from imbue.system_interface.shell.testing import write_two_app_registry
+from imbue.system_interface.shell.wallpapers import DEFAULT_WALLPAPER_FILES_DIRECTORY
+from imbue.system_interface.testing import find_free_port
 from imbue.system_interface.ws_broadcaster import WebSocketBroadcaster
-
-_STUB_1 = Address("app:stub?instance=stub-1")
-_STUB_2 = Address("app:stub?instance=stub-2")
-
-
-def _shell_over_stub(
-    tmp_path: Path, broadcaster: WebSocketBroadcaster, stub_app_url: str, clock: list[float]
-) -> ShellState:
-    registry_path = write_registry(
-        tmp_path / "apps.toml", registry_row_toml("stub", stub_app_url, True, actions=[("new", "New")])
-    )
-    inventory = build_inventory(registry_path, broadcaster, fetcher=HttpInstanceFetcher(), clock=lambda: clock[0])
-    inventory.refetch_now("stub")
-    return build_shell_state(tmp_path / "state", registry_path, broadcaster, inventory=inventory)
-
-
-def test_unreferenced_referenced_instances_are_deleted_after_the_grace_period(
-    tmp_path: Path, broadcaster: WebSocketBroadcaster, stub_source: StubInstanceSource, stub_app_url: str
-) -> None:
-    stub_source.records.extend(
-        [
-            instance_record("stub-1", lifetime=InstanceLifetime.REFERENCED),
-            instance_record("stub-2", lifetime=InstanceLifetime.REFERENCED),
-            instance_record("stub-3", lifetime=InstanceLifetime.EXPLICIT),
-        ]
-    )
-    clock = [1000.0]
-    shell = _shell_over_stub(tmp_path, broadcaster, stub_app_url, clock)
-    try:
-        shell.projects.create_project("Alpha", "#111111", 0, ())
-        shell.projects.add_tab("alpha", _STUB_1)
-        first = shell.layouts.save_browser_layout("everything", "c1", layout_showing(_STUB_2), None, TEST_NOW)
-        # Everything is referenced, and stub-3 is explicit: nothing goes.
-        assert shell.delete_unreferenced_instances() == []
-        assert first is not None
-        shell.layouts.save_browser_layout("everything", "c1", layout_showing(), first.updated_at, TEST_NOW)
-        # stub-2 is unreferenced now but within its grace period.
-        assert shell.delete_unreferenced_instances() == []
-        clock[0] += 60.0
-        assert shell.delete_unreferenced_instances() == [_STUB_2]
-        assert [str(record.key) for record in stub_source.records] == ["stub-1", "stub-3"]
-        assert shell.inventory.listed_addresses() == {_STUB_1, Address("app:stub?instance=stub-3")}
-    finally:
-        shell.stop()
-
-
-def test_a_refused_delete_keeps_the_instance_listed_for_the_next_sweep(
-    tmp_path: Path, broadcaster: WebSocketBroadcaster, stub_source: StubInstanceSource, stub_app_url: str
-) -> None:
-    stub_source.records.append(instance_record("stub-1", lifetime=InstanceLifetime.REFERENCED))
-    clock = [1000.0]
-    shell = _shell_over_stub(tmp_path, broadcaster, stub_app_url, clock)
-    try:
-        clock[0] += 60.0
-        stub_source.is_ready = False
-        assert shell.delete_unreferenced_instances() == []
-        assert [str(record.key) for record in stub_source.records] == ["stub-1"]
-        assert shell.inventory.listed_addresses() == {_STUB_1}
-        stub_source.is_ready = True
-        assert shell.delete_unreferenced_instances() == [_STUB_1]
-        assert stub_source.records == []
-    finally:
-        shell.stop()
-
-
-def test_an_instance_its_app_stops_listing_keeps_its_tabs_and_layouts_until_it_is_listed_again(
-    tmp_path: Path, broadcaster: WebSocketBroadcaster, stub_source: StubInstanceSource, stub_app_url: str
-) -> None:
-    """Missing from a list is not deleted: an app can drop an instance for a moment (a new chat
-    before the observe stream reports its agent), so only an explicit delete takes a tab away."""
-    stub_source.records.extend([instance_record("stub-1"), instance_record("stub-2")])
-    shell = _shell_over_stub(tmp_path, broadcaster, stub_app_url, [0.0])
-    shell.projects.create_project("Alpha", "#111111", 0, ())
-    shell.projects.add_tab("alpha", _STUB_1)
-    shell.projects.add_tab("alpha", _STUB_2)
-    shell.layouts.save_browser_layout("alpha", "c1", layout_showing(_STUB_1, _STUB_2), None, TEST_NOW)
-    shell.start()
-    try:
-        stub_source.records = [record for record in stub_source.records if str(record.key) != "stub-1"]
-        shell.inventory.refetch_now("stub")
-        assert shell.inventory.listed_addresses() == {_STUB_2}
-
-        assert shell.projects.get_project("alpha").tabs == (_STUB_1, _STUB_2)
-        kept = shell.layouts.read_layout("alpha", "c1", DeviceKind.DESKTOP)
-        assert set(instance_panel_params_by_id(kept.dockview)) == {"p0", "p1"}
-
-        stub_source.records.append(instance_record("stub-1"))
-        shell.inventory.refetch_now("stub")
-        assert shell.inventory.listed_addresses() == {_STUB_1, _STUB_2}
-    finally:
-        shell.stop()
 
 
 def test_start_prunes_stale_clients_and_their_layouts_now_and_on_the_interval(
-    tmp_path: Path, broadcaster: WebSocketBroadcaster, stub_app_url: str
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
 ) -> None:
-    registry_path = write_registry(tmp_path / "apps.toml", registry_row_toml("stub", stub_app_url, True))
+    registry_path = write_two_app_registry(tmp_path)
     inventory = build_inventory(registry_path, broadcaster)
-    built = build_shell_state(tmp_path / "state", registry_path, broadcaster, inventory=inventory)
+    built = build_shell_state(
+        tmp_path / "state", registry_path, broadcaster, inventory=inventory, repo_root=tmp_path / "repo"
+    )
     shell = built.model_copy_update(to_update(built.field_ref().client_prune_interval_seconds, 0.05))
     stale_at = TEST_NOW - CLIENT_RETENTION - timedelta(days=1)
+    (home,) = shell.list_desktops()
+    window_id = WindowId("win-0000000000000001")
     shell.clients.record_report(
-        ClientStateReport(client_id=ClientId("old"), device_kind=DeviceKind.DESKTOP, active_view=ViewId("everything")),
+        client_report("old", "home"),
         stale_at,
+        is_redirected=False,
     )
-    shell.layouts.save_browser_layout("everything", "old", layout_showing(_STUB_1), None, stale_at)
+    shell.placements.save_browser_layout("home", "old", (placement_record(window_id),), None, {window_id}, stale_at)
+    shell.window_paths.set_path(
+        ClientId("old"),
+        window_id,
+        StoredWindowPath(path=WindowPath("/x"), title=WindowTitle("")),
+        lambda: {window_id},
+    )
     shell.start()
     try:
-        # The prune at start took the stale client and its layout file.
+        # The prune at start took the stale client, its layout file, and its window paths.
         assert shell.clients.get_client("old") is None
-        assert shell.layouts.all_client_layouts() == []
+        assert shell.placements.read_layout(home.id, "old", {window_id}).placements == ()
+        assert shell.window_paths.read_paths(ClientId("old"), {window_id}) == {}
         # A client that goes stale while the shell runs is taken by the periodic prune.
         shell.clients.record_report(
-            ClientStateReport(
-                client_id=ClientId("later"), device_kind=DeviceKind.DESKTOP, active_view=ViewId("everything")
-            ),
+            client_report("later", "home"),
             stale_at,
+            is_redirected=False,
         )
-        assert wait_until(lambda: shell.clients.get_client("later") is None, timeout_seconds=5.0)
+        wait_for(
+            lambda: shell.clients.get_client("later") is None,
+            timeout=5.0,
+            poll_interval=0.02,
+            error_message="the periodic prune never took the stale client",
+        )
     finally:
         shell.stop()
+
+
+@pytest.mark.timeout(30)
+def test_a_theme_made_while_the_shell_runs_reaches_every_window(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    registry_path = write_two_app_registry(tmp_path)
+    repo_root = tmp_path / "repo"
+    write_standard_theme(repo_root)
+    shell = build_shell_state(
+        tmp_path / "state",
+        registry_path,
+        broadcaster,
+        inventory=build_inventory(registry_path, broadcaster),
+        repo_root=repo_root,
+    )
+    window = broadcaster.register()
+    heard: list[str] = []
+
+    def has_heard_of_paper() -> bool:
+        for message in drain_messages(window):
+            if message["type"] == "themes_changed":
+                heard.extend(theme["id"] for theme in message["catalog"]["themes"])
+        return "paper" in heard
+
+    shell.start()
+    try:
+        write_test_theme(repo_root / WORKSPACE_THEMES_DIRECTORY, "paper", "")
+        wait_for(has_heard_of_paper, timeout=10.0, poll_interval=0.05, error_message="no window heard of the theme")
+    finally:
+        shell.stop()
+
+
+def _shell_recording_hints(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster, hints: list[WindowClosedHintPost]
+) -> ShellState:
+    registry_path = write_two_app_registry(tmp_path)
+    built = build_shell_state(
+        tmp_path / "state", registry_path, broadcaster, inventory=build_inventory(registry_path, broadcaster)
+    )
+    return built.model_copy_update(to_update(built.field_ref().close_hint_poster, hints.append))
+
+
+def _open(shell: ShellState, desktop_id: str, app: str, path: str) -> WindowId:
+    request = WindowOpenRequest(app=AppName(app), path=WindowPath(path), client_id=ClientId("laptop"))
+    return shell.open_window(desktop_id, request, None).window.id
+
+
+def test_closing_a_window_tells_its_app_when_the_row_names_a_window_closed_path(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    hints: list[WindowClosedHintPost] = []
+    shell = _shell_recording_hints(tmp_path, broadcaster, hints)
+    (home,) = shell.list_desktops()
+    terminal_window = _open(shell, home.id, "terminal", "/?session=terminal-1")
+    files_window = _open(shell, home.id, "files", "/notes/")
+
+    assert shell.close_window(home.id, terminal_window) is True
+    assert hints == [
+        WindowClosedHintPost(
+            app="terminal",
+            url=f"{TEST_TERMINAL_URL}{TEST_TERMINAL_WINDOW_CLOSED_PATH}",
+            hint=WindowClosedHint(
+                path=WindowPath("/?session=terminal-1"), window_id=terminal_window, desktop_id=DesktopId("home")
+            ),
+        )
+    ]
+    # A second close of the same window is idempotent and tells nobody; the files row names no path.
+    assert shell.close_window(home.id, terminal_window) is False
+    assert shell.close_window(home.id, files_window) is True
+    assert len(hints) == 1
+
+
+def test_a_stopped_app_is_not_told_of_its_closed_window(tmp_path: Path, broadcaster: WebSocketBroadcaster) -> None:
+    """The post would reach the shell's own parker and wake the app to tell it a window closed."""
+    hints: list[WindowClosedHintPost] = []
+    prober = FakeLivenessProber()
+    prober.is_running_by_name["terminal"] = False
+    registry_path = write_two_app_registry(tmp_path)
+    built = build_shell_state(
+        tmp_path / "state",
+        registry_path,
+        broadcaster,
+        inventory=build_inventory(registry_path, broadcaster, prober=prober),
+    )
+    shell = built.model_copy_update(to_update(built.field_ref().close_hint_poster, hints.append))
+    (home,) = shell.list_desktops()
+    terminal_window = _open(shell, home.id, "terminal", "/?session=terminal-1")
+
+    assert shell.close_window(home.id, terminal_window) is True
+
+    assert hints == []
+
+
+def test_a_post_launch_to_a_stopped_stoppable_app_wakes_it_and_waits_for_it_to_answer(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    """The stop-when-no-windows spec, section 5.6: a POST launch cannot go through the parker (which answers
+    503), so the shell wakes the app and posts once its port accepts; an app that does not come up in time fails
+    the launch without a post."""
+    docs_port = find_free_port()
+    registry_path = write_registry(
+        tmp_path / "apps.toml",
+        registry_row_toml(
+            "docs",
+            f"http://127.0.0.1:{docs_port}",
+            program="docs",
+            launch_paths=(("new", "New doc", "/api/intake"),),
+            launch_methods={"new": "POST"},
+        ),
+    )
+    prober = FakeLivenessProber()
+    prober.is_running_by_name["docs"] = False
+    posts: list[LaunchPost] = []
+
+    def poster(post: LaunchPost) -> LaunchPostOutcome:
+        posts.append(post)
+        return LaunchPostOutcome(status_code=200, body={"path": "/?doc=1"})
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    started: list[str] = []
+
+    def start_and_bind(program: str) -> None:
+        started.append(program)
+        listener.bind(("127.0.0.1", docs_port))
+        listener.listen(1)
+
+    built = build_shell_state(
+        tmp_path / "state",
+        registry_path,
+        broadcaster,
+        inventory=build_inventory(registry_path, broadcaster, prober=prober),
+        launch_poster=poster,
+    )
+    shell = built.model_copy_update(
+        to_update(built.field_ref().lifecycle, _launch_waking_manager(built, start_and_bind, time.monotonic))
+    )
+    entry = shell.inventory.entry("docs")
+    assert entry is not None and entry.is_running is False
+    (launch_path,) = entry.row.launch_paths
+
+    try:
+        path = shell.launch_destination(entry, launch_path, {}, ClientId("c1"), DesktopId("home"), None)
+    finally:
+        listener.close()
+
+    assert path == "/?doc=1" and started == ["docs"]
+    (post,) = posts
+    assert post.url == f"http://127.0.0.1:{docs_port}/api/intake"
+
+    # An app that never binds: the wait (over a clock that steps past it on each read) ends in a 502, unposted.
+    ticks = itertools.count(start=0.0, step=WAKE_WAIT_SECONDS)
+    never_up = built.model_copy_update(
+        to_update(built.field_ref().lifecycle, _launch_waking_manager(built, started.append, lambda: next(ticks)))
+    )
+    with pytest.raises(LaunchUnavailableError, match="could not be brought up"):
+        never_up.launch_destination(entry, launch_path, {}, ClientId("c1"), DesktopId("home"), None)
+    assert started == ["docs", "docs"] and len(posts) == 1
+
+    # A manager that does not own the live apps (a preview's) wakes nothing: the post goes out as it is and fails
+    # as one to any unreachable app does.
+    preview = built.model_copy_update(
+        to_update(
+            built.field_ref().lifecycle,
+            _launch_waking_manager(built, started.append, time.monotonic, is_enabled=False),
+        )
+    ).model_copy_update(to_update(built.field_ref().launch_poster, _refusing_launch_poster))
+    with pytest.raises(LaunchUnavailableError, match="refused"):
+        preview.launch_destination(entry, launch_path, {}, ClientId("c1"), DesktopId("home"), None)
+    assert started == ["docs", "docs"]
+
+
+def _refusing_launch_poster(post: LaunchPost) -> LaunchPostOutcome:
+    raise LaunchUnavailableError(f"{post.app} could not be reached for the launch: refused")
+
+
+def _launch_waking_manager(
+    shell: ShellState, start_program: Callable[[str], None], clock: Callable[[], float], is_enabled: bool = True
+) -> AppLifecycleManager:
+    """A lifecycle manager over the shell's inventory whose supervisord is a stopped ``docs`` and whose start is
+    ``start_program``; enabled, so a launch wakes the app, but never started, so nothing is swept."""
+    return AppLifecycleManager(
+        inventory=shell.inventory,
+        is_enabled=is_enabled,
+        count_windows_by_app=lambda: {},
+        granted_app_names=lambda: set(),
+        program_states=lambda: {"docs": SupervisorProgramState(statename="STOPPED", pid=0)},
+        start_program=start_program,
+        stop_program=lambda program: None,
+        clock=clock,
+    )
+
+
+def test_the_lifecycle_manager_reads_the_per_app_share_grants_under_the_workspace_root(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    registry_path = write_two_app_registry(tmp_path)
+    secrets_directory = tmp_path / "repo" / "data" / ".secrets"
+    secrets_directory.mkdir(parents=True)
+    (secrets_directory / "share_grants.toml").write_text('[services.docs]\nemails = ["reviewer@example.com"]\n')
+    shell = build_shell_state(
+        tmp_path / "state",
+        registry_path,
+        broadcaster,
+        inventory=build_inventory(registry_path, broadcaster),
+        repo_root=tmp_path / "repo",
+    )
+
+    assert shell.lifecycle.granted_app_names() == set()
+    (secrets_directory / "share.env").write_text("export SHARE_BROKER_URL=https://broker.example\n")
+    assert shell.lifecycle.granted_app_names() == {"docs"}
+
+
+def test_an_arrival_marks_the_workspace_visited(tmp_path: Path, broadcaster: WebSocketBroadcaster) -> None:
+    registry_path = write_two_app_registry(tmp_path)
+    shell = build_shell_state(
+        tmp_path / "state", registry_path, broadcaster, inventory=build_inventory(registry_path, broadcaster)
+    )
+    assert shell.lifecycle.is_visited is False
+    shell.list_desktops()
+
+    shell.arrive_client(ClientId("laptop"), RequestIdentity(owner=True))
+
+    assert shell.lifecycle.is_visited is True
+
+
+def test_deleting_a_desktop_tells_the_apps_of_every_window_it_held(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    hints: list[WindowClosedHintPost] = []
+    shell = _shell_recording_hints(tmp_path, broadcaster, hints)
+    shell.list_desktops()
+    work = shell.desktops.create_desktop("Work", "#123456", 1, (), (), None, ())
+    first = _open(shell, work.id, "terminal", "/?session=terminal-1")
+    second = _open(shell, work.id, "terminal", "/?session=terminal-2")
+    _open(shell, work.id, "files", "/")
+
+    shell.delete_desktop(work.id)
+
+    assert [(post.hint.window_id, post.hint.desktop_id) for post in hints] == [(first, "work"), (second, "work")]
+
+
+def _shell_with_a_visitors_desktop_from_before_owners(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> tuple[ShellState, Desktop]:
+    """A shell whose ``kanjun`` desktop was seeded for a visitor by a shell older than desktop owners: no owner, and
+    named by her ``users.json`` record; the workspace also has a desktop of the owner's own."""
+    registry_path = write_two_app_registry(tmp_path)
+    shell = build_shell_state(
+        tmp_path / "state", registry_path, broadcaster, inventory=build_inventory(registry_path, broadcaster)
+    )
+    shell.list_desktops()
+    visitors_desktop = shell.desktops.create_desktop("kanjun", "#123456", 1, (), (), None, ())
+    shell.desktops.create_desktop("Work", "#654321", 2, (), (), None, ())
+    shell.users.record_user(
+        UserRecord(
+            user_id=UserId("user-kanjun"),
+            desktop_id=visitors_desktop.id,
+            desktop_name=visitors_desktop.name,
+            email="kanjun@example.com",
+            display_name=None,
+            last_seen=TEST_NOW,
+        )
+    )
+    return shell, visitors_desktop
+
+
+def test_start_gives_a_visitors_desktop_from_before_desktop_owners_back_to_its_visitor_once(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    """A shell older than desktop owners seeded a visitor's desktop with none, which reads as the workspace owner's;
+    the first start gives it the visitor's key, and only it. Later starts leave ownerless desktops alone: her record
+    still names the id after the owner deletes that desktop, and the owner may make one of their own under it."""
+    shell, visitors_desktop = _shell_with_a_visitors_desktop_from_before_owners(tmp_path, broadcaster)
+    kanjun = RequestIdentity(owner=False, user_id="user-kanjun", email="kanjun@example.com")
+
+    shell.start()
+    try:
+        owners = {desktop.id: desktop.owner for desktop in shell.list_desktops()}
+        outcome = shell.arrive_client(ClientId("kanjuns-laptop"), kanjun)
+    finally:
+        shell.stop()
+
+    assert owners == {"home": None, "kanjun": "user:user-kanjun", "work": None}
+    assert outcome is not None and outcome.desktop_id == "kanjun" and outcome.created_desktop is None
+    assert is_desktop_owned_by(shell.get_desktop("kanjun"), kanjun)
+
+    shell.delete_desktop(visitors_desktop.id)
+    shell.desktops.create_desktop("kanjun", "#123456", 1, (), (), None, ())
+    shell.adopt_visitor_desktops()
+    assert shell.get_desktop("kanjun").owner is None
+
+
+def test_a_fill_in_that_cannot_record_it_ran_is_logged_and_runs_again_at_the_next_start(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster, loguru_records: list[str]
+) -> None:
+    shell, _ = _shell_with_a_visitors_desktop_from_before_owners(tmp_path, broadcaster)
+    # A directory where the record goes makes every write of it fail.
+    marker_path = tmp_path / "state" / VISITOR_DESKTOPS_ADOPTED_FILENAME
+    marker_path.mkdir()
+
+    shell.adopt_visitor_desktops()
+
+    assert any(record.startswith("ERROR Failed to give the visitors' old desktops") for record in loguru_records)
+    marker_path.rmdir()
+    shell.adopt_visitor_desktops()
+    assert marker_path.is_file()
+    assert shell.get_desktop("kanjun").owner == "user:user-kanjun"
+
+
+def test_concurrent_first_arrivals_of_one_user_seed_a_single_desktop(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    registry_path = write_two_app_registry(tmp_path)
+    shell = build_shell_state(
+        tmp_path / "state", registry_path, broadcaster, inventory=build_inventory(registry_path, broadcaster)
+    )
+    alice = RequestIdentity(owner=False, user_id="user-alice", email="alice@example.com")
+    arrival_count = 6
+    ready = threading.Barrier(arrival_count)
+
+    def arrive(index: int) -> tuple[str | None, bool]:
+        ready.wait(timeout=5)
+        outcome = shell.arrive_client(ClientId(f"tab-{index}"), alice)
+        assert outcome is not None
+        return outcome.desktop_id, outcome.created_desktop is not None
+
+    with ThreadPoolExecutor(max_workers=arrival_count) as executor:
+        outcomes = list(executor.map(arrive, range(arrival_count)))
+    assert [landing for landing, _ in outcomes] == ["alice"] * arrival_count
+    assert sum(1 for _, is_created in outcomes if is_created) == 1
+    assert [desktop.id for desktop in shell.list_desktops()] == ["home", "alice"]
+
+
+def test_a_visiting_users_desktop_is_named_after_the_profile_the_connector_answers(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    """The header names the account; what the desktop is called comes from the account's profile, fetched from the
+    broker share.env names and kept on the user's record for the notice."""
+    registry_path = write_two_app_registry(tmp_path)
+    (tmp_path / "share.env").write_text('export SHARE_BROKER_URL="https://broker.example.test/"\n')
+    requested_paths: list[str] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        return httpx.Response(
+            200, json={"user_id": "user-alice", "display_name": "Alice Q", "profile_picture_url": None}
+        )
+
+    profiles = ProfileResolver(
+        cache_directory=tmp_path / "profiles",
+        share_env_path=tmp_path / "share.env",
+        transport=httpx.MockTransport(answer),
+    )
+    shell = build_shell_state(
+        tmp_path / "state",
+        registry_path,
+        broadcaster,
+        inventory=build_inventory(registry_path, broadcaster),
+        profiles=profiles,
+    )
+    alice = RequestIdentity(owner=False, user_id="user-alice", email="alice@example.com")
+
+    outcome = shell.arrive_client(ClientId("tab-1"), alice)
+
+    assert outcome is not None and outcome.created_desktop is not None
+    assert outcome.created_desktop.name == "Alice Q" and outcome.desktop_id == "alice-q"
+    assert requested_paths == ["/users/user-alice/profile"]
+    stored = shell.users.get_user(UserId("user-alice"))
+    assert stored is not None and stored.display_name == "Alice Q"
+
+
+def test_a_visiting_user_arrives_named_by_email_when_the_connector_is_down(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    registry_path = write_two_app_registry(tmp_path)
+    (tmp_path / "share.env").write_text("SHARE_BROKER_URL=https://broker.example.test\n")
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    profiles = ProfileResolver(
+        cache_directory=tmp_path / "profiles",
+        share_env_path=tmp_path / "share.env",
+        transport=httpx.MockTransport(refuse),
+    )
+    shell = build_shell_state(
+        tmp_path / "state",
+        registry_path,
+        broadcaster,
+        inventory=build_inventory(registry_path, broadcaster),
+        profiles=profiles,
+    )
+
+    outcome = shell.arrive_client(
+        ClientId("tab-1"), RequestIdentity(owner=False, user_id="user-bob", email="bob.smith@example.com")
+    )
+
+    assert outcome is not None and outcome.created_desktop is not None
+    assert outcome.created_desktop.name == "bob.smith"
+
+
+def test_the_wallpapers_directory_is_absolute_however_the_workspace_root_is_named(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory configured under the workspace root lands absolute even when that root is named relatively.
+
+    The listing route walks the directory itself while the serve route hands it to a sender that resolves
+    against the package, so a relative directory reaches two different places and the image 500s. ``ShellState``
+    refuses one outright, which is what a second construction site beside ``build_shell_state`` would meet.
+    """
+    registry_path = write_two_app_registry(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    built = build_shell_state(
+        tmp_path / "state",
+        registry_path,
+        broadcaster,
+        inventory=build_inventory(registry_path, broadcaster),
+        repo_root=Path("repo"),
+    )
+
+    assert built.wallpaper_files_directory == (tmp_path / "repo" / DEFAULT_WALLPAPER_FILES_DIRECTORY).resolve()
+    with pytest.raises(ValidationError) as refused:
+        ShellState.model_validate({**dict(built), "wallpaper_files_directory": DEFAULT_WALLPAPER_FILES_DIRECTORY})
+    assert str(DEFAULT_WALLPAPER_FILES_DIRECTORY) in str(refused.value)
+
+
+# Default shortcuts of apps that register after the default desktop was seeded (desktop plan section 3.2)
+
+
+def _pinned_apps_on(desktop: Desktop) -> list[str]:
+    return [str(window.app) for window in desktop.windows if window.is_pinned]
+
+
+def _seed_of_the_registry(shell: ShellState) -> tuple[DesktopShortcut, ...]:
+    """The shortcuts a desktop is seeded with from the rows the shell's inventory holds."""
+    return seed_desktop_shortcuts([entry.row for entry in shell.inventory.entries()])
+
+
+def _default_targets_of_the_registry(shell: ShellState) -> list[tuple[str, str]]:
+    """The default shortcut targets of the rows the shell's inventory holds, as the offered record keeps them."""
+    return default_target_pairs([entry.row for entry in shell.inventory.entries()])
+
+
+def _register_chat(registry_path: Path) -> None:
+    write_registry(registry_path, *builtin_rows_toml_before_chat(), builtin_chat_row_toml())
+
+
+def _register_chat_and_read(shell: ShellState) -> None:
+    """The chat registers, and the shell's inventory reads the registry as its watch would."""
+    _register_chat(shell.inventory.registry_path)
+    shell.inventory.reload_registry()
+
+
+def _deregister_chat_and_read(shell: ShellState) -> None:
+    """The chat deregisters, and the shell's inventory reads the registry as its watch would."""
+    write_registry(shell.inventory.registry_path, *builtin_rows_toml_before_chat())
+    shell.inventory.reload_registry()
+
+
+def _shell_over(state_directory: Path, registry_path: Path, broadcaster: WebSocketBroadcaster) -> ShellState:
+    """A shell over ``state_directory`` whose inventory has read ``registry_path`` once."""
+    return build_shell_state(
+        state_directory, registry_path, broadcaster, inventory=build_inventory(registry_path, broadcaster)
+    )
+
+
+def _shell_before_the_chat(tmp_path: Path, broadcaster: WebSocketBroadcaster) -> ShellState:
+    """A shell over ``tmp_path / "state"`` whose inventory has read a registry of the built-in apps' rows without the
+    chat's."""
+    registry_path = write_registry(tmp_path / "apps.toml", *builtin_rows_toml_before_chat())
+    return _shell_over(tmp_path / "state", registry_path, broadcaster)
+
+
+def _shell_restarted_after_the_chat_registered(tmp_path: Path, broadcaster: WebSocketBroadcaster) -> ShellState:
+    """A shell over the state of one that seeded Home before the chat registered, its inventory having read the
+    chat's row before the shell listened to it (a restart)."""
+    seeding = _shell_before_the_chat(tmp_path, broadcaster)
+    (home,) = seeding.list_desktops()
+    assert shortcut_apps_on(home) == BUILTIN_SHORTCUT_APPS_BEFORE_CHAT
+    registry_path = seeding.inventory.registry_path
+    _register_chat(registry_path)
+    return _shell_over(tmp_path / "state", registry_path, broadcaster)
+
+
+def _desktops_updates(client_queue: "queue.Queue[str | None]") -> list[tuple[str, ...]]:
+    """The shortcut apps of the first desktop in each ``desktops_updated`` the client was sent."""
+    return [
+        tuple(shortcut["target"]["app"] for shortcut in message["desktops"][0]["shortcuts"])
+        for message in drain_messages(client_queue)
+        if message["type"] == "desktops_updated"
+    ]
+
+
+def test_a_registry_change_before_the_first_read_of_the_desktops_seeds_nothing(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    """Home is seeded by the first read of the desktops, from the registry as it reads then, never by the reconcile a
+    registry change runs."""
+    shell = _shell_before_the_chat(tmp_path, broadcaster)
+    client_queue = broadcaster.register()
+
+    _register_chat_and_read(shell)
+
+    assert shell.desktops.list_desktops() == []
+    assert not (tmp_path / "state" / DEFAULT_SHORTCUTS_OFFERED_FILENAME).exists()
+    assert _desktops_updates(client_queue) == []
+    (home,) = shell.list_desktops()
+    assert home.shortcuts == _seed_of_the_registry(shell)
+    assert offered_targets_recorded(tmp_path / "state") == _default_targets_of_the_registry(shell)
+
+
+def test_an_app_registering_after_home_was_seeded_reaches_it_through_the_registry_change_alone(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    shell = _shell_before_the_chat(tmp_path, broadcaster)
+    (home,) = shell.list_desktops()
+    assert shortcut_apps_on(home) == BUILTIN_SHORTCUT_APPS_BEFORE_CHAT and _pinned_apps_on(home) == []
+    client_queue = broadcaster.register()
+
+    _register_chat_and_read(shell)
+
+    # Read straight from the store, so nothing but the registry change can have added the chat.
+    (stored,) = shell.desktops.list_desktops()
+    assert shortcut_apps_on(stored) == BUILTIN_SHORTCUT_APPS_WITH_CHAT
+    assert stored.shortcuts == _seed_of_the_registry(shell)
+    assert _pinned_apps_on(stored) == ["chat"]
+    assert _desktops_updates(client_queue) == [BUILTIN_SHORTCUT_APPS_WITH_CHAT]
+
+
+def test_an_app_registering_after_home_was_seeded_reaches_it_through_a_later_read(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    """A shell whose inventory read the chat's row before the shell listened to it (a restart) adds it on the read."""
+    reading = _shell_restarted_after_the_chat_registered(tmp_path, broadcaster)
+    assert shortcut_apps_on(reading.desktops.list_desktops()[0]) == BUILTIN_SHORTCUT_APPS_BEFORE_CHAT
+    client_queue = broadcaster.register()
+
+    (read,) = reading.list_desktops()
+
+    assert shortcut_apps_on(read) == BUILTIN_SHORTCUT_APPS_WITH_CHAT and _pinned_apps_on(read) == ["chat"]
+    assert _desktops_updates(client_queue) == [BUILTIN_SHORTCUT_APPS_WITH_CHAT]
+    # The next read finds nothing to add and announces nothing.
+    assert reading.list_desktops() == [read]
+    assert _desktops_updates(client_queue) == []
+
+
+def test_a_desktop_created_before_a_late_app_was_reconciled_leaves_it_offered_on_every_desktop(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    """A shell whose inventory read the chat's row before the shell listened to it, and before any read of the
+    desktops: creating a desktop, which records the chat as offered, first adds it to the desktops already there."""
+    reading = _shell_restarted_after_the_chat_registered(tmp_path, broadcaster)
+
+    work = reading.create_desktop("Work", "#123456", 1, ANONYMOUS_OWNER)
+
+    stored_home, stored_work = reading.desktops.list_desktops()
+    assert shortcut_apps_on(stored_home) == BUILTIN_SHORTCUT_APPS_WITH_CHAT
+    assert _pinned_apps_on(stored_home) == ["chat"]
+    assert stored_work == work and shortcut_apps_on(work) == BUILTIN_SHORTCUT_APPS_WITH_CHAT
+    assert ("chat", "root") in offered_targets_recorded(tmp_path / "state")
+
+
+def test_a_visiting_users_desktop_made_before_a_late_app_registered_gets_its_shortcut_too(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    """A visitor's desktop, a copy of Home made before the chat registered, records no app Home was not seeded with,
+    and is laid out again in launcher order with Home when the chat registers."""
+    shell = _shell_before_the_chat(tmp_path, broadcaster)
+    shell.list_desktops()
+    arrival = shell.arrive_client(
+        ClientId("visitor-tab"), RequestIdentity(owner=False, user_id="user-alice", email="alice@example.com")
+    )
+    assert arrival is not None and arrival.created_desktop is not None
+    assert offered_targets_recorded(tmp_path / "state") == _default_targets_of_the_registry(shell)
+    assert "chat" not in {app for app, _ in offered_targets_recorded(tmp_path / "state")}
+
+    _register_chat_and_read(shell)
+
+    seeded_with_chat = _seed_of_the_registry(shell)
+    home, visitors = shell.desktops.list_desktops()
+    assert visitors.id == arrival.created_desktop.id
+    assert home.shortcuts == seeded_with_chat and visitors.shortcuts == seeded_with_chat
+    assert offered_targets_recorded(tmp_path / "state") == _default_targets_of_the_registry(shell)
+
+
+def test_a_removed_default_shortcut_stays_removed_across_registrations_and_a_new_shell(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    shell = _shell_before_the_chat(tmp_path, broadcaster)
+    shell.list_desktops()
+    _register_chat_and_read(shell)
+    assert shortcut_apps_on(shell.desktops.list_desktops()[0]) == BUILTIN_SHORTCUT_APPS_WITH_CHAT
+    shell.desktops.remove_shortcut("home", AppName("chat"), LaunchPathId("root"))
+
+    # The chat deregisters and registers again; each change reached the desktops (its pinned window was released and
+    # taken back), and neither brought the shortcut back.
+    _deregister_chat_and_read(shell)
+    assert _pinned_apps_on(shell.desktops.list_desktops()[0]) == []
+    _register_chat_and_read(shell)
+    assert _pinned_apps_on(shell.desktops.list_desktops()[0]) == ["chat"]
+    assert shortcut_apps_on(shell.list_desktops()[0]) == BUILTIN_SHORTCUT_APPS_BEFORE_CHAT
+
+    restarted = _shell_over(tmp_path / "state", shell.inventory.registry_path, broadcaster)
+    assert shortcut_apps_on(restarted.list_desktops()[0]) == BUILTIN_SHORTCUT_APPS_BEFORE_CHAT
+
+
+def test_a_state_directory_from_before_the_offered_record_gets_a_late_apps_shortcut_once(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    """A workspace seeded by a shell that kept no record of what it offered: its first read adds the chat, creates the
+    record, and writes a desktops.json every release reads."""
+    before_chat, _ = builtin_registry_rows(tmp_path / "registry")
+    state_directory = tmp_path / "state"
+    write_desktops_file(state_directory, default_desktop(seed_desktop_shortcuts(before_chat)))
+    registry_path = write_registry(tmp_path / "apps.toml", *builtin_rows_toml_before_chat(), builtin_chat_row_toml())
+    shell = _shell_over(state_directory, registry_path, broadcaster)
+
+    (home,) = shell.list_desktops()
+
+    assert shortcut_apps_on(home) == BUILTIN_SHORTCUT_APPS_WITH_CHAT
+    assert offered_targets_recorded(state_directory) == _default_targets_of_the_registry(shell)
+    assert read_desktops_file_in_its_released_shape(state_directory) == (home,)
+    # Removed once added, it stays removed: the record now names it.
+    shell.desktops.remove_shortcut("home", AppName("chat"), LaunchPathId("root"))
+    assert shortcut_apps_on(shell.list_desktops()[0]) == BUILTIN_SHORTCUT_APPS_BEFORE_CHAT
+
+
+def test_a_registry_change_whose_reconcile_cannot_write_is_logged_and_the_next_read_completes_it(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster, loguru_records: list[str]
+) -> None:
+    """The reconcile a registry change runs must not raise into the registry read (the watch thread's); once the
+    state can be written again, the next read of the desktops records the late app as offered."""
+    shell = _shell_before_the_chat(tmp_path, broadcaster)
+    shell.list_desktops()
+    # A directory where the offered record goes makes every write of it fail.
+    offered_path = tmp_path / "state" / DEFAULT_SHORTCUTS_OFFERED_FILENAME
+    offered_path.unlink()
+    offered_path.mkdir()
+
+    _register_chat_and_read(shell)
+
+    assert any(
+        record.startswith("ERROR Failed to reconcile the desktops with the changed app registry")
+        for record in loguru_records
+    )
+    offered_path.rmdir()
+    (home,) = shell.list_desktops()
+    assert shortcut_apps_on(home) == BUILTIN_SHORTCUT_APPS_WITH_CHAT
+    assert offered_targets_recorded(tmp_path / "state") == _default_targets_of_the_registry(shell)
+
+
+def test_a_late_registration_reaches_the_desktops_through_the_registry_watch(
+    tmp_path: Path, broadcaster: WebSocketBroadcaster
+) -> None:
+    registry_path = write_registry(tmp_path / "apps.toml", *builtin_rows_toml_before_chat())
+    inventory = AppInventory(
+        registry_path=registry_path,
+        broadcaster=broadcaster,
+        liveness_prober=FakeLivenessProber(),
+        sweep_interval_seconds=60.0,
+    )
+    shell = build_shell_state(tmp_path / "state", registry_path, broadcaster, inventory=inventory)
+    inventory.start()
+    try:
+        (home,) = shell.list_desktops()
+        assert shortcut_apps_on(home) == BUILTIN_SHORTCUT_APPS_BEFORE_CHAT
+
+        _register_chat(registry_path)
+
+        wait_for(
+            lambda: shortcut_apps_on(shell.desktops.list_desktops()[0]) == BUILTIN_SHORTCUT_APPS_WITH_CHAT,
+            timeout=5.0,
+            poll_interval=0.02,
+            error_message="the registry watch never brought the chat's shortcut to the default desktop",
+        )
+    finally:
+        inventory.stop()

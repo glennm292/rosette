@@ -4,15 +4,20 @@ import json
 import os
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
 from imbue.chat.agent_discovery import AgentInfo
+from imbue.chat.harnesses.claude.queue_tracker import DELIVERY_GRACE_SECONDS
 from imbue.chat.harnesses.claude.watcher import ClaudeSessionWatcher
 from imbue.chat.harnesses.claude.watcher import ClaudeTranscriptLoader
+from imbue.chat.harnesses.session_watcher import ReplyDraftSources
+from imbue.mngr_claude.claude_config import encode_claude_project_dir_name
 
 
 def _user_event(index: int, content: str | None = None) -> dict[str, Any]:
@@ -47,7 +52,19 @@ def _make_watcher(
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda _aid, evts: collected.extend(evts),
+    )
+
+
+def _make_work_dir_watcher(agent_state_dir: Path, claude_config_dir: Path, work_dir: Path) -> ClaudeSessionWatcher:
+    """A watcher that knows its agent's work dir, so it looks for sessions where claude files them for it."""
+    return ClaudeSessionWatcher(
+        agent_id="test-agent",
+        agent_state_dir=agent_state_dir,
+        claude_config_dir=claude_config_dir,
+        work_dir=str(work_dir),
+        on_events=lambda _aid, _evts: None,
     )
 
 
@@ -102,6 +119,7 @@ def test_get_all_events_returns_parsed_events(tmp_path: Path) -> None:
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: collected.append((aid, evts)),
     )
 
@@ -128,6 +146,7 @@ def test_get_all_events_with_tail(tmp_path: Path) -> None:
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
 
@@ -154,6 +173,7 @@ def test_get_backfill_events(tmp_path: Path) -> None:
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
 
@@ -181,6 +201,7 @@ def test_watcher_detects_new_events(tmp_path: Path) -> None:
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: collected.append((aid, evts)),
     )
 
@@ -233,6 +254,7 @@ def test_watcher_handles_missing_history_file(tmp_path: Path) -> None:
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
 
@@ -395,6 +417,7 @@ def test_get_all_events_caches_parsed_events(tmp_path: Path) -> None:
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
 
@@ -414,6 +437,7 @@ def test_get_all_events_parses_only_new_tail(tmp_path: Path) -> None:
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
 
@@ -445,6 +469,7 @@ def test_concurrent_reads_and_discovery_do_not_raise(tmp_path: Path) -> None:
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
 
@@ -611,6 +636,7 @@ def test_running_subagent_gets_rich_card_from_disk_linkage(tmp_path: Path) -> No
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
 
@@ -668,6 +694,7 @@ def test_multiple_agent_tool_uses_link_to_their_subagents(tmp_path: Path) -> Non
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
 
@@ -715,6 +742,7 @@ def test_falls_back_to_tool_result_linkage_when_subagent_file_absent(tmp_path: P
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
     # Seed the metadata cache as if the subagent file once existed but is now gone.
@@ -774,6 +802,7 @@ def test_late_subagent_discovery_rebroadcasts_enriched_parent(tmp_path: Path) ->
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: collected.append((aid, evts)),
     )
 
@@ -835,6 +864,7 @@ def test_inorder_subagent_discovery_does_not_rebroadcast(tmp_path: Path) -> None
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: collected.append((aid, evts)),
     )
 
@@ -899,6 +929,7 @@ def test_tool_result_in_later_poll_relinks_cached_parent(tmp_path: Path) -> None
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: collected.append((aid, evts)),
     )
 
@@ -963,6 +994,7 @@ def test_parent_already_on_disk_at_start_upgrades_card_when_subagent_links(tmp_p
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: collected.append((aid, evts)),
     )
 
@@ -1023,6 +1055,7 @@ def test_tool_result_before_meta_discovery_does_not_strand_card(tmp_path: Path) 
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: collected.append((aid, evts)),
     )
 
@@ -1086,6 +1119,7 @@ def test_subagent_discovered_after_history_file_disappears(tmp_path: Path) -> No
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: collected.append((aid, evts)),
     )
 
@@ -1111,9 +1145,6 @@ def test_subagent_discovered_after_history_file_disappears(tmp_path: Path) -> No
     upgraded = _latest_agent_tool_call(collected, parent_assistant_uuid, tool_use_id)
     assert upgraded is not None
     assert upgraded["subagent_metadata"]["session_id"] == "agent-rotsubid"
-
-
-# --- Queue replay scoped to the latest main session ---
 
 
 def _queue_enqueue_record(
@@ -1208,7 +1239,7 @@ def test_latest_session_parked_enqueues_replay_on_a_fresh_start(tmp_path: Path) 
 
 
 def test_new_latest_session_registered_mid_watch_purges_residue(tmp_path: Path) -> None:
-    """A new main session registered mid-watch (claude restarted outside minds)
+    """A new main session registered mid-watch (claude restarted outside Imbue Studio)
     purges residue on the next discovery cycle, without waiting for the new
     session to emit a queue signal, and the poll broadcasts the empty snapshot."""
     agent_state_dir, claude_config_dir, session_file = _setup_empty_agent(tmp_path)
@@ -1266,6 +1297,7 @@ def test_queued_to_delivered_emits_chip_removal_before_the_transcript_turn(tmp_p
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda _aid, evts: order_log.append(f"turn:{len(evts)}"),
     )
     watcher.set_queue_snapshot_callback(
@@ -1291,6 +1323,115 @@ def test_queued_to_delivered_emits_chip_removal_before_the_transcript_turn(tmp_p
     # The chip-removal (empty snapshot) is emitted BEFORE the transcript turn -- never the turn
     # while the chip is still shown.
     assert order_log == ["queue:[]", "turn:1"]
+
+
+def test_a_message_sent_during_a_compact_arrives_once_after_the_compacts_own_arrival(tmp_path: Path) -> None:
+    """Replays a live /compact-then-"hello" session (Claude Code 2.1.292). The page retires its
+    "Sending..." bubbles oldest-first, one per user-message arrival or new queued entry, so the
+    /compact must arrive on the transcript before "hello" is queued: otherwise the queued "hello"
+    retires the /compact's bubble and "hello" shows as a queued chip and a bubble at once. The typed /compact
+    is the user's own bubble from then on."""
+    agent_state_dir, claude_config_dir, session_file = _setup_empty_agent(tmp_path)
+    order_log: list[str] = []
+    watcher = ClaudeSessionWatcher(
+        agent_id="test-agent",
+        agent_state_dir=agent_state_dir,
+        claude_config_dir=claude_config_dir,
+        work_dir=None,
+        on_events=lambda _aid, evts: order_log.extend(
+            f"turn:{evt['content']}:{evt.get('display', 'shown')}" for evt in evts if evt["type"] == "user_message"
+        ),
+    )
+    watcher.set_queue_snapshot_callback(
+        lambda snapshot: order_log.append(f"queue:{[entry['content'] for entry in snapshot]}")
+    )
+
+    def append(*records: dict[str, Any]) -> None:
+        with open(session_file, "ab") as f:
+            for record in records:
+                f.write((json.dumps(record) + "\n").encode("utf-8"))
+        watcher._emit_cycle()
+
+    append(
+        {
+            "type": "user",
+            "uuid": "uuid-compact",
+            "timestamp": "2026-10-07T19:53:39.804Z",
+            "message": {"role": "user", "content": "/compact"},
+        }
+    )
+    append(_queue_enqueue_record("hello", "test-session", "2026-10-07T19:53:42.615Z"))
+    assert order_log == ["turn:/compact:shown", "queue:['hello']"]
+    assert _queued_contents(watcher) == ["hello"]
+
+    order_log.clear()
+    append(
+        _queue_dequeue_record("test-session"),
+        {
+            "type": "user",
+            "uuid": "uuid-command",
+            "timestamp": "2026-10-07T19:53:39.807Z",
+            "message": {
+                "role": "user",
+                "content": "<command-name>/compact</command-name>\n<command-message>compact</command-message>",
+            },
+        },
+        _user_event(1, "hello") | {"timestamp": "2026-10-07T19:54:00.077Z"},
+    )
+    # The command's expansion, written once the compaction ends, repeats the typed /compact and renders nowhere.
+    assert order_log == ["queue:[]", "turn:/compact:hidden", "turn:hello:shown"]
+
+
+def test_a_message_queued_through_the_reply_stays_shown_until_its_turn(tmp_path: Path) -> None:
+    """The agent reads as IDLE the moment its reply lands, before claude dequeues what was
+    queued behind it. The idle backstop keeps that message (as being sent) instead of blanking
+    it, and its own leave record removes it in the cycle its turn arrives."""
+    agent_state_dir, claude_config_dir, session_file = _setup_empty_agent(tmp_path)
+    order_log: list[str] = []
+    watcher = ClaudeSessionWatcher(
+        agent_id="test-agent",
+        agent_state_dir=agent_state_dir,
+        claude_config_dir=claude_config_dir,
+        work_dir=None,
+        on_events=lambda _aid, evts: order_log.append(f"turn:{len(evts)}"),
+    )
+    watcher.set_queue_snapshot_callback(
+        lambda snapshot: order_log.append(f"queue:{[entry['content'] for entry in snapshot]}")
+    )
+    with open(session_file, "ab") as f:
+        f.write((json.dumps(_queue_enqueue_record("follow-up", "test-session")) + "\n").encode("utf-8"))
+    watcher._emit_cycle()
+
+    assert [(entry["content"], entry["is_sending"]) for entry in watcher.notify_idle()] == [("follow-up", True)]
+
+    order_log.clear()
+    watcher._emit_cycle()
+    assert order_log == []
+    with open(session_file, "ab") as f:
+        f.write((json.dumps(_queue_dequeue_record("test-session")) + "\n").encode("utf-8"))
+        f.write((json.dumps(_user_event(1, "follow-up")) + "\n").encode("utf-8"))
+    watcher._emit_cycle()
+    assert order_log == ["queue:[]", "turn:1"]
+
+
+def test_an_emit_cycle_drops_a_message_left_queued_past_the_idle_grace(tmp_path: Path) -> None:
+    """A message claude never dequeues (an interrupt from its own terminal, a crash) is dropped once
+    the delivery grace runs out, by an emit cycle that has no new ledger line to read."""
+    agent_state_dir, claude_config_dir, session_file = _setup_empty_agent(tmp_path)
+    pushed: list[list[str]] = []
+    watcher = _make_watcher(agent_state_dir, claude_config_dir, [])
+    watcher.set_queue_snapshot_callback(lambda snapshot: pushed.append([entry["content"] for entry in snapshot]))
+    with open(session_file, "ab") as f:
+        f.write((json.dumps(_queue_enqueue_record("stranded", "test-session")) + "\n").encode("utf-8"))
+    watcher._emit_cycle()
+    assert pushed == [["stranded"]]
+
+    # Seen idle with it still queued a full grace ago.
+    watcher._queue_tracker.on_idle(time.monotonic() - DELIVERY_GRACE_SECONDS)
+    watcher._emit_cycle()
+
+    assert pushed == [["stranded"], []]
+    assert _queued_contents(watcher) == []
 
 
 def test_reprime_after_backend_restart_excludes_dead_epoch_enqueues(tmp_path: Path) -> None:
@@ -1363,9 +1504,6 @@ def test_truncation_reset_excludes_dead_epoch_enqueues(tmp_path: Path) -> None:
     assert _queued_contents(watcher) == []
 
 
-# --- Main-session discovery: no read-path stalls, history-ordered registration ---
-
-
 def test_discovery_miss_does_not_stall_the_read_path(tmp_path: Path) -> None:
     """A session listed in history whose file is not on disk yet (an agent's
     startup window) must not make the synchronous read-path discovery wait for
@@ -1399,25 +1537,28 @@ def test_late_found_session_is_inserted_in_history_order(tmp_path: Path) -> None
     agent_state_dir = tmp_path / "agent_state"
     agent_state_dir.mkdir()
     claude_config_dir = tmp_path / "claude_config"
-    projects_dir = claude_config_dir / "projects"
+    work_dir = tmp_path / "workspace"
+    work_dir.mkdir()
+    project_dir = claude_config_dir / "projects" / encode_claude_project_dir_name(work_dir)
+    project_dir.mkdir(parents=True)
     (agent_state_dir / "claude_session_id_history").write_text("session-1\nsession-2\n")
     # Only the newer session's file is on disk at first discovery.
-    _write_session_file(projects_dir, "session-2", [_user_event(5)])
+    session_2_file = project_dir / "session-2.jsonl"
+    session_2_file.write_text(json.dumps(_user_event(5)) + "\n")
 
-    watcher = _make_watcher(agent_state_dir, claude_config_dir, [])
+    watcher = _make_work_dir_watcher(agent_state_dir, claude_config_dir, work_dir)
     watcher.get_all_events()
     assert watcher._main_session_ids == ["session-2"]
 
     # The latest session's ledger feeds the queue tracker while session-1's file
     # is still missing.
-    session_2_file = projects_dir / "hash123" / "session-2.jsonl"
     with open(session_2_file, "ab") as f:
         f.write((json.dumps(_queue_enqueue_record("parked in the live session", "session-2")) + "\n").encode("utf-8"))
     watcher._emit_cycle()
     assert _queued_contents(watcher) == ["parked in the live session"]
 
     # The older session's file lands late; it must register at its history position.
-    _write_session_file(projects_dir, "session-1", [_user_event(0)])
+    (project_dir / "session-1.jsonl").write_text(json.dumps(_user_event(0)) + "\n")
     watcher.get_all_events()
 
     assert watcher._main_session_ids == ["session-1", "session-2"]
@@ -1437,6 +1578,7 @@ def test_is_main_session_event_excludes_subagent_sessions(tmp_path: Path) -> Non
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
     watcher.get_all_events()
@@ -1460,6 +1602,7 @@ def test_watcher_handles_missing_session_file(tmp_path: Path) -> None:
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda aid, evts: None,
     )
 
@@ -1467,7 +1610,51 @@ def test_watcher_handles_missing_session_file(tmp_path: Path) -> None:
     assert len(result) == 0
 
 
-# --- Bounded tail/backfill/offset paging over the resident store ---
+def test_a_session_missing_everywhere_is_scanned_for_on_a_backoff_not_on_every_refresh(
+    tmp_path: Path, loguru_records: list[str]
+) -> None:
+    """A history can name a session whose file never lands, and every watcher wake
+    refreshes, so the project dirs are scanned for it on a backoff: twenty back-to-back
+    refreshes scan once."""
+    agent_state_dir = tmp_path / "agent_state"
+    agent_state_dir.mkdir()
+    claude_config_dir = tmp_path / "claude_config"
+    for index in range(3):
+        project_dir = claude_config_dir / "projects" / f"-another-project-{index}"
+        project_dir.mkdir(parents=True)
+        (project_dir / f"{uuid4().hex}.jsonl").write_text(json.dumps(_user_event(index)) + "\n")
+    missing_session_id = uuid4().hex
+    (agent_state_dir / "claude_session_id_history").write_text(f"{missing_session_id}\n")
+    watcher = _make_watcher(agent_state_dir, claude_config_dir, [])
+
+    for _ in range(20):
+        assert watcher.get_all_events() == []
+
+    scans = [record for record in loguru_records if f"Session file not found for {missing_session_id}" in record]
+    assert len(scans) == 1
+
+
+def test_a_session_filed_under_the_work_dir_is_found_as_soon_as_it_lands_while_its_scan_is_backed_off(
+    tmp_path: Path,
+) -> None:
+    """The backoff must not delay the ordinary case: a just-started session whose file is
+    written a moment after its id reaches the history, under the project dir claude names
+    for the work dir."""
+    agent_state_dir = tmp_path / "agent_state"
+    agent_state_dir.mkdir()
+    claude_config_dir = tmp_path / "claude_config"
+    work_dir = tmp_path / "workspace"
+    work_dir.mkdir()
+    session_id = uuid4().hex
+    (agent_state_dir / "claude_session_id_history").write_text(f"{session_id}\n")
+    watcher = _make_work_dir_watcher(agent_state_dir, claude_config_dir, work_dir)
+    assert watcher.get_all_events() == []
+
+    project_dir = claude_config_dir / "projects" / encode_claude_project_dir_name(work_dir)
+    project_dir.mkdir(parents=True)
+    (project_dir / f"{session_id}.jsonl").write_text(json.dumps(_user_event(7)) + "\n")
+
+    assert [event["event_id"] for event in watcher.get_all_events()] == ["uuid-7-user"]
 
 
 def _ts(index: int) -> str:
@@ -1544,6 +1731,7 @@ def _make_oracle_watcher(agent_state_dir: Path, claude_config_dir: Path) -> Clau
         agent_id="test-agent",
         agent_state_dir=agent_state_dir,
         claude_config_dir=claude_config_dir,
+        work_dir=None,
         on_events=lambda _aid, _evts: None,
     )
 
@@ -1711,9 +1899,6 @@ def test_get_latest_main_session_file_none_without_history(tmp_path: Path) -> No
     assert watcher.get_latest_main_session_file() is None
 
 
-# --- On-demand payload detail ---
-
-
 def _make_bash_result_line(uuid: str, timestamp: str, call_id: str, output: str) -> str:
     return json.dumps(
         {
@@ -1852,3 +2037,112 @@ def test_a_loader_reads_the_same_transcript_as_the_watcher_without_watching(tmp_
     assert loader.get_event_detail(tool_result["event_id"]) == watcher.get_event_detail(tool_result["event_id"])
     assert loader.get_subagent_metadata("nobody") is None
     loader.close()
+
+
+def _task_notification(task_id: str, status: str) -> str:
+    return (
+        f"<task-notification>\n<task-id>{task_id}</task-id>\n<status>{status}</status>\n"
+        f"<summary>Background command finished</summary>\n</task-notification>"
+    )
+
+
+def test_a_task_the_ledger_reports_over_is_handed_on_after_the_cycles_events(tmp_path: Path) -> None:
+    """The enqueue of a task's completion notice is the one record of its end an interrupted or failed turn
+    cannot lose. Its id goes to the callback after the cycle's events, so the turn the notice starts is
+    folded in before the chat stops waiting on the task."""
+    agent_state_dir, claude_config_dir, session_file = _setup_empty_agent(tmp_path)
+    collected: list[dict[str, Any]] = []
+    handed_on: list[tuple[tuple[str, ...], int]] = []
+    watcher = _make_watcher(agent_state_dir, claude_config_dir, collected)
+    watcher.set_finished_tasks_callback(lambda task_ids: handed_on.append((task_ids, len(collected))))
+    watcher._prime()
+
+    records = [
+        _queue_enqueue_record(_task_notification("bg-done", "completed"), "test-session"),
+        _queue_enqueue_record(_task_notification("bg-still-going", "running"), "test-session"),
+        _queue_enqueue_record("a message the user queued", "test-session"),
+        _user_event(1, _task_notification("bg-done", "completed")),
+    ]
+    session_file.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    watcher._emit_cycle()
+
+    assert len(collected) == 1
+    assert handed_on == [(("bg-done",), 1)]
+
+    watcher._emit_cycle()
+    assert len(handed_on) == 1
+
+
+_REPLY_DRAFT_FIXTURE_DIR = Path(__file__).parent / "testdata" / "reply_draft"
+
+
+def _pane_sources(capture_pane: Callable[[], str | None]) -> ReplyDraftSources:
+    return ReplyDraftSources(capture_pane=capture_pane, read_streamed_reply=lambda: None)
+
+
+def _reply_draft_watcher(tmp_path: Path) -> ClaudeSessionWatcher:
+    """A watcher whose transcript holds one user turn and the reply Claude gave it (a real one)."""
+    landed_reply = (_REPLY_DRAFT_FIXTURE_DIR / "landed_previous_reply.md").read_text()
+    reply_line = {
+        "type": "assistant",
+        "uuid": "reply-uuid-5521",
+        "timestamp": "2026-01-01T00:00:02Z",
+        "message": {
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [{"type": "text", "text": landed_reply}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    }
+    agent_state_dir, claude_config_dir, _ = _setup_agent(tmp_path, [_user_event(1), reply_line])
+    watcher = _make_watcher(agent_state_dir, claude_config_dir, [])
+    watcher.get_all_events()
+    return watcher
+
+
+def test_reply_draft_reads_nothing_and_captures_nothing_while_no_turn_runs(tmp_path: Path) -> None:
+    watcher = _reply_draft_watcher(tmp_path)
+    captures: list[str] = []
+
+    def capture() -> str:
+        captures.append("captured")
+        return (_REPLY_DRAFT_FIXTURE_DIR / "pane_reply_streaming.txt").read_text()
+
+    draft = watcher.read_reply_draft(_pane_sources(capture))
+
+    assert draft is not None and draft.text == ""
+    assert captures == []
+
+
+def test_reply_draft_reads_the_reply_on_screen_after_the_last_event_while_a_turn_runs(tmp_path: Path) -> None:
+    watcher = _reply_draft_watcher(tmp_path)
+    (tmp_path / "agent_state" / "active").touch()
+
+    draft = watcher.read_reply_draft(
+        _pane_sources(lambda: (_REPLY_DRAFT_FIXTURE_DIR / "pane_reply_streaming.txt").read_text())
+    )
+
+    assert draft is not None
+    assert draft.text.startswith("**How Tides Work**")
+    assert draft.after_event_id == "reply-uuid-5521-assistant"
+
+
+def test_reply_draft_shows_no_reply_the_transcript_already_holds(tmp_path: Path) -> None:
+    watcher = _reply_draft_watcher(tmp_path)
+    (tmp_path / "agent_state" / "active").touch()
+
+    draft = watcher.read_reply_draft(
+        _pane_sources(lambda: (_REPLY_DRAFT_FIXTURE_DIR / "pane_previous_reply_only.txt").read_text())
+    )
+
+    assert draft is not None and draft.text == ""
+
+
+def test_reply_draft_is_empty_when_the_pane_cannot_be_read(tmp_path: Path) -> None:
+    watcher = _reply_draft_watcher(tmp_path)
+    (tmp_path / "agent_state" / "active").touch()
+
+    draft = watcher.read_reply_draft(_pane_sources(lambda: None))
+
+    assert draft is not None and draft.text == "" and draft.after_event_id == "reply-uuid-5521-assistant"

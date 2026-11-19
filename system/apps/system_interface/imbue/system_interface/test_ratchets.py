@@ -227,7 +227,9 @@ def test_prevent_os_fork() -> None:
 def test_prevent_direct_subprocess() -> None:
     # conftest.py is test infrastructure (fixtures), same category as *_test.py
     excluded = TEST_FILE_PATTERNS + ("testing.py", "conftest.py")
-    rc.check_direct_subprocess(_DIR, snapshot(0), excluded_patterns=excluded)
+    # The one use is the update notice's rollback launch (shell/update_notice.py): a child that must
+    # outlive this process by design, since it restarts the shell's own supervisord program group.
+    rc.check_direct_subprocess(_DIR, snapshot(1), excluded_patterns=excluded)
 
 
 # --- AST-based ratchets ---
@@ -269,6 +271,7 @@ def test_prevent_code_in_init_files() -> None:
     rc.check_code_in_init_files(_DIR, snapshot(0))
 
 
+@pytest.mark.timeout(120)
 def test_no_type_errors() -> None:
     """Ensure the codebase has zero type errors."""
     check_no_type_errors(_DIR)

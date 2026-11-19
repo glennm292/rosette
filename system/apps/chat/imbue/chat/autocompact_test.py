@@ -1,199 +1,207 @@
-import inspect
 import threading
+from collections.abc import Callable
 from collections.abc import Sequence
+from pathlib import Path
 
-from imbue.concurrency_group.errors import ProcessSetupError
-from imbue.concurrency_group.subprocess_utils import FinishedProcess
-from imbue.mngr.utils.polling import poll_until
-from imbue.chat.autocompact import _DEFAULT_CHECK_CONCURRENCY
+import pytest
+from pydantic import ValidationError
+
 from imbue.chat.autocompact import ChatAutoCompactor
+from imbue.chat.autocompact import SLOW_SWEEP_WARNING_SECONDS
+from imbue.chat.testing import use_mngr_settings
+from imbue.mngr.errors import MngrError
+from imbue.mngr.utils.polling import poll_until
+from imbue.mngr_autocompact.config import AutoCompactPluginConfig
 
 
-def _make_finished_process(
-    command: Sequence[str],
-    returncode: int = 0,
-    stdout: str = "",
-    stderr: str = "",
-) -> FinishedProcess:
-    return FinishedProcess(
-        command=tuple(command),
-        returncode=returncode,
-        stdout=stdout,
-        stderr=stderr,
-        is_timed_out=False,
-        is_output_already_logged=False,
-    )
+def _recording_compact(
+    compacted_of: Callable[[Sequence[str]], Sequence[str]] = lambda names: [],
+) -> tuple[list[list[str]], Callable[[Sequence[str]], Sequence[str]]]:
+    recorded_batches: list[list[str]] = []
+
+    def compact(names: Sequence[str]) -> Sequence[str]:
+        recorded_batches.append(list(names))
+        return compacted_of(names)
+
+    return recorded_batches, compact
 
 
-def test_default_check_concurrency() -> None:
-    compactor = ChatAutoCompactor.build(list_running_chat_agent_names=lambda: [])
-    assert compactor._max_concurrency == _DEFAULT_CHECK_CONCURRENCY
-    assert _DEFAULT_CHECK_CONCURRENCY == 4
+def test_a_sweep_with_no_opted_in_chat_makes_no_call() -> None:
+    """Nothing opted in (or nothing running) must cost nothing: not even the config read the call makes."""
+    recorded_batches, compact = _recording_compact()
+
+    compactor = ChatAutoCompactor.build(list_opted_in_chat_agent_names=list, compact=compact)
+
+    assert compactor.sweep() == []
+    assert recorded_batches == []
 
 
-def test_check_agent_success() -> None:
-    recorded_commands: list[list[str]] = []
-    recorded_kwargs: dict[str, object] = {}
-
-    def fake_runner(command: Sequence[str], **kwargs: object) -> FinishedProcess:
-        recorded_commands.append(list(command))
-        recorded_kwargs.update(kwargs)
-        return _make_finished_process(
-            command=command, returncode=0, stdout="No agents require compaction."
-        )
+def test_a_sweep_passes_every_opted_in_chat_to_one_plugin_call() -> None:
+    recorded_batches, compact = _recording_compact(lambda names: ["chat-beta"])
 
     compactor = ChatAutoCompactor.build(
-        list_running_chat_agent_names=lambda: ["chat-1"],
-        runner=fake_runner,
-        mngr_binary="mngr-custom",
+        list_opted_in_chat_agent_names=lambda: ["chat-alpha", "chat-beta", "chat-gamma"],
+        compact=compact,
     )
-    result = compactor.check_agent("chat-1")
 
-    assert result is not None
-    assert result.returncode == 0
-    assert recorded_commands == [["mngr-custom", "autocompact", "run", "chat-1"]]
-    assert recorded_kwargs.get("is_checked") is False
+    assert compactor.sweep() == ["chat-beta"]
+    assert recorded_batches == [["chat-alpha", "chat-beta", "chat-gamma"]]
 
 
-def test_check_agent_exit_code_1_logged_as_debug(loguru_records: list[str]) -> None:
-    def fake_runner(
-        command: Sequence[str], is_checked: bool = False, **kwargs: object
-    ) -> FinishedProcess:
-        return _make_finished_process(
-            command=command,
-            returncode=1,
-            stderr="Agent 'chat-1' does not support context compaction",
-        )
+def test_each_compacted_agent_is_reported_once_and_logged(loguru_records: list[str]) -> None:
+    reported: list[str] = []
+    _recorded_batches, compact = _recording_compact(lambda names: ["chat-alpha", "chat-gamma"])
 
     compactor = ChatAutoCompactor.build(
-        list_running_chat_agent_names=lambda: ["chat-1"],
-        runner=fake_runner,
+        list_opted_in_chat_agent_names=lambda: ["chat-alpha", "chat-beta", "chat-gamma"],
+        compact=compact,
+        on_compaction_requested=reported.append,
+        harness_of_agent=lambda name: "claude" if name == "chat-alpha" else None,
     )
-    result = compactor.check_agent("chat-1")
+    compactor.sweep()
 
-    assert result is None
-    debug_logs = [log for log in loguru_records if log.startswith("DEBUG") and "chat-1" in log]
-    assert len(debug_logs) == 1
-    assert "does not support context compaction" in debug_logs[0]
-    warning_logs = [log for log in loguru_records if log.startswith("WARNING")]
-    assert len(warning_logs) == 0
-
-
-def test_check_agent_other_nonzero_exit_logged_as_warning(loguru_records: list[str]) -> None:
-    def fake_runner(
-        command: Sequence[str], is_checked: bool = False, **kwargs: object
-    ) -> FinishedProcess:
-        return _make_finished_process(
-            command=command,
-            returncode=2,
-            stderr="invalid syntax",
-        )
-
-    compactor = ChatAutoCompactor.build(
-        list_running_chat_agent_names=lambda: ["chat-1"],
-        runner=fake_runner,
-    )
-    result = compactor.check_agent("chat-1")
-
-    assert result is None
-    warning_logs = [log for log in loguru_records if log.startswith("WARNING") and "chat-1" in log]
-    assert len(warning_logs) == 1
-    assert "return code 2" in warning_logs[0]
-
-
-def test_check_agent_process_setup_error_handled_gracefully(loguru_records: list[str]) -> None:
-    def fake_runner(command: Sequence[str], **kwargs: object) -> FinishedProcess:
-        raise ProcessSetupError(
-            command=tuple(command),
-            stdout="",
-            stderr="mngr executable not found",
-            is_output_already_logged=False,
-        )
-
-    compactor = ChatAutoCompactor.build(
-        list_running_chat_agent_names=lambda: ["chat-1"],
-        runner=fake_runner,
-    )
-    result = compactor.check_agent("chat-1")
-
-    assert result is None
-    warning_logs = [log for log in loguru_records if log.startswith("WARNING") and "chat-1" in log]
-    assert len(warning_logs) == 1
-
-
-def test_sweep_checks_all_running_chat_agents() -> None:
-    recorded_commands: list[list[str]] = []
-    lock = threading.Lock()
-
-    def fake_runner(command: Sequence[str], **kwargs: object) -> FinishedProcess:
-        with lock:
-            recorded_commands.append(list(command))
-        return _make_finished_process(command=command, returncode=0)
-
-    running_chats = ["chat-alpha", "chat-beta", "chat-gamma"]
-    compactor = ChatAutoCompactor.build(
-        list_running_chat_agent_names=lambda: running_chats,
-        runner=fake_runner,
-        mngr_binary="mngr",
-    )
-    results = compactor.sweep()
-
-    assert len(results) == 3
-    assert sorted(recorded_commands) == [
-        ["mngr", "autocompact", "run", "chat-alpha"],
-        ["mngr", "autocompact", "run", "chat-beta"],
-        ["mngr", "autocompact", "run", "chat-gamma"],
+    assert reported == ["chat-alpha", "chat-gamma"]
+    requested_logs = [record for record in loguru_records if "autocompact: requested" in record]
+    assert requested_logs == [
+        "INFO autocompact: requested agent=chat-alpha harness=claude",
+        "INFO autocompact: requested agent=chat-gamma",
     ]
 
 
-def test_sweep_runs_concurrently() -> None:
-    barrier = threading.Barrier(3)
+@pytest.mark.parametrize("is_call_failing", [False, True], ids=["call_returns", "call_fails"])
+def test_a_sweep_brackets_the_plugin_call_and_its_reports_with_its_candidates(is_call_failing: bool) -> None:
+    calls: list[tuple[str, ...]] = []
 
-    def fake_runner(command: Sequence[str], **kwargs: object) -> FinishedProcess:
-        barrier.wait(timeout=2.0)
-        return _make_finished_process(command=command, returncode=0)
+    def compact(names: Sequence[str]) -> Sequence[str]:
+        calls.append(("compact", *names))
+        if is_call_failing:
+            raise MngrError("host offline")
+        return ["chat-beta"]
 
     compactor = ChatAutoCompactor.build(
-        list_running_chat_agent_names=lambda: ["chat-1", "chat-2", "chat-3"],
-        runner=fake_runner,
-        max_concurrency=3,
+        list_opted_in_chat_agent_names=lambda: ["chat-alpha", "chat-beta"],
+        compact=compact,
+        on_compaction_requested=lambda name: calls.append(("requested", name)),
+        on_sweep_started=lambda names: calls.append(("started", *names)),
+        on_sweep_finished=lambda: calls.append(("finished",)),
     )
-    results = compactor.sweep()
-    assert len(results) == 3
+    compactor.sweep()
+
+    reported = [] if is_call_failing else [("requested", "chat-beta")]
+    assert calls == [
+        ("started", "chat-alpha", "chat-beta"),
+        ("compact", "chat-alpha", "chat-beta"),
+        *reported,
+        ("finished",),
+    ]
 
 
-def test_sweep_stops_early_if_stop_event_set() -> None:
-    recorded_commands: list[list[str]] = []
+def _invalid_mode_error() -> ValidationError:
+    """The pydantic error mngr's config raises for an unknown autocompact mode."""
+    with pytest.raises(ValidationError) as raised:
+        AutoCompactPluginConfig.model_validate({"mode": "bogus"})
+    return raised.value
 
-    compactor: ChatAutoCompactor
 
-    def fake_runner(command: Sequence[str], **kwargs: object) -> FinishedProcess:
-        recorded_commands.append(list(command))
-        compactor._stop_event.set()
-        return _make_finished_process(command=command, returncode=0)
+@pytest.mark.parametrize(
+    "compact_error",
+    [MngrError("host offline"), OSError("disk gone"), _invalid_mode_error()],
+    ids=["mngr_error", "os_error", "validation_error"],
+)
+def test_a_failed_plugin_call_logs_and_reports_nothing(compact_error: Exception, loguru_records: list[str]) -> None:
+    reported: list[str] = []
 
-    running_chats = ["chat-1", "chat-2", "chat-3"]
+    def failing_compact(names: Sequence[str]) -> Sequence[str]:
+        raise compact_error
+
     compactor = ChatAutoCompactor.build(
-        list_running_chat_agent_names=lambda: running_chats,
-        runner=fake_runner,
-        max_concurrency=1,
+        list_opted_in_chat_agent_names=lambda: ["chat-alpha", "chat-beta"],
+        compact=failing_compact,
+        on_compaction_requested=reported.append,
     )
-    results = compactor.sweep()
 
-    assert len(results) == 1
-    assert recorded_commands == [["mngr", "autocompact", "run", "chat-1"]]
+    assert compactor.sweep() == []
+    assert reported == []
+    warning_logs = [log for log in loguru_records if log.startswith("WARNING") and "chat-alpha, chat-beta" in log]
+    assert len(warning_logs) == 1
+
+
+def test_an_unexpected_error_in_one_tick_is_logged_and_the_next_tick_still_runs(loguru_records: list[str]) -> None:
+    second_tick_ran = threading.Event()
+    calls: list[None] = []
+
+    def compact(names: Sequence[str]) -> Sequence[str]:
+        calls.append(None)
+        if len(calls) == 1:
+            raise RuntimeError("corrupt agent record")
+        second_tick_ran.set()
+        return []
+
+    compactor = ChatAutoCompactor.build(
+        list_opted_in_chat_agent_names=lambda: ["chat-alpha"],
+        compact=compact,
+        interval_seconds=0.01,
+    )
+    compactor.start()
+    try:
+        poll_until(second_tick_ran.is_set, timeout=5.0)
+    finally:
+        compactor.stop()
+
+    error_logs = [log for log in loguru_records if log.startswith("ERROR") and "sweep failed unexpectedly" in log]
+    assert len(error_logs) == 1
+
+
+def test_a_slow_sweep_logs_a_warning(loguru_records: list[str]) -> None:
+    clock = iter([100.0, 100.0 + SLOW_SWEEP_WARNING_SECONDS + 1.0])
+
+    compactor = ChatAutoCompactor.build(
+        list_opted_in_chat_agent_names=lambda: ["chat-alpha"],
+        compact=lambda names: [],
+        monotonic=lambda: next(clock),
+    )
+    compactor.sweep()
+
+    warning_logs = [log for log in loguru_records if log.startswith("WARNING") and "slow sweep" in log]
+    assert len(warning_logs) == 1
+
+
+def test_a_quick_sweep_logs_no_warning(loguru_records: list[str]) -> None:
+    clock = iter([100.0, 101.0])
+
+    compactor = ChatAutoCompactor.build(
+        list_opted_in_chat_agent_names=lambda: ["chat-alpha"],
+        compact=lambda names: [],
+        monotonic=lambda: next(clock),
+    )
+    compactor.sweep()
+
+    assert [log for log in loguru_records if log.startswith("WARNING")] == []
+
+
+def test_an_invalid_mode_in_the_settings_file_logs_and_requests_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loguru_records: list[str]
+) -> None:
+    """mngr's loader rejects an unknown mode with a pydantic error, which must not end the sweep thread."""
+    use_mngr_settings('[plugins.autocompact]\nmode = "bogus"\n', tmp_path, monkeypatch)
+
+    compactor = ChatAutoCompactor.build(list_opted_in_chat_agent_names=lambda: ["chat-alpha"])
+
+    assert compactor.sweep() == []
+    warning_logs = [log for log in loguru_records if log.startswith("WARNING") and "chat-alpha" in log]
+    assert len(warning_logs) == 1
 
 
 def test_start_and_stop_lifecycle() -> None:
     sweep_called = threading.Event()
 
-    def fake_runner(command: Sequence[str], **kwargs: object) -> FinishedProcess:
+    def compact(names: Sequence[str]) -> Sequence[str]:
         sweep_called.set()
-        return _make_finished_process(command=command, returncode=0)
+        return []
 
     compactor = ChatAutoCompactor.build(
-        list_running_chat_agent_names=lambda: ["test-chat"],
-        runner=fake_runner,
+        list_opted_in_chat_agent_names=lambda: ["test-chat"],
+        compact=compact,
         interval_seconds=0.01,
     )
     compactor.start()
@@ -207,3 +215,68 @@ def test_start_and_stop_lifecycle() -> None:
 
     compactor.stop()
     assert compactor._thread is None
+
+
+def _stuck_sweep_warnings(loguru_records: list[str]) -> list[str]:
+    return [log for log in loguru_records if log.startswith("WARNING autocompact: sweep still running")]
+
+
+def test_a_stuck_sweep_is_logged_with_its_stack_and_no_second_sweep_starts_until_it_returns(
+    loguru_records: list[str],
+) -> None:
+    release_stuck_sweep = threading.Event()
+    calls: list[list[str]] = []
+
+    def compact_blocked_until_released(names: Sequence[str]) -> Sequence[str]:
+        calls.append(list(names))
+        if len(calls) == 1:
+            release_stuck_sweep.wait(timeout=30.0)
+        return []
+
+    compactor = ChatAutoCompactor.build(
+        list_opted_in_chat_agent_names=lambda: ["chat-alpha"],
+        compact=compact_blocked_until_released,
+        interval_seconds=0.01,
+        stuck_sweep_first_warning_seconds=0.05,
+        stuck_sweep_repeat_warning_seconds=0.05,
+    )
+    compactor.start()
+    try:
+        is_warned_twice = poll_until(lambda: len(_stuck_sweep_warnings(loguru_records)) >= 2, timeout=10.0)
+        calls_while_stuck = len(calls)
+        release_stuck_sweep.set()
+        is_next_sweep_run = poll_until(lambda: len(calls) >= 2, timeout=10.0)
+    finally:
+        release_stuck_sweep.set()
+        compactor.stop()
+
+    assert is_warned_twice is True
+    assert calls_while_stuck == 1
+    assert is_next_sweep_run is True
+    first_warning = _stuck_sweep_warnings(loguru_records)[0]
+    assert "after 0s" in first_warning
+    assert "in compact_blocked_until_released" in first_warning
+    assert "release_stuck_sweep.wait(timeout=30.0)" in first_warning
+
+
+def test_a_sweep_that_returns_in_time_logs_no_stuck_warning(loguru_records: list[str]) -> None:
+    sweep_returned = threading.Event()
+
+    def compact(names: Sequence[str]) -> Sequence[str]:
+        sweep_returned.set()
+        return []
+
+    compactor = ChatAutoCompactor.build(
+        list_opted_in_chat_agent_names=lambda: ["chat-alpha"],
+        compact=compact,
+        interval_seconds=0.01,
+        stuck_sweep_first_warning_seconds=5.0,
+    )
+    compactor.start()
+    try:
+        is_swept = poll_until(sweep_returned.is_set, timeout=5.0)
+    finally:
+        compactor.stop()
+
+    assert is_swept is True
+    assert _stuck_sweep_warnings(loguru_records) == []

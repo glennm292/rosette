@@ -1,6 +1,6 @@
 ---
 name: file-sharing
-description: Use to read and write files and directories on the user's local filesystem.
+description: Use to read and write files and directories on the user's local filesystem. Also useful for importing Apple Notes, Photos, and other similar locally stored data.
 metadata:
   author: imbue
 ---
@@ -10,25 +10,28 @@ metadata:
 ## Instructions
 
 Use this skill when the user asks you to work with files located directly on their computer.
+To *run* something on their computer rather than read or write its files, see the `run-on-users-computer` skill instead; file sharing is the first thing it tells you to try.
 
 **First, look for a synced copy.** If the folder you need is already under
-`~/synced_folders/`, it is on this machine as ordinary files: work on it
+`~/synced_folders/`, it is in this workspace as ordinary files: work on it
 directly with your normal tools and skip everything below. See "Folders the
 user keeps synced", including what happens to anything you write. The rest of
 this section is for a shared path that has no copy here.
 
-1. **Use `latchkey curl`** calls to communicate with the remote WebDAV server. (They are the same as normal curl calls, just going through the Latchkey Gateway.)
-2. **Check existing access first.** Sometimes important context can be revealed simply by observing which directories or files the user already shared. See the "Check existing access" example below.
-3. **Submit a permission request to the user** by calling `latchkey curl -XPOST http://latchkey-self.invalid/permission-requests` when the curl request comes back with the "request not permitted by the user" message. See the "Ask for user permission" example below.
-4. **Stop working** in case of upstream connection failures. Those are most likely caused by the user closing their locally running Mind app. Restarting the Mind app should usually help.
+1. **Find out which device the files are on**: see the `devices` skill for details about listing devices. Use conversation context to narrow it down to a single device when needed.
+2. **In all requests, set the `X-Latchkey-Device` header** to the desired device ID so that the request gets routed to the right device.
+3. **Use `latchkey curl`** calls to communicate with the remote WebDAV server. (They are the same as normal curl calls, just going through the Latchkey Gateway.)
+4. **Check existing access first.** Sometimes important context can be revealed simply by observing which directories or files the user already shared. See the "Check existing access" example below.
+5. **Submit a permission request to the user** by calling `latchkey curl -XPOST http://latchkey-self.invalid/permission-requests` when the curl request comes back with the "request not permitted by the user" message. See the "Ask for user permission" example below.
+6. **Stop working** if the device is unreachable. A 502 means the targeted device is unreachable, most likely because the user's computer is asleep or the Imbue Studio app is closed. Restarting the Imbue Studio app should usually help. A 503 means the device ID is unknown.
 
-The base URL is `http://latchkey-self.invalid/minds-api-proxy/api/v1/files`. Only the user's home directory and the user's system temp directory are accessible. MOVE and COPY operations are not supported.
+The base URL is `http://latchkey-self.invalid/minds-api-proxy/api/v1/files/<device ID>`. Replace the `<device ID>` placeholder with an actual device ID. Only the user's home directory and the user's system temp directory are accessible. MOVE and COPY operations are not supported.
 
 
 ## Folders the user keeps synced
 
-For a shared folder, the user can additionally ask Minds to keep a copy of it
-on this machine. When there is one, **use it instead of the WebDAV server
+For a shared folder, the user can additionally ask Imbue Studio to keep a copy of it
+in this workspace. When there is one, **use it instead of the WebDAV server
 above**: it is ordinary local files, so your normal tools work on it, there is
 no round trip per file, and it keeps working while the user's computer is
 asleep or offline. Fall back to `latchkey curl` only for a shared path that has
@@ -38,20 +41,22 @@ no copy here.
   folder that is syncing now. So `/Users/kim/notes` from device `host-abc`
   is at `~/synced_folders/host-abc/Users/kim/notes`.
 - `~/inactive_synced_folders/...` holds a copy whose syncing the user turned
-  off. **Treat it as Minds' own.** Do not create, move, or write anything under
-  it: Minds moves folders in and out of it by name, and anything of yours
+  off. **Treat it as Imbue Studio's own.** Do not create, move, or write anything under
+  it: Imbue Studio moves folders in and out of it by name, and anything of yours
   sitting where a folder belongs is deleted when the user turns syncing off
   again. If you need somewhere to put your own files, use your working
-  directory or `/tmp`.
+  directory, or `/tmp` for small files (`/var/tmp` for anything large).
 
 ### Whether your writes reach the user
 
 Only if you were granted **write** access to that path. Check before you rely
-on it -- the rules list names each permission `minds-file-server-read-<path>`
-or `minds-file-server-write-<path>`:
+on it -- the rules list names each permission
+`minds-file-server-read-<device ID>:<path>` or
+`minds-file-server-write-<device ID>:<path>` (a computer whose Imbue Studio
+predates per-device grants names them with no `<device ID>:`):
 
 ```bash
-latchkey curl http://latchkey-self.invalid/permissions/self | jq .rules
+latchkey curl -H "X-Latchkey-Device: <device ID>" http://latchkey-self.invalid/permissions/self | jq .rules
 ```
 
 With **read and write**, changes travel both ways: what you write here reaches
@@ -88,22 +93,22 @@ sorts it out.
 ### Check existing access
 
 ```bash
-latchkey curl http://latchkey-self.invalid/permissions/self | jq .rules
+latchkey curl -H "X-Latchkey-Device: <device ID>" http://latchkey-self.invalid/permissions/self | jq .rules
 ```
 
 ### Retrieving a file
 ```bash
-latchkey curl -O http://latchkey-self.invalid/minds-api-proxy/api/v1/files/home/hynek/project/notes.txt
+latchkey curl -H "X-Latchkey-Device: <device ID>" -O http://latchkey-self.invalid/minds-api-proxy/api/v1/files/<device ID>/home/hynek/project/notes.txt
 ```
 
 ### Writing a file
 ```bash
-latchkey curl -T localfile.txt http://latchkey-self.invalid/minds-api-proxy/api/v1/files/home/hynek/project/remotefile.txt
+latchkey curl -H "X-Latchkey-Device: <device ID>" -T localfile.txt http://latchkey-self.invalid/minds-api-proxy/api/v1/files/<device ID>/home/hynek/project/remotefile.txt
 ```
 
 ### Listing a directory
 ```bash
-latchkey curl -s -X PROPFIND -H "Depth: 1" http://latchkey-self.invalid/minds-api-proxy/api/v1/files/home/hynek/project/ | xmlstarlet sel -N d=DAV: -t -m "//d:response/d:href" -v . -n
+latchkey curl -H "X-Latchkey-Device: <device ID>" -s -X PROPFIND -H "Depth: 1" http://latchkey-self.invalid/minds-api-proxy/api/v1/files/<device ID>/home/hynek/project/ | xmlstarlet sel -N d=DAV: -t -m "//d:response/d:href" -v . -n
 ```
 
 ### Ask for user permission
@@ -114,7 +119,7 @@ When a request comes back with the "request not permitted by the user" message, 
 # 2. Ask for the necessary missing permissions.
 # (Never pipe the output through jq because frontend rendering depends on seeing the full output from your tool.)
 # The request goes in a tool call of its own, with nothing else in it and its output untouched.
-latchkey curl -XPOST http://latchkey-self.invalid/permission-requests \
+latchkey curl -H "X-Latchkey-Device: <device ID>" -XPOST http://latchkey-self.invalid/permission-requests \
   -H 'Content-Type: application/json' \
   -d '{"agent_id": "'"${MINDS_CHAT_ID:-$MNGR_AGENT_ID}"'", "type": "file-sharing", "payload": {"path": "/home/hynek/project", "access": "READ"}, "rationale": "I'"'"'d like to access the /home/hynek/project directory in order to find the most recent accounting spreadsheet you asked me about."}'
 ```
@@ -124,13 +129,28 @@ The body must be a JSON object with exactly four fields:
 sets `MINDS_CHAT_ID` on every agent it creates and an agent created any other way is its own
 chat), `rationale`, `type` (use "file-sharing"), and `payload`.
 
-`payload` must be an object with exactly two string fields: `path` and `access`. `path` should be absolute, `access` must be "READ" or "WRITE".
+`payload` must be an object with two string fields, `path` and `access`, and optionally a `sync` object (see below). `path` should be absolute, `access` must be "READ" or "WRITE".
 
 If you don't know the absolute path to the user's home directory, you can use "~" in your permission request. The backend will expand it to the full path, which you can use to work with the files once your request is approved.
 
 After posting, wait for an automated system message indicating whether the user approved or denied the permission request.
 
+### Ask for a synchronized copy
+
+Access through the file server only works while the user's computer is awake and the Imbue Studio app is running. If you need a folder to stay reachable while the user's computer is asleep or offline, ask for a synchronized copy of it in this workspace in the same request, by adding `sync` to the payload:
+
+```bash
+latchkey curl -H "X-Latchkey-Device: <device ID>" -XPOST http://latchkey-self.invalid/permission-requests \
+  -H 'Content-Type: application/json' \
+  -d '{"agent_id": "'"${MINDS_CHAT_ID:-$MNGR_AGENT_ID}"'", "type": "file-sharing", "payload": {"path": "/home/hynek/project", "access": "WRITE", "sync": {"conflict": "NEWER"}}, "rationale": "I'"'"'d like to keep working on the project while your laptop is asleep, so I need a copy of it in this workspace."}'
+```
+
+- `sync` is an object. Only folders can be synced, never single files.
+- `conflict` is optional and says which side wins when a two-way sync finds the same file changed on both: "NEWER" (the default), "THIS_COMPUTER" (the user's computer) or "WORKSPACE" (this workspace). It only matters for "WRITE" access; a "READ" grant syncs one way, from the user's computer to this workspace.
+- The user decides. The approval dialog offers the sync switched on because you asked, and they can turn it off (or turn it on when you did not ask). The message you receive says which. When a sync was started it names where the copy lives, `~/synced_folders/<device id>/<the folder's full path on the user's computer>`; work with the files there directly, with ordinary file tools, not through the file server. When the user turned the sync off, the message says the copy was not enabled, and the file server is the only way to reach the folder.
+- The copy takes a moment to arrive after approval. If the directory is empty at first, wait briefly and look again.
+
 ## Notes
 
 - Users may run macOS or Linux, possible even other OSes.
-- In the permission request dialog that pops up in the Mind app on their machine, users can adjust the path, overriding the originally requested one. There are no other sharing settings the user can configure.
+- In the permission request dialog that pops up in the Imbue Studio app on their computer, users can adjust the path, overriding the originally requested one, and switch the synchronized copy on or off. There are no other sharing settings the user can configure.

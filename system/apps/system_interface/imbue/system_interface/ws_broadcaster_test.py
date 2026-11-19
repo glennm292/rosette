@@ -3,6 +3,16 @@
 import json
 import queue
 
+from app_manifest.primitives import AppName
+from workspace_layout.answers import LayoutOpMessage
+from workspace_layout.answers import LayoutOpMessageArgs
+from workspace_layout.primitives import ClientId
+from workspace_layout.primitives import LayoutOp
+from workspace_layout.primitives import WindowId
+from workspace_layout.testing import fake_app
+from workspace_layout.testing import fake_desktop
+
+from imbue.system_interface.ws_broadcaster import ConnectionRegistration
 from imbue.system_interface.ws_broadcaster import WebSocketBroadcaster
 from imbue.system_interface.ws_broadcaster import _CLIENT_QUEUE_MAX_SIZE
 from imbue.system_interface.ws_broadcaster import _MAX_CONSECUTIVE_QUEUE_FULL
@@ -11,6 +21,15 @@ from imbue.system_interface.ws_broadcaster import _MAX_CONSECUTIVE_QUEUE_FULL
 # before the broadcaster evicts it. The first ``_CLIENT_QUEUE_MAX_SIZE``
 # broadcasts fill the queue without overflow; broadcasts after that overflow.
 _BROADCASTS_TO_TRIGGER_DISCONNECT = _CLIENT_QUEUE_MAX_SIZE + _MAX_CONSECUTIVE_QUEUE_FULL
+
+
+_WINDOW = WindowId("win-0000000000000001")
+
+
+def _message(
+    op: LayoutOp, args: LayoutOpMessageArgs, requester: str, target_client_id: ClientId | None = None
+) -> LayoutOpMessage:
+    return LayoutOpMessage(op=op, args=args, requester=requester, target_client_id=target_client_id)
 
 
 def _get_message(q: queue.Queue[str | None]) -> str:
@@ -58,62 +77,59 @@ def test_broadcast_apps_updated() -> None:
     broadcaster = WebSocketBroadcaster()
     q = broadcaster.register()
 
-    apps = [{"name": "web", "url": "http://localhost:8000"}]
+    apps = [fake_app("web")]
     broadcaster.broadcast_apps_updated(apps)
 
     msg = json.loads(_get_message(q))
     assert msg["type"] == "apps_updated"
-    assert msg["apps"] == apps
+    assert msg["apps"] == [app.model_dump(mode="json") for app in apps]
 
 
-def test_broadcast_layout_op_open() -> None:
+def test_broadcast_layout_op_refresh_of_a_window() -> None:
     broadcaster = WebSocketBroadcaster()
     q = broadcaster.register()
 
-    broadcaster.broadcast_layout_op("open", {"ref": "service:web"}, requester="app:chat?instance=agent-1")
+    broadcaster.broadcast_layout_op(_message(LayoutOp.REFRESH, LayoutOpMessageArgs(window=_WINDOW), "chat:agent-1"))
 
     msg = json.loads(_get_message(q))
     assert msg == {
         "type": "layout_op",
-        "op": "open",
-        "args": {"ref": "service:web"},
-        "requester": "app:chat?instance=agent-1",
+        "op": "refresh",
+        "args": {"window": "win-0000000000000001"},
+        "requester": "chat:agent-1",
         "target_client_id": None,
     }
 
 
-def test_broadcast_layout_op_passes_args_through_unchanged() -> None:
-    """Each op gets a distinct ``args`` payload; the broadcaster should not interpret it."""
+def test_broadcast_layout_op_carries_only_what_the_op_is_about() -> None:
+    """A message's ``args`` name the window or app it is about and nothing else, so a page reading one key never
+    sees another op's keys as nulls."""
     broadcaster = WebSocketBroadcaster()
     q = broadcaster.register()
 
-    payload = {
-        "ref": "service:web",
-        "relative_to": "chat:alice",
-        "direction": "right",
-        "ratio": 0.5,
-    }
-    broadcaster.broadcast_layout_op("split", payload, requester="app:chat?instance=agent-2")
+    broadcaster.broadcast_layout_op(
+        _message(LayoutOp.REFRESH, LayoutOpMessageArgs(app=AppName("files")), "chat:agent-2")
+    )
+    broadcaster.broadcast_layout_op(_message(LayoutOp.RELOAD_SYSTEM_INTERFACE, LayoutOpMessageArgs(), "chat"))
+    broadcaster.broadcast_layout_op(
+        _message(LayoutOp.SHOW, LayoutOpMessageArgs(window=_WINDOW, is_detached=False), "chat")
+    )
 
-    msg = json.loads(_get_message(q))
-    assert msg == {
+    assert json.loads(_get_message(q)) == {
         "type": "layout_op",
-        "op": "split",
-        "args": payload,
-        "requester": "app:chat?instance=agent-2",
+        "op": "refresh",
+        "args": {"app": "files"},
+        "requester": "chat:agent-2",
         "target_client_id": None,
     }
-
-
-def test_broadcast_layout_op_defaults_the_requester_to_an_empty_string() -> None:
-    """``requester`` is optional; omitting it yields an empty string."""
-    broadcaster = WebSocketBroadcaster()
-    q = broadcaster.register()
-
-    broadcaster.broadcast_layout_op("restore", {})
-
-    msg = json.loads(_get_message(q))
-    assert msg["requester"] == ""
+    assert json.loads(_get_message(q)) == {
+        "type": "layout_op",
+        "op": "reload_system_interface",
+        "args": {},
+        "requester": "chat",
+        "target_client_id": None,
+    }
+    assert json.loads(_get_message(q))["args"] == {"window": _WINDOW, "is_detached": False}
 
 
 def test_shutdown_sends_none_sentinel() -> None:
@@ -261,26 +277,6 @@ def test_evicted_client_receives_shutdown_sentinel() -> None:
     assert stuck_queue.get_nowait() is None
 
 
-def test_broadcast_projects_updated_and_tab_rebound_are_typed_events() -> None:
-    broadcaster = WebSocketBroadcaster()
-    client_queue = broadcaster.register()
-
-    broadcaster.broadcast_projects_updated([{"id": "p1"}])
-    broadcaster.broadcast_tab_rebound("client-1", "everything", "tab-0123456789abcdef", "app:terminal?instance=k")
-
-    assert json.loads(_get_message(client_queue)) == {
-        "type": "projects_updated",
-        "projects": [{"id": "p1"}],
-    }
-    assert json.loads(_get_message(client_queue)) == {
-        "type": "tab_rebound",
-        "client_id": "client-1",
-        "view_id": "everything",
-        "tab_id": "tab-0123456789abcdef",
-        "address": "app:terminal?instance=k",
-    }
-
-
 def test_shutdown_delivers_sentinel_even_to_full_queue() -> None:
     """Shutdown must signal even clients whose queues happen to be full."""
     broadcaster = WebSocketBroadcaster()
@@ -299,23 +295,43 @@ def test_shutdown_delivers_sentinel_even_to_full_queue() -> None:
     assert drained[-1] is None
 
 
-def test_set_client_info_and_view_lookup() -> None:
+def test_set_client_info_and_desktop_lookup() -> None:
     broadcaster = WebSocketBroadcaster()
     first_queue = broadcaster.register()
     broadcaster.register()
 
-    broadcaster.set_client_info(first_queue, "client-1", "everything", "desktop")
+    broadcaster.set_client_info(first_queue, "client-1", "home")
 
     assert broadcaster.connected_client_ids() == {"client-1"}
-    infos = broadcaster.get_connected_client_infos()
-    assert infos == [{"client_id": "client-1", "active_view": "everything", "device_kind": "desktop"}]
+    assert broadcaster.get_connected_client_infos() == [
+        ConnectionRegistration(client_id="client-1", active_desktop="home", is_pop_out=False)
+    ]
+
+
+def test_a_pop_out_registration_is_targeted_and_connected_but_names_no_desktop() -> None:
+    broadcaster = WebSocketBroadcaster()
+    pop_out_queue = broadcaster.register()
+    other_queue = broadcaster.register()
+    broadcaster.set_pop_out_info(pop_out_queue, "client-1")
+    broadcaster.set_client_info(other_queue, "client-2", "home")
+
+    broadcaster.broadcast_layout_op(
+        _message(LayoutOp.REFRESH, LayoutOpMessageArgs(window=_WINDOW), "", ClientId("client-1"))
+    )
+
+    assert json.loads(_get_message(pop_out_queue))["target_client_id"] == "client-1"
+    assert other_queue.empty()
+    assert broadcaster.connected_client_ids() == {"client-1", "client-2"}
+    assert broadcaster.get_client_info(pop_out_queue) == ConnectionRegistration(
+        client_id="client-1", active_desktop="", is_pop_out=True
+    )
 
 
 def test_set_client_info_ignores_unregistered_queue() -> None:
     broadcaster = WebSocketBroadcaster()
     stray_queue: queue.Queue[str | None] = queue.Queue()
 
-    broadcaster.set_client_info(stray_queue, "client-1", "everything", "desktop")
+    broadcaster.set_client_info(stray_queue, "client-1", "home")
 
     assert broadcaster.get_connected_client_infos() == []
 
@@ -323,7 +339,7 @@ def test_set_client_info_ignores_unregistered_queue() -> None:
 def test_unregister_drops_client_info() -> None:
     broadcaster = WebSocketBroadcaster()
     client_queue = broadcaster.register()
-    broadcaster.set_client_info(client_queue, "client-1", "everything", "desktop")
+    broadcaster.set_client_info(client_queue, "client-1", "home")
 
     broadcaster.unregister(client_queue)
 
@@ -334,9 +350,11 @@ def test_broadcast_layout_op_without_target_reaches_everyone() -> None:
     broadcaster = WebSocketBroadcaster()
     desktop_queue = broadcaster.register()
     unregistered_queue = broadcaster.register()
-    broadcaster.set_client_info(desktop_queue, "client-1", "everything", "desktop")
+    broadcaster.set_client_info(desktop_queue, "client-1", "home")
 
-    broadcaster.broadcast_layout_op("refresh", {"address": "app:files"}, "agent-1")
+    broadcaster.broadcast_layout_op(
+        _message(LayoutOp.REFRESH, LayoutOpMessageArgs(app=AppName("files")), "chat:agent-1")
+    )
 
     assert json.loads(_get_message(desktop_queue))["op"] == "refresh"
     assert json.loads(_get_message(unregistered_queue))["op"] == "refresh"
@@ -348,37 +366,44 @@ def test_broadcast_to_client_reaches_every_window_of_that_client_only() -> None:
     second_window = broadcaster.register()
     other_client = broadcaster.register()
     unregistered_queue = broadcaster.register()
-    broadcaster.set_client_info(first_window, "client-1", "everything", "desktop")
-    broadcaster.set_client_info(second_window, "client-1", "project-1", "desktop")
-    broadcaster.set_client_info(other_client, "client-2", "project-1", "mobile")
+    broadcaster.set_client_info(first_window, "client-1", "home")
+    broadcaster.set_client_info(second_window, "client-1", "home")
+    broadcaster.set_client_info(other_client, "client-2", "home")
 
     broadcaster.broadcast_layout_op(
-        "maximize", {"address": "app:files"}, "app:chat?instance=agent-1", target_client_id="client-1"
+        _message(LayoutOp.REFRESH, LayoutOpMessageArgs(window=_WINDOW), "chat:agent-1", ClientId("client-1"))
     )
 
     for window in (first_window, second_window):
         message = json.loads(_get_message(window))
-        assert message["op"] == "maximize" and message["target_client_id"] == "client-1"
+        assert message["op"] == "refresh" and message["target_client_id"] == "client-1"
     assert other_client.empty()
     # A window that never registered its client is not targeted either.
     assert unregistered_queue.empty()
 
 
-def test_layout_updated_and_active_view_changed_are_typed_events() -> None:
+def test_desktops_placements_and_active_desktop_events_are_typed() -> None:
     broadcaster = WebSocketBroadcaster()
     client_queue = broadcaster.register()
 
-    broadcaster.broadcast_layout_updated("project-1", "client-1", "save-0123456789abcdef")
-    broadcaster.broadcast_active_view_changed("client-1", "project-1")
+    broadcaster.broadcast_desktops_updated([fake_desktop("home")])
+    broadcaster.broadcast_placements_updated("home", "client-1", "save-0123456789abcdef")
+    broadcaster.broadcast_active_desktop_changed("client-1", "home", 3, "report-0123456789abcdef")
 
     assert json.loads(_get_message(client_queue)) == {
-        "type": "layout_updated",
-        "view_id": "project-1",
+        "type": "desktops_updated",
+        "desktops": [fake_desktop("home").model_dump(mode="json")],
+    }
+    assert json.loads(_get_message(client_queue)) == {
+        "type": "placements_updated",
+        "desktop_id": "home",
         "client_id": "client-1",
         "save_id": "save-0123456789abcdef",
     }
     assert json.loads(_get_message(client_queue)) == {
-        "type": "active_view_changed",
+        "type": "active_desktop_changed",
         "client_id": "client-1",
-        "view_id": "project-1",
+        "desktop_id": "home",
+        "revision": 3,
+        "report_id": "report-0123456789abcdef",
     }

@@ -52,6 +52,30 @@ describe("placeTooltip", () => {
   });
 });
 
+describe("placeTooltip above placement", () => {
+  it("centers the bubble over the trigger with a 6px gap", () => {
+    const anchor = { left: 400, top: 300, bottom: 320, width: 40 };
+    expect(placeTooltip(anchor, BUBBLE, VIEWPORT, "above")).toEqual({ left: 370, top: 274 });
+  });
+
+  it("flips below the trigger when the bubble would overflow the top", () => {
+    const anchor = { left: 400, top: 10, bottom: 40, width: 40 };
+    expect(placeTooltip(anchor, BUBBLE, VIEWPORT, "above")).toEqual({ left: 370, top: 46 });
+  });
+
+  it("stays above when flipping below would not fit either", () => {
+    // A trigger taller than the viewport: neither side has room, so only the edge clamp
+    // applies.
+    const anchor = { left: 400, top: 5, bottom: 795, width: 40 };
+    expect(placeTooltip(anchor, BUBBLE, VIEWPORT, "above")).toEqual({ left: 370, top: 6 });
+  });
+
+  it("clamps to 6px from the right edge for a trigger against it", () => {
+    const anchor = { left: 980, top: 300, bottom: 320, width: 20 };
+    expect(placeTooltip(anchor, BUBBLE, VIEWPORT, "above").left).toBe(894);
+  });
+});
+
 describe("placeTooltip right placement", () => {
   it("sits beside the trigger with a 6px gap, vertically centered on it", () => {
     const anchor = { left: 400, top: 300, bottom: 320, width: 40 };
@@ -140,6 +164,15 @@ describe("hoverTooltipAttrs", () => {
     expect(hoverTooltipText(button)).toBe("Start");
   });
 
+  it("shows its bubble as the contract's tooltip part", () => {
+    vi.useFakeTimers();
+    const button = renderButton("Start");
+    hoverTooltip(button);
+
+    expect(document.querySelector<HTMLElement>(".hover-tooltip")?.dataset.part).toBe("tooltip");
+    unhoverTooltip(button);
+  });
+
   it("answers a hover over anything inside the trigger", () => {
     vi.useFakeTimers();
     const button = renderButton("Start");
@@ -165,6 +198,43 @@ describe("hoverTooltipAttrs", () => {
 
     // Leaving and coming back does bring it back.
     expect(hoverTooltipText(button)).toBe("Start");
+  });
+
+  it("shows an optional second line under the first, in its own quieter text", () => {
+    vi.useFakeTimers();
+    m.render(
+      root,
+      m("button", { ...hoverTooltipAttrs("Up to date", "below", { detail: "Synced at 9:30 AM" }) }, "Go"),
+    );
+    const button = root.firstElementChild as HTMLElement;
+    hoverTooltip(button);
+    const bubble = document.querySelector<HTMLElement>(".hover-tooltip")!;
+    expect(bubble.style.flexDirection).toBe("column");
+    expect(bubble.querySelector(".hover-tooltip-detail")?.textContent).toBe("Synced at 9:30 AM");
+    expect(bubble.firstElementChild?.textContent).toBe("Up to date");
+    unhoverTooltip(button);
+
+    // The next tooltip with one line is one line again.
+    const single = renderButton("Start");
+    hoverTooltip(single);
+    expect(bubble.style.flexDirection).toBe("");
+    expect(bubble.querySelector(".hover-tooltip-detail")).toBeNull();
+    expect(shownTooltipText()).toBe("Start");
+    unhoverTooltip(single);
+  });
+
+  it("follows a change to the second line alone while the bubble is up", async () => {
+    vi.useFakeTimers();
+    const render = (detail: string): HTMLElement => {
+      m.render(root, m("button", { ...hoverTooltipAttrs("Syncing", "below", { detail }) }, "Go"));
+      return root.firstElementChild as HTMLElement;
+    };
+    const button = render("10% done");
+    hoverTooltip(button);
+    expect(render("40% done")).toBe(button);
+    await Promise.resolve();
+    expect(document.querySelector(".hover-tooltip-detail")?.textContent).toBe("40% done");
+    unhoverTooltip(button);
   });
 
   it("follows a text change on its trigger while the bubble is up", async () => {
@@ -229,6 +299,45 @@ describe("hoverTooltipAttrs", () => {
     button.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
     expect(shownTooltipText()).toBeNull();
     elsewhere.remove();
+  });
+
+  it("hangs the bubble off the trigger's top edge when it asks to sit above", () => {
+    vi.useFakeTimers();
+    // jsdom measures every element as zero-sized, so the trigger's box is stubbed and the bubble's
+    // stays empty: the two placements then differ only in which edge they hang the 6px gap off,
+    // which is exactly the wiring under test.
+    const box = { left: 400, top: 300, bottom: 320, width: 40, height: 20 } as DOMRect;
+    m.render(root, m("button", { ...hoverTooltipAttrs("Plan", "above") }, m("span", "Go")));
+    const button = root.firstElementChild as HTMLElement;
+    button.getBoundingClientRect = () => box;
+    hoverTooltip(button);
+    const bubble = document.querySelector<HTMLElement>(".hover-tooltip")!;
+    expect(bubble.style.top).toBe("294px");
+    unhoverTooltip(button);
+
+    // The default is unchanged: under the trigger, same gap.
+    m.render(root, m("button", { ...hoverTooltipAttrs("Plan") }, m("span", "Go")));
+    const belowTrigger = root.firstElementChild as HTMLElement;
+    belowTrigger.getBoundingClientRect = () => box;
+    hoverTooltip(belowTrigger);
+    expect(bubble.style.top).toBe("326px");
+    unhoverTooltip(belowTrigger);
+  });
+
+  it("wraps at the width a trigger asks for, and at the shared one otherwise", () => {
+    vi.useFakeTimers();
+    m.render(root, m("button", { ...hoverTooltipAttrs("A longer explanation", "right", { maxWidth: 220 }) }));
+    const narrow = root.firstElementChild as HTMLElement;
+    hoverTooltip(narrow);
+    const bubble = document.querySelector<HTMLElement>(".hover-tooltip")!;
+    expect(bubble.style.maxWidth).toBe("220px");
+    unhoverTooltip(narrow);
+
+    m.render(root, m("button", { ...hoverTooltipAttrs("Plan") }));
+    const plain = root.firstElementChild as HTMLElement;
+    hoverTooltip(plain);
+    expect(bubble.style.maxWidth).toBe("");
+    unhoverTooltip(plain);
   });
 
   it("stops offering a tooltip an imperative caller takes back", () => {

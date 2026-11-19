@@ -15,13 +15,17 @@ from pathlib import Path
 from typing import Final
 from uuid import uuid4
 
+from env_converge.converge import DEFAULT_WORKSPACE_DIR, capture_unless_fresh_rootfs
+from env_converge.record import EnvConvergeError, default_record_dir
 from loguru import logger
 
 from host_backup.capabilities import BackupCapabilities, detect_backup_capabilities
 from host_backup.config import (
     BACKUP_TOML_PATH,
+    HOST_BACKUP_README_PATH,
     PRUNE_TIMESTAMP_PATH,
     RESTIC_ENV_PATH,
+    SLOW_BACKUP_NOTICE_TIMESTAMP_PATH,
     BackupConfig,
     get_events_dir,
     load_backup_config,
@@ -29,10 +33,19 @@ from host_backup.config import (
     missing_required_restic_keys,
     publish_service_events_dir,
 )
-from host_backup.events import BackupEventType, make_event, write_event
+from host_backup.events import (
+    BACKUP_FAILURE_REASON_QUOTA_EXCEEDED,
+    BackupEventType,
+    make_event,
+    record_abandoned_tick,
+    rotate_events_log_if_over,
+    write_event,
+)
 from host_backup.restic import (
     RESTORE_MARKER_TAGS,
     extract_snapshot_id_from_backup_output,
+    find_backup_summary,
+    is_quota_exceeded_error,
     is_repo_locked_error,
 )
 from host_backup.restic import backup as restic_backup
@@ -49,6 +62,7 @@ from host_backup.snapshot import (
     SnapshotResult,
     make_snapshot_taker,
 )
+from host_backup.usage import StoreUsage, read_store_usage
 
 LOG_FILE = Path("/tmp/host-backup.log")
 
@@ -56,21 +70,25 @@ LOG_FILE = Path("/tmp/host-backup.log")
 # durable alarm so a silent multi-day backup outage cannot go unnoticed.
 CONSECUTIVE_FAILURE_ALARM_THRESHOLD: Final[int] = 3
 
-# Where `uv run env-converge capture` resolves its venv from; matches the
-# host-backup program's `directory=` in system/supervisord.conf.d/host-backup.conf,
-# made explicit so the capture also works when the runner is launched from
-# another cwd.
-WORKSPACE_DIR: Final[Path] = Path("/home/user/workspace")
+SLOW_BACKUP_NOTICE_INTERVAL_SECONDS: Final[float] = 24 * 3600.0
 
-# Hard ceiling for the pre-snapshot `env-converge capture` refresh. The probes
-# (dpkg/npm/uv listings) normally take a few seconds; a wedged probe must not
-# stall the backup cadence.
-ENV_RECORD_CAPTURE_TIMEOUT_SECONDS: Final[float] = 120.0
+SLOW_BACKUP_HINT: Final[str] = (
+    "Backup time follows how many files and directories the backup walks, not "
+    "their size. Run `uv run --no-sync host-backup-heavy-dirs` to see which "
+    f"directories hold them, and read 'Slow backups' in {HOST_BACKUP_README_PATH}."
+)
 
-# The restic-call signatures the backup step depends on, injected so the
-# orchestration can be unit-tested without shelling out to restic.
+# The restic-call signatures the backup and retention steps depend on, injected so
+# the orchestration can be unit-tested without shelling out to restic.
 BackupFn = Callable[..., subprocess.CompletedProcess[str]]
+ForgetFn = Callable[..., subprocess.CompletedProcess[str]]
+ForgetIdsFn = Callable[
+    [tuple[str, ...], Mapping[str, str]], subprocess.CompletedProcess[str]
+]
+PruneFn = Callable[..., subprocess.CompletedProcess[str]]
 UnlockFn = Callable[..., subprocess.CompletedProcess[str]]
+UsageFn = Callable[[Mapping[str, str]], StoreUsage | None]
+FreeSpaceFn = Callable[..., None]
 
 
 def main() -> None:
@@ -102,6 +120,7 @@ def _run_loop(capabilities: BackupCapabilities) -> None:
             trigger_dir=str(capabilities.trigger_dir),
         ),
     )
+    record_abandoned_tick(state.events_dir)
     while True:
         try:
             _service_iteration(state)
@@ -200,7 +219,7 @@ def _should_tick_now(
     Reasons: 'startup' (first tick after process start), 'config_change'
     (either file's mtime differs from last seen -- including the file
     appearing or disappearing, since neither file exists until written:
-    minds injects restic.env and host-backup-now may create backup.toml),
+    Imbue Studio injects restic.env and host-backup-now may create backup.toml),
     'interval' (the wall-clock backup interval elapsed).
     """
     if state.last_tick_end_monotonic is None:
@@ -217,11 +236,65 @@ def _should_tick_now(
     return False, "interval_not_elapsed"
 
 
+def _free_space_over_quota(
+    *,
+    state: _LoopState,
+    config: BackupConfig,
+    env_overrides: Mapping[str, str],
+    usage: StoreUsage,
+    forget_fn: ForgetFn = restic_forget,
+    prune_fn: PruneFn = restic_prune,
+    unlock_fn: UnlockFn = restic_unlock,
+) -> None:
+    """The over-quota tick: no backup; the retention forget and a bounded prune instead.
+
+    Emits BACKUP_SKIPPED_OVER_QUOTA (which ends the tick, like a backup outcome)
+    and then reclaims what it can. The prune repacks at most half the headroom
+    between the soft and hard limits, so its transient growth always fits under
+    the hard limit the store enforces; repeated ticks finish the job.
+    """
+    logger.warning(
+        "Skipping the backup: the account's backup storage is over quota "
+        "({} of {} bytes used); running forget and a bounded prune to free space",
+        usage.account_used_bytes,
+        usage.quota_bytes,
+    )
+    write_event(
+        state.events_dir,
+        make_event(
+            BackupEventType.BACKUP_SKIPPED_OVER_QUOTA,
+            tick_id=state.current_tick_id,
+            used_bytes=usage.used_bytes,
+            account_used_bytes=usage.account_used_bytes,
+            quota_bytes=usage.quota_bytes,
+            hard_limit_bytes=usage.hard_limit_bytes,
+        ),
+    )
+    _run_forget(
+        state=state,
+        config=config,
+        env_overrides=env_overrides,
+        forget_fn=forget_fn,
+        unlock_fn=unlock_fn,
+    )
+    _maybe_run_prune(
+        state=state,
+        config=config,
+        env_overrides=env_overrides,
+        prune_fn=prune_fn,
+        unlock_fn=unlock_fn,
+        is_forced=True,
+        max_repack_bytes=usage.headroom_bytes // 2,
+    )
+
+
 def _run_one_tick(
     *,
     state: _LoopState,
     config: BackupConfig,
     trigger_reason: str,
+    usage_fn: UsageFn = read_store_usage,
+    free_space_fn: FreeSpaceFn = _free_space_over_quota,
 ) -> None:
     """Run one full backup tick.
 
@@ -235,6 +308,8 @@ def _run_one_tick(
     backup_mtime = _safe_mtime(BACKUP_TOML_PATH) or 0.0
     env_mtime = _safe_mtime(RESTIC_ENV_PATH)
 
+    # Only here, so a tick's events never span two files.
+    rotate_events_log_if_over(state.events_dir)
     write_event(
         state.events_dir,
         make_event(
@@ -258,9 +333,19 @@ def _run_one_tick(
         return
     # restic.env is the overlay restic runs with: RESTIC_REPOSITORY plus every
     # credential restic reads from the environment. The repository is created
-    # (and keyed) by the minds app, so host_backup just backs up to it -- it
+    # (and keyed) by Imbue Studio, so host_backup just backs up to it -- it
     # never probes-then-inits the repo itself.
     env_overrides = dict(env)
+    # The backup store refuses data uploads past the account's hard limit, and
+    # restic can only free space by writing (a prune repacks). So a tick asks
+    # the store first and, over the soft quota, frees space instead of trying
+    # to back up into the headroom the prune needs.
+    usage = usage_fn(env)
+    if usage is not None and usage.is_over_soft_limit:
+        free_space_fn(
+            state=state, config=config, env_overrides=env_overrides, usage=usage
+        )
+        return
     _refresh_environment_record(state=state)
     snapshot_result = _take_snapshot(state=state)
     if snapshot_result is None:
@@ -287,9 +372,7 @@ def _run_one_tick(
     _maybe_run_prune(state=state, config=config, env_overrides=env_overrides)
 
 
-# ---------------------------------------------------------------------------
 # Per-step helpers
-# ---------------------------------------------------------------------------
 
 
 def _check_secrets_present(*, state: _LoopState) -> dict[str, str] | None:
@@ -310,10 +393,17 @@ def _check_secrets_present(*, state: _LoopState) -> dict[str, str] | None:
     return env
 
 
+def _capture_environment_record() -> None:
+    """``env-converge capture``'s work, in this process: re-capture the record unless the rootfs is fresh."""
+    capture_unless_fresh_rootfs(
+        default_record_dir(), DEFAULT_WORKSPACE_DIR, is_forced=False
+    )
+
+
 def _refresh_environment_record(
     *,
     state: _LoopState,
-    run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    capture_fn: Callable[[], None] = _capture_environment_record,
 ) -> None:
     """Re-capture the environment record so the snapshot carries current package state.
 
@@ -324,41 +414,29 @@ def _refresh_environment_record(
     (npm globals, uv tools) are otherwise only refreshed at boot; without this,
     anything installed since boot would be missing from a restored workspace.
 
-    Best-effort by design: capture is read-only and takes seconds, and a
-    failure (or absent env-converge, e.g. a pre-cutover workspace) must never
-    block the backup itself -- a slightly stale record beats no backup.
+    Best-effort by design: capture is read-only, each of its probes has its own
+    timeout, and a failure must never block the backup itself -- a slightly
+    stale record beats no backup.
     """
     start = time.monotonic()
-    exit_code: int | None = None
-    stderr = ""
+    error_message = ""
     try:
-        result = run_fn(
-            ["uv", "run", "env-converge", "capture"],
-            cwd=WORKSPACE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=ENV_RECORD_CAPTURE_TIMEOUT_SECONDS,
-            check=False,
-        )
-        exit_code = result.returncode
-        stderr = result.stderr.strip()[-500:]
-    except (OSError, subprocess.TimeoutExpired) as e:
-        stderr = str(e)[-500:]
+        capture_fn()
+        success = True
+    except (EnvConvergeError, OSError, ValueError) as e:
+        success = False
+        error_message = str(e)[-500:]
     duration = time.monotonic() - start
-    success = exit_code == 0
     if not success:
-        logger.warning(
-            "Pre-snapshot env-converge capture failed (rc={}): {}", exit_code, stderr
-        )
+        logger.warning("Pre-snapshot env-converge capture failed: {}", error_message)
     write_event(
         state.events_dir,
         make_event(
             BackupEventType.ENV_RECORD_CAPTURE_COMPLETED,
             tick_id=state.current_tick_id,
             success=success,
-            exit_code=exit_code,
             duration_seconds=duration,
-            stderr="" if success else stderr,
+            error_message=error_message,
         ),
     )
 
@@ -482,16 +560,26 @@ def _run_restic_backup(
     an outage cannot pass silently. `backup_fn`/`unlock_fn` are injected for tests.
     """
     tag = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    result, duration = _attempt_backup_with_unlock_retry(
-        snapshot=snapshot,
-        excludes=config.excludes,
-        tag=tag,
+    start = time.monotonic()
+    result = _run_with_unlock_retry(
+        operation="backup",
+        run=lambda: backup_fn(
+            source_path=snapshot.read_path,
+            excludes=config.effective_excludes,
+            tag=tag,
+            env_overrides=env_overrides,
+        ),
         env_overrides=env_overrides,
-        backup_fn=backup_fn,
         unlock_fn=unlock_fn,
     )
+    duration = time.monotonic() - start
     if result.returncode != 0:
         state.consecutive_backup_failures += 1
+        reason = (
+            BACKUP_FAILURE_REASON_QUOTA_EXCEEDED
+            if is_quota_exceeded_error(result.stderr)
+            else ""
+        )
         write_event(
             state.events_dir,
             make_event(
@@ -503,6 +591,7 @@ def _run_restic_backup(
                 stdout=result.stdout,
                 stderr=result.stderr,
                 consecutive_failures=state.consecutive_backup_failures,
+                reason=reason,
             ),
         )
         logger.error(
@@ -524,52 +613,92 @@ def _run_restic_backup(
             stderr=result.stderr,
         ),
     )
+    _maybe_emit_slow_backup_notice(
+        state=state,
+        config=config,
+        duration_seconds=duration,
+        backup_stdout=result.stdout,
+    )
     return True
 
 
-def _attempt_backup_with_unlock_retry(
+def _maybe_emit_slow_backup_notice(
     *,
-    snapshot: SnapshotResult,
-    excludes: tuple[str, ...],
-    tag: str,
-    env_overrides: Mapping[str, str],
-    backup_fn: BackupFn,
-    unlock_fn: UnlockFn,
-) -> tuple[subprocess.CompletedProcess[str], float]:
-    """Run the backup, clearing a stale lock and retrying once if one blocks it.
+    state: _LoopState,
+    config: BackupConfig,
+    duration_seconds: float,
+    backup_stdout: str,
+) -> None:
+    """Record a BACKUP_SLOW event when the backup ran past the threshold, at most once a day.
 
-    Returns (final restic result, total elapsed seconds). Only a lock error
-    triggers the unlock; any other failure is returned as-is for the caller to
-    record.
+    The daily limit is kept in a timestamp file rather than in memory, so a
+    restarting service cannot repeat the notice every tick.
     """
-    start = time.monotonic()
-    result = backup_fn(
-        source_path=snapshot.read_path,
-        excludes=excludes,
-        tag=tag,
-        env_overrides=env_overrides,
+    if duration_seconds < config.slow_backup_threshold_seconds:
+        return
+    last_notice = _safe_mtime(SLOW_BACKUP_NOTICE_TIMESTAMP_PATH)
+    if (
+        last_notice is not None
+        and time.time() - last_notice < SLOW_BACKUP_NOTICE_INTERVAL_SECONDS
+    ):
+        return
+    summary = find_backup_summary(backup_stdout) or {}
+    logger.warning(
+        "restic backup took {:.0f}s (threshold {:.0f}s); see the backup_slow event",
+        duration_seconds,
+        config.slow_backup_threshold_seconds,
     )
-    if result.returncode != 0 and is_repo_locked_error(result.stderr):
+    write_event(
+        state.events_dir,
+        make_event(
+            BackupEventType.BACKUP_SLOW,
+            tick_id=state.current_tick_id,
+            duration_seconds=duration_seconds,
+            threshold_seconds=config.slow_backup_threshold_seconds,
+            total_files_processed=summary.get("total_files_processed"),
+            files_new=summary.get("files_new"),
+            files_changed=summary.get("files_changed"),
+            files_unmodified=summary.get("files_unmodified"),
+            dirs_unmodified=summary.get("dirs_unmodified"),
+            hint=SLOW_BACKUP_HINT,
+        ),
+    )
+    _write_timestamp_file(SLOW_BACKUP_NOTICE_TIMESTAMP_PATH)
+
+
+def _run_with_unlock_retry(
+    *,
+    operation: str,
+    run: Callable[[], subprocess.CompletedProcess[str]],
+    env_overrides: Mapping[str, str],
+    unlock_fn: UnlockFn,
+) -> subprocess.CompletedProcess[str]:
+    """Run a restic command, clearing stale locks and retrying once if one blocks it.
+
+    Only a lock error triggers the unlock; any other failure (and a failed
+    unlock) returns the first result as-is for the caller to record.
+
+    forget and prune need an exclusive lock, which restic refuses while ANY other
+    lock exists, stale or not. A non-exclusive lock a dead container left behind
+    never blocks a backup, so these steps are the ones that meet it.
+    """
+    result = run()
+    if result.returncode == 0 or not is_repo_locked_error(result.stderr):
+        return result
+    logger.warning(
+        "restic {} blocked by an existing repository lock; running "
+        "`restic unlock` to clear stale locks and retrying once",
+        operation,
+    )
+    unlock_result = unlock_fn(env_overrides=env_overrides)
+    if unlock_result.returncode != 0:
         logger.warning(
-            "restic backup blocked by an existing repository lock; running "
-            "`restic unlock` to clear stale locks and retrying once"
+            "restic unlock failed (rc={}): {}",
+            unlock_result.returncode,
+            unlock_result.stderr.strip(),
         )
-        unlock_result = unlock_fn(env_overrides=env_overrides)
-        if unlock_result.returncode != 0:
-            logger.warning(
-                "restic unlock failed (rc={}): {}",
-                unlock_result.returncode,
-                unlock_result.stderr.strip(),
-            )
-        else:
-            result = backup_fn(
-                source_path=snapshot.read_path,
-                excludes=excludes,
-                tag=tag,
-                env_overrides=env_overrides,
-            )
-    duration = time.monotonic() - start
-    return result, duration
+        return result
+    return run()
 
 
 def _maybe_emit_repeated_failure_alarm(state: _LoopState) -> None:
@@ -597,15 +726,22 @@ def _run_forget(
     state: _LoopState,
     config: BackupConfig,
     env_overrides: Mapping[str, str],
+    forget_fn: ForgetFn = restic_forget,
+    unlock_fn: UnlockFn = restic_unlock,
 ) -> None:
     """Run `restic forget` (no prune); always emit FORGET_COMPLETED."""
     start = time.monotonic()
-    result = restic_forget(
-        keep_hourly=config.retention.keep_hourly,
-        keep_daily=config.retention.keep_daily,
-        keep_weekly=config.retention.keep_weekly,
-        keep_monthly=config.retention.keep_monthly,
+    result = _run_with_unlock_retry(
+        operation="forget",
+        run=lambda: forget_fn(
+            keep_hourly=config.retention.keep_hourly,
+            keep_daily=config.retention.keep_daily,
+            keep_weekly=config.retention.keep_weekly,
+            keep_monthly=config.retention.keep_monthly,
+            env_overrides=env_overrides,
+        ),
         env_overrides=env_overrides,
+        unlock_fn=unlock_fn,
     )
     duration = time.monotonic() - start
     write_event(
@@ -656,9 +792,8 @@ def _age_out_restore_markers(
     list_fn: Callable[
         [tuple[str, ...], Mapping[str, str]], subprocess.CompletedProcess[str]
     ] = restic_list_snapshots_with_any_tag,
-    forget_ids_fn: Callable[
-        [tuple[str, ...], Mapping[str, str]], subprocess.CompletedProcess[str]
-    ] = restic_forget_snapshot_ids,
+    forget_ids_fn: ForgetIdsFn = restic_forget_snapshot_ids,
+    unlock_fn: UnlockFn = restic_unlock,
     now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> None:
     """Forget restore-marker snapshots older than the configured cutoff.
@@ -707,7 +842,12 @@ def _age_out_restore_markers(
         return
 
     start = time.monotonic()
-    result = forget_ids_fn(tuple(expired_ids), env_overrides)
+    result = _run_with_unlock_retry(
+        operation="forget of expired restore markers",
+        run=lambda: forget_ids_fn(tuple(expired_ids), env_overrides),
+        env_overrides=env_overrides,
+        unlock_fn=unlock_fn,
+    )
     duration = time.monotonic() - start
     write_event(
         state.events_dir,
@@ -735,12 +875,18 @@ def _maybe_run_prune(
     state: _LoopState,
     config: BackupConfig,
     env_overrides: Mapping[str, str],
+    prune_fn: PruneFn = restic_prune,
+    unlock_fn: UnlockFn = restic_unlock,
+    # The over-quota tick prunes to free space now, whatever the gate says.
+    is_forced: bool = False,
+    # Caps restic's repacking (`--max-repack-size`); None leaves it unbounded.
+    max_repack_bytes: int | None = None,
 ) -> None:
-    """Run `restic prune` iff the gate file is older than prune_interval_hours."""
+    """Run `restic prune` iff the gate file is older than prune_interval_hours (or forced)."""
     interval_seconds = config.retention.prune_interval_hours * 3600.0
     last_prune = _safe_mtime(PRUNE_TIMESTAMP_PATH)
     now = time.time()
-    if last_prune is not None:
+    if last_prune is not None and not is_forced:
         age_seconds = now - last_prune
         if age_seconds < interval_seconds:
             write_event(
@@ -754,7 +900,12 @@ def _maybe_run_prune(
             )
             return
     start = time.monotonic()
-    result = restic_prune(env_overrides)
+    result = _run_with_unlock_retry(
+        operation="prune",
+        run=lambda: prune_fn(env_overrides, max_repack_bytes=max_repack_bytes),
+        env_overrides=env_overrides,
+        unlock_fn=unlock_fn,
+    )
     duration = time.monotonic() - start
     write_event(
         state.events_dir,
@@ -768,22 +919,20 @@ def _maybe_run_prune(
         ),
     )
     if result.returncode == 0:
-        _touch_prune_timestamp()
+        _write_timestamp_file(PRUNE_TIMESTAMP_PATH)
     else:
         logger.warning(
             "restic prune failed (rc={}): {}", result.returncode, result.stderr.strip()
         )
 
 
-def _touch_prune_timestamp() -> None:
-    """Update PRUNE_TIMESTAMP_PATH to mark the prune as completed."""
+def _write_timestamp_file(path: Path) -> None:
+    """Write the current time to a gate file, whose mtime then records when it last fired."""
     try:
-        PRUNE_TIMESTAMP_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PRUNE_TIMESTAMP_PATH.write_text(datetime.now(timezone.utc).isoformat())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(datetime.now(timezone.utc).isoformat())
     except OSError as e:
-        logger.warning(
-            "Could not update prune timestamp at {}: {}", PRUNE_TIMESTAMP_PATH, e
-        )
+        logger.warning("Could not update timestamp file at {}: {}", path, e)
 
 
 def _emit_tick_error(state: _LoopState, e: Exception) -> None:

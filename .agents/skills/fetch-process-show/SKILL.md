@@ -38,23 +38,25 @@ Pick a short kebab-case slug `$SLUG` for the task (e.g. `fetch-emails`,
 Ask only what blocks (phase 1). Then a small research pass (phase 2) and a
 proposed plan (phase 3), with these data specifics:
 
-For external services, load the `latchkey` skill first (it documents auth flows,
-permission requests, and credential handling you need before running any
+For external services, load the `connect-external-service` skill first (it routes
+you to the user's connected accounts, a new connection, an MCP server, a key on
+a secret card, or the browser, and documents the permission requests and
+credential handling you need before running any
 `latchkey` command), then run:
 
 ```bash
-latchkey services list --viable
+latchkey services list
 latchkey services info <svc>   # REQUIRED for each obviously-involved service
 ```
 
-Running `info` is essential: `list --viable` only shows services that *could* be
-authenticated (credentials exist *or* a browser auth flow is available); it
+Running `info` is essential: `list` only names the services latchkey knows; it
 doesn't tell you whether the specific service the user needs is already set up.
 Run `info` on each involved service to see its actual credential state and whether
 you'll need to trigger an auth flow next.
 
-For services not covered by latchkey, do 1-2 web/docs searches. Stop as soon as
-you can propose a plausible plan.
+For a service latchkey does not cover, the skill's routing table names the next
+row to try; 1-2 web/docs searches are enough to tell which is workable. Stop as
+soon as you can propose a plausible plan.
 
 Show the plan as two sections (phrase the data choices in business terms per the
 skeleton's principles):
@@ -87,13 +89,13 @@ on downstream components you'd have to discard if auth turns out unavailable. Fo
 multi-service asks, validate each uncontrolled dependency independently, then the
 combined operation.
 
-- Latchkey setup is part of the normal flow, NOT a failure. Follow the `latchkey`
-  skill for auth/permission handling.
+- Latchkey setup is part of the normal flow, NOT a failure. Follow the
+  `connect-external-service` skill for auth/permission handling.
 - A failure is when setup itself fails, or post-setup calls don't work. On
   failure, surface a specific cause AND propose 1-2 concrete alternatives before
   asking the user to choose.
 
-Keep validation code simple -- inline bash, `uv run python -c`, or short scripts
+Keep validation code simple -- inline bash, `uv run --no-sync python -c`, or short scripts
 under `data/.tasks/fetch-process-show/$SLUG/` if substantive.
 
 ## The sample loop (skeleton phase 5)
@@ -174,8 +176,9 @@ script-centric **skill**):
 1. **Kick off `crystallize-creation`** with `type=skill` and
    `source_artifacts_dir: data/.tasks/fetch-process-show/$SLUG/` in the task
    frontmatter, reusing `$SLUG` as its `$NAME`.
-2. **Launch the lead-proxy poll** (`run_in_background: true`) for worker reports,
-   per `crystallize-creation` Step 5 / `.agents/shared/references/lead-proxy.md`.
+2. **Launch the lead-proxy poll** (through `system/scripts/workspace_bare_scripts/run_in_background.py --waiter`)
+   for worker reports, per `crystallize-creation` Step 5 /
+   `.agents/shared/references/lead-proxy.md`.
    Do this *before* returning to the user. The poll does not block subsequent
    steps. Without it, Gate 1 / Gate 2 reports never reach the user and the worker
    deadlocks waiting for approval.
@@ -217,6 +220,11 @@ agree; this depends on the sample carrying the raw payload + source reference.
 own UI-mock confirmation (the data sample confirms the data *shape*, not the UI
 shape) and covers the same raw-data requirement, including rendering untrusted HTML
 safely. Hand it the confirmed `sample.json` so the mock renders real data.
+A surface rendering the sample is still a mock, however real its routes are:
+`build-app` keeps it inside its labeled mock frame, with a note saying it shows a
+sample and what does not work yet, until you point it at the pipeline's output.
+Only then take the frame down, with `build-app`'s `mock_frame.py down` (its
+Step 2).
 
 Additional surfaces (scheduling, persistence, history, live integration) each get
 their *own* delivery and feedback gate -- even when the user's original prompt
@@ -234,7 +242,7 @@ missing auth scope, the user changed their mind about which fields matter), send
 short note to the worker:
 
 ```bash
-uv run .agents/skills/launch-task/scripts/create_worker.py reply \
+uv run --no-sync .agents/skills/launch-task/scripts/create_worker.py reply \
     --task-file data/.tasks/harden/crystallize-$SLUG/task.md \
     -m "<short note about what changed>"
 ```

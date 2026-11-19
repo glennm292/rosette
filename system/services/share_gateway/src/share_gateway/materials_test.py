@@ -1,10 +1,19 @@
+import hashlib
+import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
+from share_gateway.materials import discard_signing_secret
 from share_gateway.materials import load_or_create_auth_label
 from share_gateway.materials import load_or_create_signing_secret
 from share_gateway.materials import parse_share_materials
 from share_gateway.materials import read_share_materials
+from share_gateway.materials import record_share_domain
+
+_TOK_123_DIGEST = hashlib.sha256(b"tok-123").hexdigest()
 
 _VALID = """
 export SHARE_WORKSPACE_DOMAIN=host-aaaa.bbbb.us1.imbueminds.com
@@ -26,9 +35,7 @@ def test_parse_share_materials_reads_all_fields() -> None:
 
 
 def test_parse_share_materials_defaults_chrome_origin_to_empty_when_absent() -> None:
-    without_chrome = "\n".join(
-        line for line in _VALID.splitlines() if "SHARE_CHROME_ORIGIN" not in line
-    )
+    without_chrome = "\n".join(line for line in _VALID.splitlines() if "SHARE_CHROME_ORIGIN" not in line)
     materials = parse_share_materials(without_chrome)
     assert materials is not None
     assert materials.chrome_origin == ""
@@ -37,7 +44,7 @@ def test_parse_share_materials_defaults_chrome_origin_to_empty_when_absent() -> 
 def test_parse_share_materials_rejects_missing_or_malformed_keys() -> None:
     assert parse_share_materials("") is None
     assert parse_share_materials("export SHARE_WORKSPACE_DOMAIN=x") is None
-    assert parse_share_materials(_VALID.replace('tok-123', "")) is None
+    assert parse_share_materials(_VALID.replace("tok-123", "")) is None
 
 
 def test_read_share_materials_handles_missing_file(tmp_path: Path) -> None:
@@ -49,13 +56,65 @@ def test_read_share_materials_handles_missing_file(tmp_path: Path) -> None:
     assert materials.relay_token == "tok-123"
 
 
-def test_signing_secret_is_created_once_and_reused(tmp_path: Path) -> None:
+def test_signing_secret_is_created_once_and_reused_under_the_same_relay_token(tmp_path: Path) -> None:
     secret_path = tmp_path / "signing_key"
-    first = load_or_create_signing_secret(secret_path)
-    second = load_or_create_signing_secret(secret_path)
+    first = load_or_create_signing_secret(secret_path, "tok-123")
+    second = load_or_create_signing_secret(secret_path, "tok-123")
     assert first == second
     assert len(first) > 32
     assert (secret_path.stat().st_mode & 0o777) == 0o600
+    # The file binds the secret to its share by a digest, never by the token itself.
+    assert "tok-123" not in secret_path.read_text()
+
+
+def test_signing_secret_minted_under_one_relay_token_is_replaced_under_another(tmp_path: Path) -> None:
+    # An unshare and re-share the runner was down for leaves the earlier share's secret on disk with
+    # materials present; the new share's relay token must not pick it up, or the old cookies would open it.
+    secret_path = tmp_path / "signing_key"
+    earlier_share = load_or_create_signing_secret(secret_path, "tok-123")
+
+    later_share = load_or_create_signing_secret(secret_path, "tok-456")
+
+    assert later_share != earlier_share
+    assert load_or_create_signing_secret(secret_path, "tok-456") == later_share
+    assert load_or_create_signing_secret(secret_path, "tok-123") != earlier_share
+
+
+@pytest.mark.parametrize(
+    "stored_text",
+    [
+        pytest.param("a-bare-secret-from-an-earlier-gateway", id="not-json"),
+        pytest.param('["a-bare-secret-from-an-earlier-gateway"]', id="json-list"),
+        pytest.param(json.dumps({"relay_token_sha256": _TOK_123_DIGEST}), id="no-secret"),
+        pytest.param(json.dumps({"secret": "", "relay_token_sha256": _TOK_123_DIGEST}), id="empty-secret"),
+        pytest.param(json.dumps({"secret": 12345, "relay_token_sha256": _TOK_123_DIGEST}), id="non-string-secret"),
+        pytest.param('{"secret": "a-bare-secret-from-an-earlier-gateway"}', id="unbound-secret"),
+    ],
+)
+def test_malformed_signing_secret_file_is_replaced_and_rebound(tmp_path: Path, stored_text: str) -> None:
+    secret_path = tmp_path / "signing_key"
+    secret_path.write_text(stored_text)
+
+    minted = load_or_create_signing_secret(secret_path, "tok-123")
+
+    assert minted not in stored_text
+    assert load_or_create_signing_secret(secret_path, "tok-123") == minted
+    assert (secret_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_discarding_the_signing_secret_makes_the_next_share_mint_a_different_one(tmp_path: Path) -> None:
+    # Unshare deletes the secret so every session it signed stops verifying;
+    # the re-share must not resurrect it.
+    secret_path = tmp_path / "signing_key"
+    before_unshare = load_or_create_signing_secret(secret_path, "tok-123")
+
+    assert discard_signing_secret(secret_path) is True
+
+    assert not secret_path.exists()
+    assert load_or_create_signing_secret(secret_path, "tok-123") != before_unshare
+    # Discarding when nothing was ever minted is a no-op, not an error, and says so (the runner
+    # logs a removal only when there was one).
+    assert discard_signing_secret(tmp_path / "never-minted") is False
 
 
 def test_auth_label_is_created_once_reused_and_well_formed(tmp_path: Path) -> None:
@@ -72,3 +131,32 @@ def test_auth_label_replaces_a_malformed_stored_value(tmp_path: Path) -> None:
     label_path.write_text("not-a-valid-auth-label")
     regenerated = load_or_create_auth_label(label_path)
     assert re.match(r"^auth-[a-z0-9]{8}$", regenerated)
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["share_auth_label"]
+
+
+def test_concurrent_creators_of_the_auth_label_all_answer_the_one_that_was_stored(tmp_path: Path) -> None:
+    """The gateway's stack start and the agent-access CLI can both create the label on a first publish."""
+    label_path = tmp_path / "share_auth_label"
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        labels = list(pool.map(lambda _: load_or_create_auth_label(label_path), range(16)))
+    assert len(set(labels)) == 1
+    assert label_path.read_text() == labels[0]
+    assert (label_path.stat().st_mode & 0o777) == 0o600
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["share_auth_label"]
+
+
+def test_the_share_domain_is_recorded_once_and_replaced_only_by_another_share(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "share_domain"
+
+    record_share_domain(path, "aaaa.us1.example.com")
+    first_write = path.stat().st_mtime_ns
+    record_share_domain(path, "aaaa.us1.example.com")
+    assert path.read_text() == "aaaa.us1.example.com\n"
+    assert path.stat().st_mtime_ns == first_write
+
+    record_share_domain(path, "bbbb.us1.example.com")
+    assert path.read_text() == "bbbb.us1.example.com\n"
+
+    path.write_bytes(b"\xff\xfe.example")
+    record_share_domain(path, "bbbb.us1.example.com")
+    assert path.read_text() == "bbbb.us1.example.com\n"

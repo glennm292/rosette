@@ -1,12 +1,33 @@
 /**
- * Activity strip that sits just above the message input -- the harness-common shell.
+ * The status row at the live end of the transcript -- the harness-common shell. It sits where
+ * the reply will appear, so it is where the user is already looking once they send: just under
+ * their own message while it waits on the agent or opens the agent's turn, and as the last piece of the agent's
+ * latest stretch, on its line, while the agent works on a turn already in the transcript (``turnStatusPlacement``
+ * says which).
  *
  * The backend (the chat app) is the source of truth for *which* state the agent
- * is in -- IDLE / THINKING / TOOL_RUNNING -- delivered on ``activity_state`` via the
- * ``chats_updated`` WS payload. This component's job is to render a label:
+ * is in -- IDLE / THINKING / TOOL_RUNNING / COMPACTING -- delivered on ``activity_state`` via
+ * the ``chats_updated`` WS payload. This component's job is to render a label:
  *   - IDLE / null      -> hidden
  *   - THINKING         -> "Thinking…"
- *   - TOOL_RUNNING     -> the in-flight tool call, captioned by the agent's harness
+ *   - TOOL_RUNNING     -> the in-flight tool call, captioned by the agent's harness; nothing while that call's
+ *                         chip in the same stretch shows it running (``isRunningCallInline``), though the row
+ *                         still ticks the chip's clock
+ *   - COMPACTING       -> "Compacting…", named for who started it ("Compacting while idle…"),
+ *                         and "…, then replying…" once a message is queued behind it
+ * and, once a turn has run for `ELAPSED_SHOWN_AFTER_MS`, how long it has run so far: from the
+ * moment the user sent the message that opened it when this page sent it, so the count runs on
+ * unbroken from the send's own, else from the transcript's record of when the turn started
+ * (`turnTiming`).
+ *
+ * Before the agent's turn starts, the row stands for the user's send (contract A1/A2): a send
+ * waiting on the agent to come up says "Connecting to <model> on <provider>…" (the backend's
+ * ``is_connecting``), and any other send still in flight shows the row's dot at once, captioned
+ * "Sending to <harness>…" only if it is still in flight after `SENDING_LABEL_AFTER_MS`. Both
+ * are the Sending state drawn on the agent's side; neither resolves anything, and both give way
+ * as soon as the backend reports the turn. Once the agent's turn ends the row goes, though its
+ * harness may still be closing it (Claude's Stop hooks): the reply is in, so the done mark under
+ * it (`TurnDoneMark`) takes over at once.
  *
  * The TOOL_RUNNING caption is read straight off the tool call: the harness's own
  * parser labelled it, so this view needs no notion of which harness is running.
@@ -21,15 +42,29 @@
  * genuinely IDLE and the strip would show nothing, so the user sees their
  * decision land and then apparent silence. Through that gap the strip says
  * `WAKE_LABEL`, bounded by `WAKE_SPINNER_MS`.
+ *
+ * Above the activity line, whatever it says, sits the wait line (`BackgroundTasksLine`) while
+ * the chat has background tasks pending: the agent may be between turns, but one of them will
+ * start the next.
  */
 
 import m from "mithril";
-import { activityDotClass } from "@imbue/workspace-ui/src/components/activityDot";
-import type { ToolCall, TranscriptEvent } from "../models/Response";
-import { getChatById } from "../models/Chats";
+import { activityDotClass, type ActivityDotTone } from "@imbue/workspace-ui/src/components/activityDot";
+import type { CompactionCause, ToolCall, TranscriptEvent } from "../models/Response";
+import { COMPACTING_STATE, isWorkingActivityState } from "../models/activityState";
+import { getChatById, getQueuedMessagesForChat } from "../models/Chats";
+import { getEventsForChat, hasMoreAfter } from "../models/Response";
+import { getOutgoingMessages, opensTurnWithHeldSends, sentAtOfArrival } from "../models/OutgoingMessages";
+import { BackgroundTasksLine } from "./BackgroundTasksLine";
+import { connectingLabel, isChatConnecting } from "./ConnectingIndicator";
 import { handoffPhaseText } from "./handoff-phase";
+import { harnessLabel } from "./harness-labels";
+import { heldSendsShownElsewhere } from "./HeldSendView";
+import { railNodeAttrs } from "./agent-rail";
+import { AGENT_TEXT_EDGE_CLASS, STRETCH_TEXT_EDGE_CLASS } from "./machine-bubbles";
 import { resolutionRequestIdOf } from "./message-classification";
 import { hasShellResolutionSince, shellResolutionArrivalFor } from "./permission-card";
+import { formatElapsed, latestTurnSpan, type TurnSpan } from "./turnTiming";
 
 /**
  * Find the most recent assistant tool call whose tool_call_id has no matching
@@ -56,31 +91,61 @@ function pendingToolCall(events: TranscriptEvent[]): ToolCall | null {
   return null;
 }
 
-// Activity states in which the agent has an interruptible turn in progress.
-const WORKING_ACTIVITY_STATES: ReadonlySet<string> = new Set(["THINKING", "TOOL_RUNNING"]);
-
-/**
- * Whether the given server-derived activity state means the agent is in the
- * middle of an interruptible turn. Drives the visibility of the stop button.
- */
-export function isWorkingActivityState(state: string | null | undefined): boolean {
-  return state !== null && state !== undefined && WORKING_ACTIVITY_STATES.has(state);
+/** The in-flight tool caption, as labelled by the harness that produced the call. */
+export function labelForToolCall(tc: ToolCall): string {
+  return tc.caption_label || "Running tool…";
 }
 
-/** The in-flight tool caption, as labelled by the harness that produced the call. */
-function labelForToolCall(tc: ToolCall): string {
-  return tc.caption_label || "Running tool…";
+/** The call the agent is running right now: the latest call with no result, while the backend reports a tool
+ *  running and the held window reaches the live end (short of it, the running call lies past the held events, whose
+ *  last unanswered call only waits on a result the window stops before). Its chip on a stretch's line shows it
+ *  running in place of the status row (see `isRunningCallInline`); a chip in a step's opened work leaves it to the
+ *  status row. */
+export function runningToolCall(chatId: string): ToolCall | null {
+  if (getChatById(chatId)?.active_agent.activity_state !== "TOOL_RUNNING" || hasMoreAfter(chatId)) return null;
+  return pendingToolCall(getEventsForChat(chatId));
+}
+
+/** How long the turn running a tool has run, as the status row would say it, or null before that is worth saying. */
+export function runningCallElapsed(chatId: string): string | null {
+  return elapsedSince(runningTurnStartedAt(chatId, "TOOL_RUNNING", true, getEventsForChat(chatId)), Date.now());
+}
+
+function compactingLead(cause: CompactionCause | null): string {
+  switch (cause) {
+    case "manual":
+      return "Compacting as requested";
+    case "idle":
+      return "Compacting while idle";
+    case "native":
+      return "Compacting to free up context";
+    default:
+      return "Compacting";
+  }
+}
+
+/** What a running compaction is called, on the strip and on the transcript's chip for its start. */
+export function compactingLabel(cause: CompactionCause | null, hasQueuedMessages: boolean): string {
+  const lead = compactingLead(cause);
+  return hasQueuedMessages ? `${lead}, then replying…` : `${lead}…`;
 }
 
 /**
  * Pick the user-facing label for a server-derived activity state. For TOOL_RUNNING
- * we consult the transcript for the in-flight tool and use its label; every other
- * state is fixed (or null = hide).
+ * we consult the transcript for the in-flight tool and use its label; COMPACTING
+ * says who started it and whether a queued message waits on it; every other state is fixed
+ * (or null = hide).
  */
-export function labelForActivityState(state: string | null | undefined, events: TranscriptEvent[]): string | null {
+export function labelForActivityState(
+  state: string | null | undefined,
+  events: TranscriptEvent[],
+  hasQueuedMessages = false,
+  compactionCause: CompactionCause | null = null,
+): string | null {
   if (state === null || state === undefined) return null;
   if (state === "IDLE") return null;
   if (state === "THINKING") return "Thinking…";
+  if (state === COMPACTING_STATE) return compactingLabel(compactionCause, hasQueuedMessages);
   if (state === "TOOL_RUNNING") {
     const pending = pendingToolCall(events);
     if (pending !== null) return labelForToolCall(pending);
@@ -99,27 +164,125 @@ const WAKE_LABEL = "Confirming permission changes…";
 // server's activity states -- the server has no signal for this beat.
 const WAKE_STATE = "WAKING";
 
-function renderStrip(label: string, state: string | null | undefined): m.Vnode {
-  // `flex` (not inline-flex) so the auto side-margins can horizontally center
-  // the strip within the footer above the centered input. The dot's pulse
-  // keyframes (agent-activity-pulse) live in the library's base.css.
+// The row's place in the message column when it stands on its own, spaced like a message so the reply that
+// replaces it does not move what is above it, and on the bubbles' text edge.
+const STRIP_COLUMN_CLASS = `mb-5 ${AGENT_TEXT_EDGE_CLASS}`;
+
+// The row as the last piece of a stretch of the agent's output, which spaces it.
+const STRIP_STRETCH_CLASS = STRETCH_TEXT_EDGE_CLASS;
+
+// How long a turn (or a send waiting on the agent) runs before the row says how long it has run:
+// a quick answer needs no clock, a long one should show that it is still moving.
+export const ELAPSED_SHOWN_AFTER_MS = 3_000;
+
+// How long a send can be in flight with only the dot before the row says where it is: most
+// deliveries land before this, and a caption that flashes past is noise.
+export const SENDING_LABEL_AFTER_MS = 1_500;
+
+// Marks the row of a send still on its way to the agent, for styling and tests. Like the wake-up
+// state, not one of the server's activity states: the row stands for the user's send.
+const SENDING_STATE = "SENDING";
+// The row of a send waiting for the agent to come up (``is_connecting``).
+const CONNECTING_STATE = "CONNECTING";
+// The row of a turn whose message is in the transcript but which the agent has not reported working on.
+const STARTING_STATE = "STARTING";
+
+function renderStrip(
+  label: string | null,
+  state: string | null | undefined,
+  columnClass: string,
+  elapsed: string | null = null,
+  dotTone: ActivityDotTone = "accent",
+): m.Vnode {
+  // The dot's pulse keyframes (agent-activity-pulse) live in the library's base.css.
   return m(
     "div",
     {
       class:
-        "agent-activity-indicator mx-auto mb-2 flex w-full max-w-(--width-message-column) items-center gap-2 px-1 " +
+        `agent-activity-indicator ${columnClass} flex min-h-5 items-center gap-1.5 pr-1 ` +
         "text-(length:--font-size-helper) text-secondary",
       "data-state": state,
       role: "status",
       "aria-live": "polite",
     },
     [
-      m("span", {
-        class: `agent-activity-indicator__dot ${activityDotClass("h-1.5 w-1.5")}`,
-      }),
-      m("span", { class: "agent-activity-indicator__label truncate" }, label),
+      // The dot in an icon's box, so it sits on the stretch's line where a chip's icon does.
+      m(
+        "span",
+        { class: "flex size-[13px] shrink-0 items-center justify-center", ...railNodeAttrs("point") },
+        m("span", { class: `agent-activity-indicator__dot ${activityDotClass("h-1.5 w-1.5", dotTone)}` }),
+      ),
+      label === null ? null : m("span", { class: "agent-activity-indicator__label truncate" }, label),
+      elapsed === null
+        ? null
+        : m("span", { class: "agent-activity-indicator__elapsed shrink-0 tabular-nums text-faint" }, elapsed),
     ],
   );
+}
+
+/** How long something running since `startedAt` has run, once that is long enough to be worth saying. */
+function elapsedSince(startedAt: number | null, now: number): string | null {
+  if (startedAt === null || now - startedAt < ELAPSED_SHOWN_AFTER_MS) return null;
+  return formatElapsed(now - startedAt);
+}
+
+// Per chat, the message that opened the last turn this page saw settle. The backend can report a new
+// turn running a moment before that turn's own message reaches the transcript; until it does, the
+// latest message there is the finished turn's, which is no start to count from.
+const settledTurnByChat = new Map<string, string>();
+
+/** When the turn opened by the transcript's latest turn-opening message started: when the user sent
+ *  that message, if this page sent it, else when the transcript recorded it. */
+export function turnStartedAt(span: TurnSpan): number {
+  return sentAtOfArrival(span.openingEventId) ?? span.startedAt;
+}
+
+/** When the turn the row reports started, or null when the row reports none or its message has not
+ *  landed yet. Notes the latest turn as settled once the agent is idle after working on it. */
+function runningTurnStartedAt(
+  chatId: string,
+  state: string | null,
+  isTurnReported: boolean,
+  events: readonly TranscriptEvent[],
+): number | null {
+  const span = latestTurnSpan(events);
+  if (span === null) return null;
+  if (state === "IDLE") {
+    if (span.hasAgentWork) settledTurnByChat.set(chatId, span.openingEventId);
+    return null;
+  }
+  return isTurnReported && settledTurnByChat.get(chatId) !== span.openingEventId ? turnStartedAt(span) : null;
+}
+
+/** Forget what the page has seen of each chat's turns. */
+export function resetSettledTurnsForTesting(): void {
+  settledTurnByChat.clear();
+}
+
+/** When the chat's oldest send still on its way was made, or null when none is. */
+function oldestSendingAt(chatId: string): number | null {
+  const outgoing = getOutgoingMessages(chatId);
+  return outgoing.length === 0 ? null : Math.min(...outgoing.map((message) => message.sentAt));
+}
+
+/** Where the status row goes at the live end of the transcript: under the user's own sends while it
+ *  stands for one (a send on its way, or waiting on the agent to come up) or reports the turn one of
+ *  them opens, until that send reaches the transcript; else under the latest turn, ahead of anything
+ *  queued behind it. */
+export function turnStatusPlacement(chatId: string): "after-sends" | "after-turn" {
+  const chat = getChatById(chatId);
+  const outgoing = getOutgoingMessages(chatId);
+  if (chat !== undefined && chat.handoff !== null) {
+    // A switch that hands its held sends over as the agent's next turn reports that turn's start until the
+    // first of them lands; the rest wait behind that turn.
+    const isSendWaiting = chat.handoff.held_sends.length > 0 || outgoing.length > 0;
+    const isTurnOpening = opensTurnWithHeldSends(chat.handoff) && heldSendsShownElsewhere(chatId) === 0;
+    return isTurnOpening && isSendWaiting ? "after-sends" : "after-turn";
+  }
+  if (chat !== undefined && isWorkingActivityState(chat.active_agent.activity_state)) {
+    return outgoing.some((message) => message.opensTurn) ? "after-sends" : "after-turn";
+  }
+  return isChatConnecting(chatId) || outgoing.length > 0 ? "after-sends" : "after-turn";
 }
 
 // How long the wake-up strip may stand in for the agent after a verdict. Long
@@ -189,6 +352,10 @@ const TOOL_CAPTION_MIN_MS = 700;
 interface ActivityIndicatorAttrs {
   chatId: string;
   events: TranscriptEvent[];
+  /** The row is the last piece of a stretch of the agent's output, on its line. */
+  isInStretch?: boolean;
+  /** The call the agent is running shows as a running chip in the stretch, so the row says nothing of it. */
+  isRunningCallInline?: boolean;
 }
 
 export function ActivityIndicator(): m.Component<ActivityIndicatorAttrs> {
@@ -215,68 +382,167 @@ export function ActivityIndicator(): m.Component<ActivityIndicatorAttrs> {
     }
   };
 
+  // Redraws the row when what it says next depends only on the clock: the elapsed count's next
+  // second, or the moment a send in flight earns its caption. Nothing else would redraw it then.
+  let tickTimer: number | null = null;
+
+  const cancelTick = (): void => {
+    if (tickTimer !== null) {
+      window.clearTimeout(tickTimer);
+      tickTimer = null;
+    }
+  };
+
+  /** Redraw at `at`, unless a redraw is already due sooner. */
+  const scheduleRedrawAt = (at: number, now: number): void => {
+    if (tickTimer !== null) return;
+    tickTimer = window.setTimeout(
+      () => {
+        tickTimer = null;
+        m.redraw();
+      },
+      Math.max(50, at - now),
+    );
+  };
+
+  /** Redraw once the clock next changes what a row running since `startedAt` says: its elapsed count's
+   *  next second (or the moment it is first shown), or `captionAt` when that comes first. */
+  const scheduleTick = (startedAt: number, now: number, captionAt: number | null = null): void => {
+    const ranFor = now - startedAt;
+    const nextElapsedAt =
+      ranFor < ELAPSED_SHOWN_AFTER_MS ? startedAt + ELAPSED_SHOWN_AFTER_MS : now + 1000 - (Math.max(0, ranFor) % 1000);
+    scheduleRedrawAt(captionAt === null || captionAt <= now ? nextElapsedAt : Math.min(captionAt, nextElapsedAt), now);
+  };
+
+  /** The row of a send not yet in a turn: waiting on the agent to come up, or still on its way. Null for neither. */
+  const sendStrip = (chatId: string, columnClass: string, now: number): m.Vnode | null => {
+    const sentAt = oldestSendingAt(chatId);
+    if (isChatConnecting(chatId)) {
+      if (sentAt !== null) scheduleTick(sentAt, now);
+      // The amber dot: the agent is not up yet, which is a wait of its own rather than work.
+      return renderStrip(connectingLabel(chatId), CONNECTING_STATE, columnClass, elapsedSince(sentAt, now), "warning");
+    }
+    if (sentAt === null) return null;
+    const captionAt = sentAt + SENDING_LABEL_AFTER_MS;
+    scheduleTick(sentAt, now, captionAt);
+    const harness = getChatById(chatId)?.active_agent.harness;
+    const caption =
+      now < captionAt ? null : harness === undefined ? "Sending…" : `Sending to ${harnessLabel(harness)}…`;
+    return renderStrip(caption, SENDING_STATE, columnClass, elapsedSince(sentAt, now));
+  };
+
+  /** The row of a turn whose message has reached the transcript while the backend reports the chat
+   *  working but not yet its activity: the dot, with the count the send started. Null for any other
+   *  chat, including one whose agent has already worked on the latest turn (it is closing, and the
+   *  done mark says so). */
+  const startingStrip = (attrs: ActivityIndicatorAttrs, columnClass: string, now: number): m.Vnode | null => {
+    const chat = getChatById(attrs.chatId);
+    if (chat === undefined || chat.status !== "working" || chat.active_agent.activity_state !== "IDLE") return null;
+    const span = latestTurnSpan(attrs.events);
+    if (span === null || span.hasAgentWork) return null;
+    const startedAt = turnStartedAt(span);
+    scheduleTick(startedAt, now);
+    return renderStrip(null, STARTING_STATE, columnClass, elapsedSince(startedAt, now));
+  };
+
+  /** The activity line: the switch's phase, the turn's caption, the wake-up caption, the row of a send
+   *  not yet in a turn, or the row of a turn not yet started; null when there is none. */
+  const activityStrip = (attrs: ActivityIndicatorAttrs, columnClass: string): m.Vnode | null => {
+    cancelTick();
+    const { chatId, events } = attrs;
+    const chat = getChatById(chatId);
+    // A chat switching harness reports the switch, not the retiring agent's turn: that
+    // agent is busy with the summary it was asked for, which is the switch's own business.
+    // The failed phase has its own notice over the composer and shows nothing here.
+    if (chat !== undefined && chat.handoff !== null && chat.handoff.phase !== "failed") {
+      cancelRelease();
+      cancelWake();
+      heldToolCaption = null;
+      return renderStrip(
+        handoffPhaseText(chat.handoff, chat.active_agent.harness),
+        `HANDOFF_${chat.handoff.phase}`,
+        columnClass,
+      );
+    }
+    const state = chat?.active_agent.activity_state ?? null;
+    const label = labelForActivityState(
+      state,
+      events,
+      getQueuedMessagesForChat(chatId).length > 0,
+      chat?.active_agent.compaction_cause ?? null,
+    );
+
+    const now = Date.now();
+    // How long the turn has run, for a row that reports one: from the transcript's record of the
+    // message that opened it, so a reloaded page counts from the same moment.
+    const turnStartedAt = runningTurnStartedAt(chatId, state, label !== null, events);
+    const turnElapsed = elapsedSince(turnStartedAt, now);
+    if (turnStartedAt !== null) scheduleTick(turnStartedAt, now);
+    if (state === "TOOL_RUNNING" && attrs.isRunningCallInline === true) {
+      // The chip says it, and keeps the clock this row schedules; nothing is held, so the row does not flash the
+      // caption back up once the call ends.
+      cancelRelease();
+      cancelWake();
+      heldToolCaption = null;
+      return null;
+    }
+    if (state === "TOOL_RUNNING" && label !== null) {
+      // Active tool -> (re)start the hold window; cancel any pending release.
+      cancelRelease();
+      heldToolCaption = label;
+      heldUntil = now + TOOL_CAPTION_MIN_MS;
+    } else if (state === "THINKING" && heldToolCaption !== null && now < heldUntil) {
+      // Still working, but the tool cleared fast -- keep the caption up briefly so
+      // it doesn't flash, then release. Schedule a redraw at the release point.
+      if (releaseTimer === null) {
+        releaseTimer = window.setTimeout(() => {
+          releaseTimer = null;
+          heldToolCaption = null;
+          m.redraw();
+        }, heldUntil - now);
+      }
+      cancelWake();
+      return renderStrip(heldToolCaption, "TOOL_RUNNING", columnClass, turnElapsed);
+    } else {
+      // IDLE / null (turn ended), window expired, or nothing held -> release now.
+      cancelRelease();
+      heldToolCaption = null;
+    }
+
+    if (label === null) {
+      // Nothing else is going on, so this is the only moment the wake-up
+      // caption may take the strip -- a real turn always outranks it.
+      const wakeDeadline = wakeUpSpinnerDeadline(events, now);
+      if (wakeDeadline !== null) {
+        if (wakeTimer === null) {
+          wakeTimer = window.setTimeout(() => {
+            wakeTimer = null;
+            m.redraw();
+          }, wakeDeadline - now);
+        }
+        return renderStrip(WAKE_LABEL, WAKE_STATE, columnClass);
+      }
+      cancelWake();
+      return sendStrip(chatId, columnClass, now) ?? startingStrip(attrs, columnClass, now);
+    }
+    cancelWake();
+    return renderStrip(label, state, columnClass, turnElapsed);
+  };
+
   return {
     onremove() {
       cancelRelease();
       cancelWake();
+      cancelTick();
     },
     view(vnode) {
-      const { chatId, events } = vnode.attrs;
-      const chat = getChatById(chatId);
-      // A chat switching harness reports the switch, not the retiring agent's turn: that
-      // agent is busy with the summary it was asked for, which is the switch's own business.
-      // The failed phase has its own notice over the composer and shows nothing here.
-      if (chat !== undefined && chat.handoff !== null && chat.handoff.phase !== "failed") {
-        cancelRelease();
-        cancelWake();
-        heldToolCaption = null;
-        return renderStrip(handoffPhaseText(chat.handoff, chat.active_agent.harness), `HANDOFF_${chat.handoff.phase}`);
-      }
-      const state = chat?.active_agent.activity_state ?? null;
-      const label = labelForActivityState(state, events);
-
-      const now = Date.now();
-      if (state === "TOOL_RUNNING" && label !== null) {
-        // Active tool -> (re)start the hold window; cancel any pending release.
-        cancelRelease();
-        heldToolCaption = label;
-        heldUntil = now + TOOL_CAPTION_MIN_MS;
-      } else if (state === "THINKING" && heldToolCaption !== null && now < heldUntil) {
-        // Still working, but the tool cleared fast -- keep the caption up briefly so
-        // it doesn't flash, then release. Schedule a redraw at the release point.
-        if (releaseTimer === null) {
-          releaseTimer = window.setTimeout(() => {
-            releaseTimer = null;
-            heldToolCaption = null;
-            m.redraw();
-          }, heldUntil - now);
-        }
-        cancelWake();
-        return renderStrip(heldToolCaption, "TOOL_RUNNING");
-      } else {
-        // IDLE / null (turn ended), window expired, or nothing held -> release now.
-        cancelRelease();
-        heldToolCaption = null;
-      }
-
-      if (label === null) {
-        // Nothing else is going on, so this is the only moment the wake-up
-        // caption may take the strip -- a real turn always outranks it.
-        const wakeDeadline = wakeUpSpinnerDeadline(events, now);
-        if (wakeDeadline !== null) {
-          if (wakeTimer === null) {
-            wakeTimer = window.setTimeout(() => {
-              wakeTimer = null;
-              m.redraw();
-            }, wakeDeadline - now);
-          }
-          return renderStrip(WAKE_LABEL, WAKE_STATE);
-        }
-        cancelWake();
-        return null;
-      }
-      cancelWake();
-      return renderStrip(label, state);
+      const columnClass = vnode.attrs.isInStretch === true ? STRIP_STRETCH_CLASS : STRIP_COLUMN_CLASS;
+      const tasks = getChatById(vnode.attrs.chatId)?.active_agent.background_tasks ?? [];
+      if (tasks.length === 0) return activityStrip(vnode.attrs, columnClass);
+      return m("div", { class: `agent-activity-stack ${columnClass} flex flex-col gap-1` }, [
+        m(BackgroundTasksLine, { tasks }),
+        activityStrip(vnode.attrs, ""),
+      ]);
     },
   };
 }

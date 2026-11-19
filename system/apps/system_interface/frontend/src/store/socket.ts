@@ -1,0 +1,314 @@
+/**
+ * The shell's WebSocket (desktop-interface contracts.md section 6), the one socket this window
+ * holds. On connect the server sends ``apps_updated``, ``desktops_updated``, ``avatar_status``,
+ * ``update_notice_changed``, ``presence_updated``, and ``roster_updated``; the window answers with its ``client_state``
+ * (which client it is, on which desktop) and re-sends it on every switch, as a move of the client or, when
+ * it only followed the client's stored desktop, as a following report that moves nothing; a pulled-out window's
+ * page answers with a pop-out's ``client_state`` instead, naming its client and no desktop. ``placements_updated``,
+ * ``active_desktop_changed``, ``client_entries_changed``, and the transient ``layout_op`` are how this
+ * client's other windows, the shell's own edits, and an agent's ops reach this one; ``avatar_status`` and
+ * ``avatar_selection_changed`` are how the workspace's avatar reaches every window, ``update_notice_changed``
+ * how the update notice does, ``presence_updated`` is who is connected to the workspace, ``roster_updated`` everyone
+ * who may be, ``clients_updated`` that a client left (its socket closed or its record was pruned), ``chats_activity``
+ * what every chat is doing, and ``bubble`` what somebody just said (the multiplayer spec, sections 4.2, 6.4, 6.5,
+ * and 8.3).
+ */
+
+import { wsUrl } from "@imbue/workspace-ui/src/base-path";
+import { ReconnectBackoff } from "@imbue/workspace-ui/src/models/backoff";
+import { parseJsonMessage } from "@imbue/workspace-ui/src/models/ws-json";
+import {
+  parseAppRecords,
+  parseAvatarSelectionChanged,
+  parseAvatarStatus,
+  parseBubble,
+  parseChatsActivity,
+  parseDesktops,
+  parseEntries,
+  parsePresentUsers,
+  parseRoster,
+  parseUpdateNoticeChanged,
+} from "../model/records";
+import type {
+  AppRecord,
+  AvatarStatus,
+  BubbleWire,
+  ChatActivity,
+  Desktop,
+  EntryPresentation,
+  PresentUser,
+  RosterParticipant,
+  UpdateNoticeWire,
+} from "../model/records";
+import { parseThemeCatalog, type ThemeCatalog } from "../model/themes";
+
+/** The ops that reach the browser as messages: the transient ones, and those that put a window on this client's
+ *  screen (applied to the files too; a phone shows the window, and a desktop acts only on a ``show`` of a
+ *  pulled-out window). */
+export type LayoutOpName = "refresh" | "reload_system_interface" | "show" | "open" | "focus";
+
+export interface LayoutOpEvent {
+  readonly op: LayoutOpName;
+  readonly args: Readonly<Record<string, unknown>>;
+  /** ``<app>`` or ``<app>:<marker>`` for the requesting agent, "" when unknown. */
+  readonly requester: string;
+}
+
+export interface PlacementsUpdatedEvent {
+  readonly desktopId: string;
+  readonly clientId: string;
+  readonly saveId: string;
+}
+
+export interface ActiveDesktopChangedEvent {
+  readonly clientId: string;
+  readonly desktopId: string;
+  /** The client's desktop revision the move was written at: a window takes only a revision newer than any it heard. */
+  readonly revision: number;
+  /** The id of the window report that made the move, null when something else did. */
+  readonly reportId: string | null;
+}
+
+/** What a window tells the shell about the desktop it is on. */
+export interface ClientStateReport {
+  readonly activeDesktop: string;
+  /** The desktop the window left, "" on connect and when following. */
+  readonly previousDesktop: string;
+  /** The window's id for a move (``REPORT_ID_PREFIX``), echoed on the broadcast it causes; null when following. */
+  readonly reportId: string | null;
+  /** Whether the window only followed the client's stored desktop (pushed, or read on a reconnect): the shell
+   *  registers the connection on it and moves nothing, since the record may already have moved on. */
+  readonly isFollowing: boolean;
+  /** This page's id (``PAGE_ID_PREFIX``), which tells the shell its own moves from the others'. */
+  readonly pageId: string;
+  /** For a move, the newest desktop revision the window had heard: the shell does not record a move made before
+   *  another page's or an op's move the window had not heard of yet. Null when following. */
+  readonly revision: number | null;
+}
+
+export interface ClientEntriesChangedEvent {
+  readonly clientId: string;
+  readonly entries: Readonly<Record<string, EntryPresentation>>;
+}
+
+export interface SocketHandlers {
+  onAppsUpdated(apps: AppRecord[]): void;
+  onDesktopsUpdated(desktops: Desktop[]): void;
+  onPlacementsUpdated(event: PlacementsUpdatedEvent): void;
+  onActiveDesktopChanged(event: ActiveDesktopChangedEvent): void;
+  onClientEntriesChanged(event: ClientEntriesChangedEvent): void;
+  onAvatarStatus(status: AvatarStatus): void;
+  onAvatarSelectionChanged(design: string): void;
+  /** The update notice as the shell now holds it, null once the record is cleared. */
+  onUpdateNoticeChanged(notice: UpdateNoticeWire | null): void;
+  /** The tray's resource gauge, as the shell pushes it (see ``model/resourceGauge``). */
+  onResourceGaugeChanged(view: unknown): void;
+  /** The workspace's themes or its default theme changed (workspace-themes plan section 5.2). */
+  onThemesChanged(catalog: ThemeCatalog): void;
+  /** Somebody changed a keybinding; the shell and every framed page re-fetch their resolved chords. */
+  onKeybindingsChanged(): void;
+  onLayoutOp(event: LayoutOpEvent): void;
+  /** The connected users, one entry per user, on connect and whenever someone joins or leaves. */
+  onPresenceUpdated(users: PresentUser[]): void;
+  /** The roster (the multiplayer spec, section 4.2), on connect and whenever presence or a grants file changed. */
+  onRosterUpdated(participants: RosterParticipant[]): void;
+  /** A client's socket closed or its record was pruned (the multiplayer spec, section 8.3): the clients listing
+   *  has changed and is worth reading again. */
+  onClientsUpdated(): void;
+  /** What every chat is doing, as the chat app last reported it (the multiplayer spec, section 6.4). */
+  onChatsActivity(chats: ChatActivity[]): void;
+  /** Somebody just said something (the multiplayer spec, section 6.5). */
+  onBubble(bubble: BubbleWire): void;
+  /** The socket (re)opened: the client state is re-reported through ``reportClientState``. */
+  onConnected(): void;
+}
+
+/** What the store asks of its socket, so a test can stand one in. */
+export interface DesktopSocket {
+  connect(handlers: SocketHandlers): void;
+  /** Report the desktop this window is on. */
+  reportClientState(report: ClientStateReport): void;
+  /** Register this socket as a pulled-out window's, under this client and naming no desktop: the ops aimed at
+   *  the client reach it, and the client's active desktop stays its main window's. */
+  reportPopOut(): void;
+}
+
+interface RawSocketEvent {
+  /** ``resource_gauge_changed``: the gauge, parsed by its model. */
+  view?: unknown;
+  type?: unknown;
+  apps?: unknown;
+  desktops?: unknown;
+  users?: unknown;
+  participants?: unknown;
+  chats?: unknown;
+  op?: unknown;
+  args?: unknown;
+  requester?: unknown;
+  target_client_id?: unknown;
+  desktop_id?: unknown;
+  client_id?: unknown;
+  save_id?: unknown;
+  entries?: unknown;
+  catalog?: unknown;
+  revision?: unknown;
+  report_id?: unknown;
+}
+
+const LAYOUT_OP_NAMES: readonly string[] = ["refresh", "reload_system_interface", "show", "open", "focus"];
+
+export class ShellSocket implements DesktopSocket {
+  private ws: WebSocket | null = null;
+  private handlers: SocketHandlers | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly reconnectBackoff = new ReconnectBackoff();
+
+  constructor(private readonly clientId: string) {}
+
+  connect(handlers: SocketHandlers): void {
+    this.handlers = handlers;
+    this.open();
+  }
+
+  reportClientState(report: ClientStateReport): void {
+    if (this.ws === null || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(
+      JSON.stringify({
+        type: "client_state",
+        client_id: this.clientId,
+        active_desktop: report.activeDesktop,
+        previous_desktop: report.previousDesktop,
+        report_id: report.reportId,
+        is_following: report.isFollowing,
+        page_id: report.pageId,
+        revision: report.revision,
+      }),
+    );
+  }
+
+  reportPopOut(): void {
+    if (this.ws === null || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: "client_state", client_id: this.clientId, is_pop_out: true }));
+  }
+
+  private open(): void {
+    if (this.ws !== null) return;
+    const url = wsUrl("/api/ws");
+    console.info(`[si-ws] connecting to ${url}`);
+    const ws = new WebSocket(url);
+    this.ws = ws;
+    ws.onopen = () => {
+      console.info("[si-ws] connected");
+      this.reconnectBackoff.reset();
+      this.handlers?.onConnected();
+    };
+    ws.onmessage = (event: MessageEvent) => {
+      const data = parseJsonMessage<RawSocketEvent>(event.data as string);
+      if (data !== null) this.handleEvent(data);
+    };
+    ws.onclose = (event: CloseEvent) => {
+      console.warn(
+        `[si-ws] closed (code=${event.code} reason=${JSON.stringify(event.reason)} wasClean=${event.wasClean})`,
+      );
+      this.ws = null;
+      this.scheduleReconnect();
+    };
+    ws.onerror = () => {
+      console.warn("[si-ws] socket error");
+      ws.close();
+    };
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer !== null) return;
+    const delayMs = this.reconnectBackoff.nextDelay();
+    console.info(`[si-ws] reconnecting in ${delayMs}ms`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.open();
+    }, delayMs);
+  }
+
+  private handleEvent(event: RawSocketEvent): void {
+    const handlers = this.handlers;
+    if (handlers === null) return;
+    switch (event.type) {
+      case "apps_updated":
+        handlers.onAppsUpdated(parseAppRecords(event.apps));
+        return;
+      case "desktops_updated":
+        handlers.onDesktopsUpdated(parseDesktops(event.desktops));
+        return;
+      case "presence_updated":
+        handlers.onPresenceUpdated(parsePresentUsers(event.users));
+        return;
+      case "roster_updated":
+        handlers.onRosterUpdated(parseRoster(event.participants));
+        return;
+      case "clients_updated":
+        handlers.onClientsUpdated();
+        return;
+      case "chats_activity":
+        handlers.onChatsActivity(parseChatsActivity(event.chats));
+        return;
+      case "bubble":
+        handlers.onBubble(parseBubble(event));
+        return;
+      case "placements_updated":
+        handlers.onPlacementsUpdated({
+          desktopId: String(event.desktop_id ?? ""),
+          clientId: String(event.client_id ?? ""),
+          saveId: String(event.save_id ?? ""),
+        });
+        return;
+      case "active_desktop_changed":
+        handlers.onActiveDesktopChanged({
+          clientId: String(event.client_id ?? ""),
+          desktopId: String(event.desktop_id ?? ""),
+          revision: typeof event.revision === "number" ? event.revision : 0,
+          reportId: typeof event.report_id === "string" ? event.report_id : null,
+        });
+        return;
+      case "client_entries_changed":
+        handlers.onClientEntriesChanged({
+          clientId: String(event.client_id ?? ""),
+          entries: parseEntries(event.entries),
+        });
+        return;
+      case "avatar_status":
+        handlers.onAvatarStatus(parseAvatarStatus(event));
+        return;
+      case "avatar_selection_changed":
+        handlers.onAvatarSelectionChanged(parseAvatarSelectionChanged(event));
+        return;
+      case "update_notice_changed":
+        handlers.onUpdateNoticeChanged(parseUpdateNoticeChanged(event));
+        return;
+      case "resource_gauge_changed":
+        handlers.onResourceGaugeChanged(event.view);
+        return;
+      case "themes_changed":
+        handlers.onThemesChanged(parseThemeCatalog(event.catalog));
+        return;
+      case "keybindings_changed":
+        handlers.onKeybindingsChanged();
+        return;
+      case "layout_op": {
+        // A targeted op is for one client's windows; an untargeted one (a refresh of a whole app,
+        // the interface reload) is for every window.
+        if (event.target_client_id != null && event.target_client_id !== this.clientId) return;
+        if (typeof event.op !== "string" || !LAYOUT_OP_NAMES.includes(event.op)) return;
+        const args =
+          event.args !== null && typeof event.args === "object" ? (event.args as Record<string, unknown>) : {};
+        handlers.onLayoutOp({
+          op: event.op as LayoutOpName,
+          args,
+          requester: typeof event.requester === "string" ? event.requester : "",
+        });
+        return;
+      }
+      default:
+        return;
+    }
+  }
+}

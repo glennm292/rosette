@@ -1,6 +1,5 @@
 import ast
 import io
-import os
 import re
 import subprocess
 import tokenize
@@ -8,7 +7,9 @@ from pathlib import Path
 
 import pytest
 import tomlkit
+from agents_shared.validate_skill import third_party_skills
 from inline_snapshot import snapshot
+from vendor_testing import resolves_into_vendor
 
 _REPO_ROOT = Path(__file__).parents[1]
 
@@ -129,29 +130,96 @@ def test_all_test_ratchets_files_have_same_tests() -> None:
 
 
 def _find_bash_scripts_without_strict_mode() -> list[str]:
-    """Find bash scripts missing 'set -euo pipefail', excluding vendored and venv code.
+    """Find bash scripts missing 'set -euo pipefail', excluding vendored code.
 
-    Walks with os.walk and prunes excluded directories in place (the vendored
-    tree, .git, virtualenvs, node_modules) rather than rglob-ing the whole
-    tree: the vendored mngr checkout alone carries a ~30k-file .venv that a
-    full recursive glob would traverse on every run.
+    Only scripts git would consider count (tracked, or untracked but not
+    ignored), for the same reason :func:`_live_prose_files` asks git: in a live
+    workspace ``data/`` accumulates generated machine state, and the terminal
+    app writes shell scripts into it. Those are gitignored, not the template's
+    code, and their style is not this ratchet's business. Asking git also drops
+    the non-source trees that hold no template code (virtualenvs, node_modules,
+    git internals), all of which are gitignored.
     """
+    candidates = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.sh",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     violations: list[str] = []
-    for dirpath, dirnames, filenames in os.walk(_REPO_ROOT):
-        current_dir = Path(dirpath)
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if d not in _PRUNED_DIR_NAMES and current_dir / d != _VENDORED_DIR
-        ]
-        for filename in filenames:
-            if not filename.endswith(".sh"):
-                continue
-            script = current_dir / filename
-            content = script.read_text(errors="replace")
-            if re.search(r"^#!/.*bash", content) and "set -euo pipefail" not in content:
-                violations.append(str(script.relative_to(_REPO_ROOT)))
+    for rel in filter(None, candidates.stdout.split("\0")):
+        script = _REPO_ROOT / rel
+        if _VENDORED_DIR in script.parents or not script.is_file():
+            continue
+        content = script.read_text(errors="replace")
+        if re.search(r"^#!/.*bash", content) and "set -euo pipefail" not in content:
+            violations.append(rel)
     return sorted(violations)
+
+
+def _skill_python_dirs_without_a_pyproject(skills_root: Path) -> list[str]:
+    """Every ``<skill>/python`` dir with no ``pyproject.toml``.
+
+    The root workspace's ``.agents/skills/*/python`` member glob makes each one a uv
+    project, and uv refuses a glob-matched directory without a ``pyproject.toml``: one
+    such directory breaks every ``uv lock``, ``uv sync`` and ``uv run`` in the workspace.
+    """
+    return sorted(
+        str(project.relative_to(skills_root))
+        for project in skills_root.glob("*/python")
+        if project.is_dir() and not (project / "pyproject.toml").is_file()
+    )
+
+
+def test_every_skill_python_dir_has_a_pyproject() -> None:
+    missing = _skill_python_dirs_without_a_pyproject(_REPO_ROOT / ".agents" / "skills")
+    assert not missing, (
+        "These skill python/ dirs have no pyproject.toml, which breaks uv for the whole workspace. "
+        "Give each one (see .agents/shared/references/spec-summary.md, Packaging):\n"
+        + "\n".join(f"  - {m}" for m in missing)
+    )
+
+
+def test_every_listed_third_party_skill_is_in_the_tree() -> None:
+    skills_root = _REPO_ROOT / ".agents" / "skills"
+    gone = sorted(
+        name
+        for name in third_party_skills(_REPO_ROOT / ".agents")
+        if not (skills_root / name).is_dir()
+    )
+    assert not gone, (
+        ".agents/third-party-skills.toml lists skills that are not in .agents/skills/. Remove their "
+        "entries: a skill of the workspace's own given the same name later would be left out of "
+        "its checks:\n" + "\n".join(f"  - {name}" for name in gone)
+    )
+
+
+def test_a_python_dir_without_a_pyproject_is_caught_and_a_plain_scripts_dir_is_not(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "half-built-skill" / "python" / "half_built_skill_skill").mkdir(
+        parents=True
+    )
+    (tmp_path / "packaged-skill" / "python").mkdir(parents=True)
+    (tmp_path / "packaged-skill" / "python" / "pyproject.toml").write_text(
+        "[project]\n"
+    )
+    (tmp_path / "third-party-skill" / "scripts").mkdir(parents=True)
+    (tmp_path / "third-party-skill" / "scripts" / "run.py").write_text("print('hi')\n")
+
+    assert _skill_python_dirs_without_a_pyproject(tmp_path) == [
+        "half-built-skill/python"
+    ]
 
 
 def test_prevent_bash_without_strict_mode() -> None:
@@ -338,7 +406,7 @@ def _live_prose_files() -> list[Path]:
         # govern. Resolved rather than inferred from is_file(), which only
         # excluded this link back when its target path was stale and it
         # resolved to nothing.
-        if _VENDORED_DIR in path.resolve().parents:
+        if resolves_into_vendor(path, _REPO_ROOT):
             continue
         files.append(path)
     return files
@@ -390,10 +458,13 @@ def test_prevent_web_service_terminology() -> None:
 
 
 def test_prevent_application_terminology() -> None:
-    """'application(s)' was retired in prose: always 'app(s)' (MIME types are code, not prose)."""
+    """'application(s)' was retired in prose: always 'app(s)' (MIME types and the macOS
+    ``Application Support`` directory are paths, not prose)."""
     pattern = re.compile(r"(?i)\bapplications?\b")
     violations = [
-        v for v in _count_pattern_in_live_prose(pattern) if "application/" not in v
+        v
+        for v in _count_pattern_in_live_prose(pattern)
+        if "application/" not in v and "Application Support" not in v
     ]
     assert len(violations) <= snapshot(3), (
         "Retired 'application' terminology in live prose:\n"
@@ -409,7 +480,7 @@ def test_prevent_application_terminology() -> None:
 # identifiers that still say "service" so the count never grows.
 # Identifiers only, never prose: Python names come from the tokenizer (so
 # docstrings and comments do not count), TypeScript names from the source with
-# its comments and string literals blanked. The remainder is the minds embed
+# its comments and string literals blanked. The remainder is the Imbue Studio embed
 # contract's own vocabulary, which the shell speaks but does not own: the
 # ``serviceName`` payload key of ``minds:open-share-settings`` (its vendored
 # declaration file is skipped whole), and one HTTP status name.
@@ -420,7 +491,16 @@ _SHELL_IDENTIFIER_SCAN_ROOTS = (
     Path("system/libs/workspace_ui/src"),
 )
 
-_SERVICE_IDENTIFIER_EXEMPT_TOKENS = frozenset({"HTTP_SERVICE_UNAVAILABLE"})
+_SERVICE_IDENTIFIER_EXEMPT_TOKENS = frozenset(
+    {
+        "HTTP_SERVICE_UNAVAILABLE",
+        # The update notice names the system-services agent, which a rollback
+        # cannot restart itself; that agent is not an app.
+        "needs_system_services_restart",
+        "needsSystemServicesRestart",
+        "SYSTEM_SERVICES_RESTART_DETAILS",
+    }
+)
 
 _SERVICE_IDENTIFIER_EXEMPT_FILENAMES = frozenset({"embed-contract.d.ts"})
 

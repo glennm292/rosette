@@ -1,0 +1,299 @@
+/**
+ * The verbs a window's menu, and a taskbar entry's context menu, offer: only what the shell
+ * itself can do (concepts.md section 2.2). Move and resize opens the grid of backdrop zones the
+ * maximize control opens on hover, as a submenu; Fullscreen fills the viewport with the window
+ * (Exit fullscreen brings it back) and Immersive asks the Imbue Studio chrome to take the whole
+ * app window with the keyboard locked, where the chrome can (the Screen spec, section 12); Share asks the Imbue Studio chrome
+ * to open its share settings for the app (never for a critical app); Quit closes every window of
+ * the app and stops its program where the workspace can honestly do so (the stop-when-no-windows
+ * spec, section 7); Close removes the window for
+ * everyone, and closes a pinned window, which is never closed for everyone, for this client alone --
+ * minimized, and its entry out of this client's bar (pinned-taskbar-entries plan
+ * section 4.4). Defined once so both menus render the identical list off the identical rule.
+ */
+
+import m from "mithril";
+import { icon } from "@imbue/workspace-ui/src/components/icons";
+import type { MenuRow, SubmenuChildRow } from "@imbue/workspace-ui/src/components/menu";
+import { OPEN_SHARE_SETTINGS, sendToEmbedder } from "@imbue/workspace-ui/src/embed";
+import { glyph } from "./glyphs";
+import { windowSizeSubmenuRow } from "./WindowSizeRow";
+import type { WindowSizeActions } from "./WindowSizeRow";
+import type { AppRecord, EntryMode } from "../model/records";
+import type { EntryLook } from "../reducers/desktopState";
+
+/** The width the shell's menus, the desktop's and the phone's, never go under, so a menu of two-word verbs is still
+ *  a card. */
+export const MENU_MIN_WIDTH = 176;
+
+/** The menu row's glyph size: the icon box is cut for the shared icon set's 24-frame glyphs at this size. */
+const MENU_GLYPH_SIZE = 16;
+
+/** The fullscreen and immersive verbs of a window's menu. */
+export interface WindowFullscreenActions {
+  /** Whether the window fills the viewport now, so the row offers the way back. */
+  readonly isFullscreen: boolean;
+  /** Fill the viewport with the window, or bring a fullscreen one back to its kept frame. */
+  readonly toggleFullscreen: () => void;
+  /** Whether the chrome has the app window immersive now, so the row offers the way out. */
+  readonly isImmersive: boolean;
+  /** Enter (or leave) immersive mode; null where the chrome cannot do it (a plain browser, an older chrome). The
+   *  row runs it straight from the click, since the chrome needs the gesture's activation to go fullscreen. */
+  readonly immersive: (() => void) | null;
+}
+
+/** What the window menu's Theming submenu offers (docs/system/themeable-apps.md): On and Off once the app is
+ *  themeable, and Enable theming until it is. */
+export interface WindowThemeActions {
+  /** Whether the app is written to wear the theme over its own look; until it is, On and Off are greyed. */
+  readonly isThemeable: boolean;
+  /** Whether the app's pages wear the workspace's theme now. */
+  readonly isOn: boolean;
+  readonly setOn: (isOn: boolean) => void;
+  /** Draft the request that makes the app themeable into the main chat; null with no chat to draft into. */
+  readonly enable: (() => void) | null;
+}
+
+/** The chat request "Enable theming" drafts: the app made themeable, following the workspace's guide. */
+export function enableThemingPrompt(appName: string): string {
+  return (
+    `Make the ${appName} app themeable, following docs/system/themeable-apps.md, and keep how it works. ` +
+    "Show me before keeping the change."
+  );
+}
+
+function themeSubmenuRow(actions: WindowThemeActions): MenuRow {
+  const check = (isChosen: boolean): m.Children =>
+    actions.isThemeable && isChosen ? m.trust(icon("check", { size: 13, strokeWidth: 2.5 })) : undefined;
+  const rows: SubmenuChildRow[] = [
+    {
+      kind: "action",
+      key: "theme-on",
+      label: "On",
+      isDisabled: !actions.isThemeable,
+      trailing: check(actions.isOn),
+      onSelect: () => actions.setOn(true),
+    },
+    {
+      kind: "action",
+      key: "theme-off",
+      label: "Off",
+      isDisabled: !actions.isThemeable,
+      trailing: check(!actions.isOn),
+      onSelect: () => actions.setOn(false),
+    },
+  ];
+  if (!actions.isThemeable && actions.enable !== null) {
+    rows.push(
+      { kind: "divider" },
+      { kind: "action", key: "theme-enable", label: "Enable theming", onSelect: actions.enable },
+    );
+  }
+  return {
+    kind: "submenu",
+    key: "theme",
+    label: "Theming",
+    value: actions.isThemeable && actions.isOn ? "On" : "Off",
+    rows: () => rows,
+  };
+}
+
+export interface WindowMenuActions {
+  /** The zone grid's actions, or null where there is nothing to place (a window since closed). */
+  readonly size: WindowSizeActions | null;
+  /** Run after a size is picked, to take the menu down. */
+  readonly onSized: () => void;
+  /** The fullscreen and immersive rows, or null where there is no window to fill the viewport with. */
+  readonly fullscreen: WindowFullscreenActions | null;
+  /** Null when there is no share surface for the app (a critical app). */
+  readonly share: (() => void) | null;
+  /** Null when the workspace cannot stop the app (a critical one). */
+  readonly quit: (() => void) | null;
+  /** Pull the window out into a desktop window of the embedding chrome's own (the pull-out-window spec); null
+   *  where the chrome cannot (a plain browser, an older chrome). */
+  readonly popOut: (() => void) | null;
+  /** Close the window for everyone; for a pinned window, which is never closed for everyone, this closes it for
+   *  this client alone (minimized, and its entry out of this client's bar). */
+  readonly close: () => void;
+  /** Null for an app that wears the theme itself, or declares that it is not themed. */
+  readonly theme: WindowThemeActions | null;
+}
+
+/** Ask the Imbue Studio chrome to open its share settings for ``app``; the embed contract names the app by the
+ *  key it gives it. */
+export function openShareSettings(app: AppRecord): void {
+  sendToEmbedder(OPEN_SHARE_SETTINGS, { serviceName: app.name });
+}
+
+/** Share and Quit, each where it applies. */
+function shareAndQuitRows(
+  app: AppRecord | undefined,
+  share: (() => void) | null,
+  quit: (() => void) | null,
+): MenuRow[] {
+  if (app === undefined) return [];
+  const rows: MenuRow[] = [];
+  if (share !== null) {
+    rows.push({
+      kind: "action",
+      key: "share",
+      label: `Share ${app.display_name}`,
+      icon: "user-plus",
+      onSelect: share,
+    });
+  }
+  if (quit !== null) {
+    rows.push({ kind: "action", key: "quit", label: `Quit ${app.display_name}`, icon: "power", onSelect: quit });
+  }
+  return rows;
+}
+
+/** Fullscreen (or Exit fullscreen), and Immersive (or Leave immersive) where the chrome can. */
+function fullscreenRows(actions: WindowFullscreenActions): MenuRow[] {
+  const rows: MenuRow[] = [
+    {
+      kind: "action",
+      key: "fullscreen",
+      label: actions.isFullscreen ? "Exit fullscreen" : "Fullscreen",
+      icon: { markup: glyph(actions.isFullscreen ? "exit-fullscreen" : "fullscreen", MENU_GLYPH_SIZE) },
+      onSelect: actions.toggleFullscreen,
+    },
+  ];
+  if (actions.immersive !== null) {
+    rows.push({
+      kind: "action",
+      key: "immersive",
+      label: actions.isImmersive ? "Leave immersive" : "Immersive",
+      icon: { markup: glyph("fullscreen", MENU_GLYPH_SIZE) },
+      onSelect: actions.immersive,
+    });
+  }
+  return rows;
+}
+
+/** The window menu's rows, in display order. */
+export function windowMenuRows(app: AppRecord | undefined, actions: WindowMenuActions): MenuRow[] {
+  const rows: MenuRow[] = [];
+  if (actions.size !== null) rows.push(windowSizeSubmenuRow(actions.size, actions.onSized));
+  if (actions.fullscreen !== null) rows.push(...fullscreenRows(actions.fullscreen));
+  if (rows.length > 0) rows.push({ kind: "divider" });
+  if (actions.theme !== null) rows.push(themeSubmenuRow(actions.theme), { kind: "divider" });
+  if (actions.popOut !== null) {
+    rows.push({
+      kind: "action",
+      key: "pop-out",
+      label: "Open in its own window",
+      icon: "external-link",
+      onSelect: actions.popOut,
+    });
+  }
+  rows.push(...shareAndQuitRows(app, actions.share, actions.quit));
+  // A rule, not a second one, and none at all above the first row: with neither Share nor Quit
+  // between them, the divider under Move and resize is already the one Close needs.
+  if (rows.length > 0 && rows[rows.length - 1]?.kind !== "divider") rows.push({ kind: "divider" });
+  rows.push({ kind: "action", key: "close", label: "Close", icon: "close", onSelect: actions.close });
+  return rows;
+}
+
+/** What a phone's window menu offers (plan-phone-interface.md): no placement verbs, no pull-out, and no Close,
+ *  since a window's row has its own X. */
+export interface PhoneWindowMenuActions {
+  readonly refresh: () => void;
+  /** Null when there is no share surface: a critical app, or a page no chrome embeds. */
+  readonly share: (() => void) | null;
+  /** Null when the workspace cannot stop the app. */
+  readonly quit: (() => void) | null;
+}
+
+/** The phone's window menu: Refresh, then Share and Quit where they apply. */
+export function phoneWindowMenuRows(app: AppRecord | undefined, actions: PhoneWindowMenuActions): MenuRow[] {
+  return [
+    { kind: "action", key: "refresh", label: "Refresh", icon: "refresh", onSelect: actions.refresh },
+    ...shareAndQuitRows(app, actions.share, actions.quit),
+  ];
+}
+
+/** The presentation verbs of a pinned entry's menu (pinned-taskbar-entries plan section 4.4). */
+export interface EntryPresentationActions {
+  readonly look: EntryLook;
+  /** Where the avatar creature lives: in the tray (``bar``), or floating above the windows. */
+  readonly setMode: (mode: EntryMode) => void;
+  /** Open the avatar chooser; offered while the pin declares the avatar. */
+  readonly changeAvatar: () => void;
+}
+
+export interface TaskbarEntryMenuActions {
+  readonly isMinimized: boolean;
+  readonly isMaximized: boolean;
+  /** Pulled out into a desktop window of the chrome's own: the entry offers to show it and to bring it back. */
+  readonly isDetached: boolean;
+  /** Raise or reopen the window's own desktop window. */
+  readonly show: () => void;
+  /** Show a pulled-out window's ghost again after it was hidden (``minimize`` hides it). */
+  readonly showGhost: () => void;
+  /** Bring a pulled-out window back to the desktop. */
+  readonly bringBack: () => void;
+  readonly restore: () => void;
+  readonly minimize: () => void;
+  readonly maximize: () => void;
+  readonly unmaximize: () => void;
+  /** Close the window for everyone; for a pinned window, minimize it and take this client's entry out of the bar. */
+  readonly close: () => void;
+  /** Null for an ordinary window's entry, which has no presentation to choose. */
+  readonly presentation: EntryPresentationActions | null;
+  /** Add the window's app to the desktop, or take it off; null when the app has no shortcut to add. */
+  readonly desktopShortcut: MenuRow | null;
+}
+
+/** A taskbar entry's context menu: Restore or Minimize, Maximize or Restore size (for a pulled-out window, Show,
+ *  Hide placeholder or Show placeholder, and Bring back to desktop instead of those), then for a pinned entry
+ *  Float or Move to taskbar (where the avatar creature lives) and the avatar chooser when the pin declares one,
+ *  then Add to desktop or Remove from desktop, then Close. */
+export function taskbarEntryMenuRows(actions: TaskbarEntryMenuActions): MenuRow[] {
+  // A pulled-out window's arrangement is the chrome's: the entry shows its window, hides or shows its
+  // placeholder here, or brings it back.
+  const rows: MenuRow[] = actions.isDetached
+    ? [
+        { kind: "action", key: "show", label: "Show", onSelect: actions.show },
+        actions.isMinimized
+          ? { kind: "action", key: "show-ghost", label: "Show placeholder", onSelect: actions.showGhost }
+          : { kind: "action", key: "hide-ghost", label: "Hide placeholder", onSelect: actions.minimize },
+        { kind: "action", key: "bring-back", label: "Bring back to desktop", onSelect: actions.bringBack },
+      ]
+    : [
+        actions.isMinimized
+          ? { kind: "action", key: "restore", label: "Restore", onSelect: actions.restore }
+          : { kind: "action", key: "minimize", label: "Minimize", onSelect: actions.minimize },
+      ];
+  if (!actions.isDetached) {
+    rows.push(
+      actions.isMaximized
+        ? { kind: "action", key: "unmaximize", label: "Restore size", onSelect: actions.unmaximize }
+        : { kind: "action", key: "maximize", label: "Maximize", onSelect: actions.maximize },
+    );
+  }
+  const presentation = actions.presentation;
+  if (presentation !== null) {
+    const { look, setMode, changeAvatar } = presentation;
+    const presentationRows: MenuRow[] = [
+      look.mode === "floating"
+        ? { kind: "action", key: "move-to-taskbar", label: "Move to taskbar", onSelect: () => setMode("bar") }
+        : { kind: "action", key: "float", label: "Float", onSelect: () => setMode("floating") },
+    ];
+    if (look.declaredStyle === "avatar") {
+      presentationRows.push({
+        kind: "action",
+        key: "change-avatar",
+        label: "Change avatar...",
+        onSelect: changeAvatar,
+      });
+    }
+    rows.push({ kind: "divider" }, ...presentationRows);
+  }
+  if (actions.desktopShortcut !== null) rows.push({ kind: "divider" }, actions.desktopShortcut);
+  rows.push(
+    { kind: "divider" },
+    { kind: "action", key: "close", label: "Close", icon: "close", onSelect: actions.close },
+  );
+  return rows;
+}

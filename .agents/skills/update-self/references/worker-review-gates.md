@@ -19,10 +19,32 @@ All three must hold:
 3. You authored no in-branch edits of your own. A 4a mirror edit, or any
    other commit you added on top of the merge, is merge work even though
    `classify-merge` (which diffs `HEAD^1` against the base) cannot see it.
-   The one commit that is not is the rollback revert Step 1 mandates on a
-   retry: it puts the landed merge's own content back, so when `git diff
-   <merge-sha> HEAD` is empty it authored nothing. Name both shas in the
-   report as this condition's evidence.
+   The commits that are not are the rollback reverts Step 1 mandates, as git
+   made them: they put earlier updates' own content back. A revert conflict
+   you resolved is your edit, unless you took the target's version of a
+   `both added` file. `git diff <merge-sha> HEAD` must still be empty, where
+   `<merge-sha>` is this pass's merge or, on a retry of a release already in
+   history (whose merge adds no commit), that release's landed merge. Name the
+   merge, each revert sha, and any revert conflict with how you resolved it
+   in the report as this condition's evidence. A catch-up merge (the worker
+   guide's §7) is not an edit of yours: what it brings in is the workspace's
+   own work, so after one the diff runs to your tip before the *first*
+   catch-up merge (§7's `$PRE` names the newest round's, which already holds
+   the earlier rounds' incoming work). Only this pass's catch-ups count: a
+   retry's `<merge-sha>` is an earlier attempt's, whose own catch-ups landed
+   after it, so the search starts at the workspace commit the newest catch-up
+   merged:
+
+   ```bash
+   LAST=$(git log --first-parent --merges -1 --format=%H --fixed-strings \
+       --grep "Catch up to the workspace's latest work")
+   FIRST=$(git log --first-parent --merges --format=%H --fixed-strings \
+       --grep "Catch up to the workspace's latest work" "$LAST^2..HEAD" | tail -n 1)
+   git diff <merge-sha> "$FIRST^1"
+   ```
+
+   A conflict you resolved in any catch-up, a lockfile you regenerated in one,
+   and any commit you added after one are edits.
 
 Every changed file then arrives exactly as upstream shipped and tested it, and
 there is nothing local for a review to protect. Running `/autofix` here would
@@ -34,7 +56,17 @@ that this branch fired and shows the evidence for all three conditions.
 ## Otherwise run the real gates, scoped to the locally-divergent content
 
 Follow the "Review gates" section of
-`.agents/shared/worker/references/harden-creation.md`.
+`.agents/shared/worker/references/harden-creation.md`, with one difference in
+its test gate: 4b's suites step already ran it. That step's `select-tests`
+read every path in this scope (the merged set, your own edits, a regenerated
+lockfile) and more, so do not select again with another base. Never run
+`select-tests --diff-base "$TARGET_REF"`: that diff is everything the workspace
+ever changed, not what this update reconciled, and it repeats suites 4b already
+ran. What you commit after 4b's suites run (a customization re-fit, a gate
+fix) is tested by what it reaches: `select-tests --diff-base <the commit
+before the first of them>`, every line of it. Those lines are the whole gate
+for those commits; a suite they did not print is a widening, and goes through
+the `question` gate like any other.
 
 The gate's scope is **every file whose merged content differs from the target
 release**: the conflicts you resolved with any hand-written content, your own

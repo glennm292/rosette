@@ -18,7 +18,7 @@
  *
  * A published entry is not necessarily a PARKED one: the backend flags an entry it is
  * about to type, or is typing, as ``is_sending``, and such an entry renders as the
- * "Sending…" bubble rather than a queued chip. A snapshot that is entirely ``is_sending``
+ * ordinary send's bubble rather than a queued chip. A snapshot that is entirely ``is_sending``
  * therefore gets no group chrome at all -- see ``renderQueuedMessages``.
  */
 
@@ -28,10 +28,24 @@ import type { QueuedMessage } from "../models/Chats";
 import { shoulderTap } from "../models/Response";
 import { hoverTooltipAttrs } from "@imbue/workspace-ui/src/components/hoverTooltip";
 import { prependToComposer, raiseFailureNotice } from "./MessageInput";
-import { OUTGOING_BUBBLE_CLASS, OUTGOING_ROW_CLASS, OUTGOING_STATUS_CLASS } from "./OutgoingMessageView";
+import {
+  closedPendingRun,
+  continuesPendingRun,
+  renderNotYetRealBubble,
+  type PendingBubbleRun,
+} from "./OutgoingMessageView";
 import { describeRequestError, describeRequestErrorKind } from "@imbue/workspace-ui/src/models/request-error";
 import { Button } from "@imbue/workspace-ui/src/components/Button";
-import { USER_BUBBLE_CLASS, USER_MESSAGE_ROW_CLASS } from "./user-message-display";
+import {
+  NOTICE_ROW_SPACING_CLASS,
+  authorOfTurn,
+  renderNoticeRow,
+  renderUserBubble,
+  renderUserBubbleContent,
+  userMessageRowClass,
+} from "./user-message-display";
+import { classifyDecidedMessage } from "./message-classification";
+import { UserMessageKind } from "./message-kinds";
 
 const SHOULDER_TAP_TOOLTIP = "Gently interrupt your agent to send queued messages early";
 const QUEUED_INFO_TOOLTIP = "Messages below are sent when your agent takes a breather mid-work or finishes a turn.";
@@ -78,30 +92,59 @@ async function shoulderTapQueuedMessages(chatId: string): Promise<void> {
 }
 
 /** Render one queued message as a user bubble. Reuses the user-bubble *view* (the
- *  same markup ``StableUserMessage`` produces for a plain prompt) directly, rather
- *  than the classifier -- a queued message is always shown verbatim.
+ *  same markup ``StableUserMessage`` produces for a plain prompt) directly: a queued message is
+ *  drawn as its transcript turn will be -- under its sender, in the words behind the author prefix
+ *  the agent is handed with a non-owner's message -- and one the transcript will show as a notice
+ *  (a background command's report) shows as that notice already.
  *
- *  A chip the backend reports as ``is_sending`` (a codex shoulder-tap's interrupt+resend)
- *  renders identically to the optimistic "Sending…" bubble (see OutgoingMessageView) -- same
- *  markup, same caption -- so a re-sent message stays continuously visible and reads "Sending…"
- *  through the resend rather than blinking out (contract A1a); the backend drives the transition
- *  to the committed turn. */
-function renderQueuedBubble(queued: QueuedMessage): m.Vnode {
-  if (queued.is_sending === true) {
-    return m("div", { class: OUTGOING_ROW_CLASS, key: `queued-${queued.queued_id}` }, [
-      m("div", { class: OUTGOING_BUBBLE_CLASS }, [
-        m("div", { class: "message-content whitespace-pre-wrap" }, queued.content),
-      ]),
-      m("div", { class: OUTGOING_STATUS_CLASS }, "Sending…"),
-    ]);
+ *  A chip the backend reports as ``is_sending`` (a codex shoulder-tap's interrupt+resend, or a
+ *  Claude message still queued when the reply landed)
+ *  renders identically to the optimistic outgoing bubble (see OutgoingMessageView), so a
+ *  re-sent message stays continuously visible through the resend rather than blinking out
+ *  (contract A1a); the backend drives the transition to the committed turn.
+ *
+ *  Drawn down `run`, as every pending send is (see PendingBubbleRun). */
+function renderQueuedBubble(queued: QueuedMessage, isInGroup: boolean, run: PendingBubbleRun): m.Vnode {
+  const cls = classifyDecidedMessage(queued.content, queued);
+  if (cls.kind === UserMessageKind.Notice) {
+    run.isOpen = false;
+    // A notice being sent is drawn like the transcript row it becomes, as a sending bubble is.
+    const rowClass = [
+      "queued-message queued-notice",
+      queued.is_sending === true ? null : "opacity-85",
+      isInGroup ? null : NOTICE_ROW_SPACING_CLASS,
+    ]
+      .filter((part) => part !== null)
+      .join(" ");
+    return renderNoticeRow(`queued-${queued.queued_id}`, rowClass, cls);
   }
+  const author = authorOfTurn(queued);
+  // The group's header names the viewer's bubbles, so theirs wear no "You" in it; another person's is named as its
+  // turn will be, once over a run of theirs.
+  if (isInGroup && author === null) {
+    run.isOpen = true;
+    run.author = null;
+  }
+  if (queued.is_sending === true) {
+    return renderNotYetRealBubble(
+      {
+        key: `queued-${queued.queued_id}`,
+        content: queued.content,
+        isGroupSpaced: isInGroup,
+        displayDecision: queued,
+        author: queued,
+      },
+      run,
+    );
+  }
+  const isContinued = continuesPendingRun(run, author);
   // opacity-85: the not-yet-sent muting; no bottom margin (the group's own gap
   // is the rhythm between queued bubbles).
-  return m("div", { class: `${USER_MESSAGE_ROW_CLASS} queued-message`, key: `queued-${queued.queued_id}` }, [
-    m("div", { class: `${USER_BUBBLE_CLASS} opacity-85` }, [
-      m("div", { class: "message-content whitespace-pre-wrap" }, queued.content),
-    ]),
-  ]);
+  return m(
+    "div",
+    { class: `${userMessageRowClass(author)} queued-message`, key: `queued-${queued.queued_id}` },
+    renderUserBubble(author, renderUserBubbleContent(cls.body), { isContinued, bubbleExtraClass: "opacity-85" }),
+  );
 }
 
 /**
@@ -112,20 +155,21 @@ function renderQueuedBubble(queued: QueuedMessage): m.Vnode {
  * the queued bubbles follow below. The group is a live mirror of the backend
  * snapshot -- it is never held or reconstructed on the frontend.
  */
-export function renderQueuedMessages(chatId: string): m.Vnode[] {
+export function renderQueuedMessages(chatId: string, run: PendingBubbleRun = closedPendingRun()): m.Vnode[] {
   const queued = getQueuedMessagesForChat(chatId);
   if (queued.length === 0) {
     return [];
   }
   // Nothing is actually parked: every entry the backend published is one it is about to
-  // type or is typing (agy's idle send, codex's shoulder-tap resend). Painting the
-  // "Queued messages" header and the tap button over those tells the user a message is
-  // WAITING when the backend is reporting the opposite -- and the header is the only
-  // reason an idle send ever looked queued, since the bubbles themselves already render
-  // as "Sending…". Bare bubbles, no group wrapper: identical markup to the optimistic
-  // ones they replace, so the handoff is invisible rather than a reflow.
+  // type or is typing (agy's idle send, codex's shoulder-tap resend, a Claude message still
+  // queued when the reply landed). Painting the "Queued messages" header and the tap button
+  // over those tells the user a message is WAITING when the backend is reporting the
+  // opposite -- and the header is the only reason an idle send ever looked queued, since the
+  // bubbles themselves already render as ordinary sends. Bare bubbles, no group wrapper:
+  // identical markup to the optimistic ones they replace, so the handoff is invisible rather
+  // than a reflow.
   if (queued.every((message) => message.is_sending === true)) {
-    return queued.map((message) => renderQueuedBubble(message));
+    return queued.map((message) => renderQueuedBubble(message, false, run));
   }
   // The button's enabled state = the backend's availability flag, AND-ed with the local
   // double-fire guard. The frontend computes nothing about availability itself: if the
@@ -159,7 +203,7 @@ export function renderQueuedMessages(chatId: string): m.Vnode[] {
           class:
             "queued-info shrink-0 cursor-help text-(length:--font-size-helper) leading-none text-secondary opacity-70 hover:opacity-100",
           tabindex: 0,
-          ...hoverTooltipAttrs(QUEUED_INFO_TOOLTIP),
+          ...hoverTooltipAttrs(QUEUED_INFO_TOOLTIP, "above"),
           "aria-label": QUEUED_INFO_TOOLTIP,
         },
         "ⓘ",
@@ -171,7 +215,7 @@ export function renderQueuedMessages(chatId: string): m.Vnode[] {
         sm: true,
         extra: "queued-action queued-action--flush shrink-0",
         ...(isDisabled ? { "aria-disabled": "true" } : {}),
-        ...hoverTooltipAttrs(SHOULDER_TAP_TOOLTIP),
+        ...hoverTooltipAttrs(SHOULDER_TAP_TOOLTIP, "above"),
         "aria-label": SHOULDER_TAP_TOOLTIP,
         onclick: () => shoulderTapQueuedMessages(chatId),
       },
@@ -182,7 +226,7 @@ export function renderQueuedMessages(chatId: string): m.Vnode[] {
   return [
     m("div", { class: "queued-group mb-5 flex flex-col items-stretch gap-2", key: "queued-group" }, [
       header,
-      ...queued.map((message) => renderQueuedBubble(message)),
+      ...queued.map((message) => renderQueuedBubble(message, true, run)),
     ]),
   ];
 }

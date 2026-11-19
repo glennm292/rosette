@@ -13,21 +13,31 @@ not have it).
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 from host_backup.capabilities import BackupCapabilities, SnapshotMethod
 from host_backup.config import BackupConfig, RetentionSettings
-from host_backup.restic import (
-    backup as restic_backup,
+from host_backup.heavy_dirs import (
+    count_snapshot_listing,
+    select_heavy_directories,
+    stream_snapshot_listing,
 )
 from host_backup.restic import (
+    NO_BACKUP_MARKER_FILENAME,
     extract_snapshot_id_from_backup_output,
+    find_backup_summary,
     init_repo,
+    is_repo_locked_error,
     is_repo_missing_error,
     probe_repo,
     run_restic,
+)
+from host_backup.restic import (
+    backup as restic_backup,
 )
 from host_backup.restic import (
     forget as restic_forget,
@@ -35,7 +45,7 @@ from host_backup.restic import (
 from host_backup.restic import (
     prune as restic_prune,
 )
-from host_backup.runner import _age_out_restore_markers, _LoopState
+from host_backup.runner import _age_out_restore_markers, _LoopState, _run_forget
 
 
 def _restic_available() -> bool:
@@ -92,6 +102,12 @@ def test_full_backup_forget_prune_cycle(tmp_path: Path) -> None:
     init = init_repo(env)
     assert init.returncode == 0, init.stderr
 
+    # Old enough to fall outside `--keep-within 1h` and every keep-* bucket,
+    # so forget has something to drop and prune something to reclaim.
+    expired_id = _backup_at(
+        source_dir, taken_at="2000-01-01 00:00:00", tag="expired", env=env
+    )
+
     backup_result = restic_backup(
         source_path=source_dir,
         excludes=("**/skip-me",),
@@ -118,15 +134,12 @@ def test_full_backup_forget_prune_cycle(tmp_path: Path) -> None:
         env_overrides=env,
     )
     assert second_backup.returncode == 0, second_backup.stderr
+    second_id = extract_snapshot_id_from_backup_output(second_backup.stdout)
 
-    forget_result = restic_forget(
-        keep_hourly=1,
-        keep_daily=1,
-        keep_weekly=1,
-        keep_monthly=1,
-        env_overrides=env,
+    _forget(env, keep_hourly=1)
+    assert _snapshot_ids(env) == {snapshot_id, second_id}, (
+        f"forget must drop only the expired snapshot {expired_id}"
     )
-    assert forget_result.returncode == 0, forget_result.stderr
 
     prune_result = restic_prune(env)
     assert prune_result.returncode == 0, prune_result.stderr
@@ -160,11 +173,167 @@ def test_exclude_pattern_actually_skips_files(tmp_path: Path) -> None:
     assert ".venv" not in listing.stdout
 
 
+def test_default_excludes_drop_app_data_copies_but_keep_what_they_copy(
+    tmp_path: Path,
+) -> None:
+    """The default excludes drop copies of app data, never the data or an instance's state."""
+    repo_dir = tmp_path / "repo"
+    home = tmp_path / "home"
+    data = home / "workspace" / "data"
+    kept = [
+        data / ".apps" / "pr-review" / "repos" / "pack.bin",
+        data / ".state" / "isolated-instances" / "pr-review-test" / "instance.json",
+        data / ".state" / "isolated-instances" / "pr-review-test" / "instance.log",
+    ]
+    dropped = [
+        data
+        / ".state"
+        / "isolated-instances"
+        / "pr-review-test"
+        / "copies"
+        / "data"
+        / "repos"
+        / "pack.bin",
+        data / ".state" / "isolated-instances" / "pr-review-test" / "scratch" / "x.db",
+    ]
+    for path in kept + dropped:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(path.name)
+
+    env = _env_for_local_repo(repo_dir)
+    assert init_repo(env).returncode == 0
+    backup_result = restic_backup(
+        source_path=home,
+        excludes=BackupConfig().excludes,
+        tag="default-excludes",
+        env_overrides=env,
+    )
+    assert backup_result.returncode == 0, backup_result.stderr
+
+    listing = run_restic(("ls", "latest"), env_overrides=env)
+    assert listing.returncode == 0, listing.stderr
+    # The snapshot holds the backed-up tree at its root.
+    listed = set(listing.stdout.splitlines())
+    for path in kept:
+        assert f"/{path.relative_to(home)}" in listed, path
+    for path in dropped:
+        assert f"/{path.relative_to(home)}" not in listed, path
+
+
+def test_a_no_backup_marker_keeps_its_directorys_contents_out_of_the_backup(
+    tmp_path: Path,
+) -> None:
+    """An app marks a rebuildable directory with the marker file; only the marker is backed up."""
+    repo_dir = tmp_path / "repo"
+    home = tmp_path / "home"
+    apps = home / "workspace" / "data" / ".apps"
+    marked = apps / "pr-review" / "repos"
+    unmarked = apps / "finances" / "raw"
+    # uv writes a CACHEDIR.TAG into every tool environment and virtualenv, which
+    # a restore could not refill, so that tag must not keep them out of the backup.
+    uv_tool_env = home / ".local" / "share" / "uv" / "tools" / "imbue-mngr"
+    for directory in (marked / "repo-a" / "sha-1", unmarked, uv_tool_env / "bin"):
+        directory.mkdir(parents=True)
+    (marked / NO_BACKUP_MARKER_FILENAME).touch()
+    (marked / "repo-a" / "sha-1" / "main.py").write_text("print('rebuildable')")
+    (unmarked / "statement.csv").write_text("kept")
+    (uv_tool_env / "CACHEDIR.TAG").write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55"
+    )
+    (uv_tool_env / "bin" / "mngr").write_text("#!/bin/sh\n")
+
+    env = _env_for_local_repo(repo_dir)
+    assert init_repo(env).returncode == 0
+    backup_result = restic_backup(
+        source_path=home, excludes=(), tag="no-backup-marker", env_overrides=env
+    )
+    assert backup_result.returncode == 0, backup_result.stderr
+
+    listing = run_restic(("ls", "latest"), env_overrides=env)
+    assert listing.returncode == 0, listing.stderr
+    listed = set(listing.stdout.splitlines())
+    assert (
+        f"/workspace/data/.apps/pr-review/repos/{NO_BACKUP_MARKER_FILENAME}" in listed
+    )
+    assert not any(
+        path.startswith("/workspace/data/.apps/pr-review/repos/repo-a")
+        for path in listed
+    )
+    assert "/workspace/data/.apps/finances/raw/statement.csv" in listed
+    assert "/.local/share/uv/tools/imbue-mngr/bin/mngr" in listed
+
+
+def test_heavy_dirs_names_the_directory_holding_most_of_a_real_snapshot(
+    tmp_path: Path,
+) -> None:
+    """The heavy-directories listing, read from a real repository, points at the big tree."""
+    repo_dir = tmp_path / "repo"
+    home = tmp_path / "home"
+    heavy_tree = home / "workspace" / "data" / ".apps" / "pr-review" / "repos"
+    for tree in range(4):
+        tree_dir = heavy_tree / f"sha-{tree}"
+        tree_dir.mkdir(parents=True)
+        for index in range(50):
+            (tree_dir / f"file-{index}.py").write_text(f"{tree}-{index}")
+    notes = home / "workspace" / "data" / "notes"
+    notes.mkdir(parents=True)
+    for index in range(5):
+        (notes / f"note-{index}.md").write_text(str(index))
+
+    env = _env_for_local_repo(repo_dir)
+    assert init_repo(env).returncode == 0
+    backup_result = restic_backup(
+        source_path=home, excludes=(), tag="heavy-dirs", env_overrides=env
+    )
+    assert backup_result.returncode == 0, backup_result.stderr
+
+    counts = count_snapshot_listing(stream_snapshot_listing("latest", env), max_depth=8)
+    heavy_by_path = {
+        directory.path: directory.entry_count
+        for directory in select_heavy_directories(counts, min_share=0.5)
+    }
+
+    # 200 files and 4 tree directories under repos/, out of 215 entries in all.
+    assert counts.entry_count_by_directory["/"] == 215
+    assert heavy_by_path["/workspace/data/.apps/pr-review/repos"] == 204
+    assert "/workspace/data/notes" not in heavy_by_path
+
+
+def _state_recording_events(tmp_path: Path) -> _LoopState:
+    state = _LoopState(BackupCapabilities(method=SnapshotMethod.DIRECT))
+    state.events_dir = tmp_path / "events"
+    state.current_tick_id = "tick-integration"
+    return state
+
+
 def _snapshot_ids(env: dict[str, str]) -> set[str]:
     """Return the full ids of all snapshots currently in the repo."""
     result = run_restic(("snapshots", "--json"), env_overrides=env)
     assert result.returncode == 0, result.stderr
     return {entry["id"] for entry in json.loads(result.stdout)}
+
+
+def _backup_at(
+    source_dir: Path, *, taken_at: str, tag: str, env: dict[str, str]
+) -> str:
+    """Back up `source_dir` as if at `taken_at` (restic `--time`); return the snapshot id."""
+    result = run_restic(
+        ("backup", "--json", str(source_dir), "--tag", tag, "--time", taken_at),
+        env_overrides=env,
+    )
+    assert result.returncode == 0, result.stderr
+    return extract_snapshot_id_from_backup_output(result.stdout)
+
+
+def _forget(env: dict[str, str], *, keep_hourly: int) -> None:
+    result = restic_forget(
+        keep_hourly=keep_hourly,
+        keep_daily=1,
+        keep_weekly=1,
+        keep_monthly=1,
+        env_overrides=env,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_forget_keeps_restore_marker_that_hourly_thinning_would_drop(
@@ -180,33 +349,23 @@ def test_forget_keeps_restore_marker_that_hourly_thinning_would_drop(
     assert init_repo(env).returncode == 0
 
     # A restore marker, then two ordinary backups -- all in the same hour, so
-    # keep-hourly=1 keeps only the newest ordinary one and would forget the
-    # marker if it were not tag-protected.
-    marker = restic_backup(
-        source_path=source_dir, excludes=(), tag="restored", env_overrides=env
+    # that hour's bucket keeps only the newest ordinary one and would forget
+    # the marker if it were not tag-protected. The latest backup comes more
+    # than an hour later, so `--keep-within 1h` holds none of the three.
+    marker_id = _backup_at(
+        source_dir, taken_at="2026-09-01 10:05:00", tag="restored", env=env
     )
-    marker_id = extract_snapshot_id_from_backup_output(marker.stdout)
-    (source_dir / "f.txt").write_text("v2")
-    ordinary_old = restic_backup(
-        source_path=source_dir, excludes=(), tag="2026-hourly-a", env_overrides=env
+    ordinary_old_id = _backup_at(
+        source_dir, taken_at="2026-09-01 10:10:00", tag="2026-hourly-a", env=env
     )
-    ordinary_old_id = extract_snapshot_id_from_backup_output(ordinary_old.stdout)
-    (source_dir / "f.txt").write_text("v3")
-    ordinary_new = restic_backup(
-        source_path=source_dir, excludes=(), tag="2026-hourly-b", env_overrides=env
+    ordinary_new_id = _backup_at(
+        source_dir, taken_at="2026-09-01 10:20:00", tag="2026-hourly-b", env=env
     )
-    ordinary_new_id = extract_snapshot_id_from_backup_output(ordinary_new.stdout)
+    latest_id = _backup_at(
+        source_dir, taken_at="2026-09-01 12:00:00", tag="2026-hourly-c", env=env
+    )
 
-    assert (
-        restic_forget(
-            keep_hourly=1,
-            keep_daily=1,
-            keep_weekly=1,
-            keep_monthly=1,
-            env_overrides=env,
-        ).returncode
-        == 0
-    )
+    _forget(env, keep_hourly=2)
 
     surviving = _snapshot_ids(env)
     assert marker_id in surviving, (
@@ -218,6 +377,7 @@ def test_forget_keeps_restore_marker_that_hourly_thinning_would_drop(
     assert ordinary_old_id not in surviving, (
         "the older ordinary backup is still thinned normally"
     )
+    assert latest_id in surviving
 
 
 def test_forget_thins_snapshots_that_each_came_from_their_own_snapshot_path(
@@ -234,37 +394,125 @@ def test_forget_thins_snapshots_that_each_came_from_their_own_snapshot_path(
     env = _env_for_local_repo(repo_dir)
     assert init_repo(env).returncode == 0
 
-    # Four ticks, four uniquely-named snapshot dirs, all within the same hour.
+    # Four ticks, four uniquely-named snapshot dirs, all within the same hour,
+    # then a fifth tick more than an hour later so `--keep-within 1h` holds
+    # none of the first four.
+    tick_times = (
+        "2026-09-01 03:10:00",
+        "2026-09-01 03:20:00",
+        "2026-09-01 03:30:00",
+        "2026-09-01 03:40:00",
+        "2026-09-01 05:00:00",
+    )
     per_tick_ids: list[str] = []
-    for tick in range(4):
-        source_dir = tmp_path / "snapshots" / f"2026-09-0{tick + 1}" / "home"
+    for tick, taken_at in enumerate(tick_times):
+        source_dir = tmp_path / "snapshots" / f"tick-{tick}" / "home"
         source_dir.mkdir(parents=True)
         (source_dir / "f.txt").write_text(f"tick-{tick}")
-        result = restic_backup(
-            source_path=source_dir,
-            excludes=(),
-            tag=f"2026-hourly-{tick}",
-            env_overrides=env,
+        per_tick_ids.append(
+            _backup_at(
+                source_dir, taken_at=taken_at, tag=f"2026-hourly-{tick}", env=env
+            )
         )
-        assert result.returncode == 0, result.stderr
-        per_tick_ids.append(extract_snapshot_id_from_backup_output(result.stdout))
 
-    assert (
-        restic_forget(
-            keep_hourly=1,
-            keep_daily=1,
-            keep_weekly=1,
-            keep_monthly=1,
-            env_overrides=env,
-        ).returncode
-        == 0
-    )
+    _forget(env, keep_hourly=2)
 
     surviving = _snapshot_ids(env)
-    assert surviving == {per_tick_ids[-1]}, (
-        "keep-hourly=1 must keep exactly the newest tick's snapshot across all "
-        f"snapshot paths, but {len(surviving)} of 4 survived"
+    assert surviving == {per_tick_ids[3], per_tick_ids[4]}, (
+        "keep-hourly=2 must keep exactly the newest snapshot of each of the two "
+        f"hours across all snapshot paths, but {len(surviving)} of 5 survived"
     )
+
+
+def test_forget_keeps_every_snapshot_within_an_hour_of_the_latest(
+    tmp_path: Path,
+) -> None:
+    """An extra tick in the same hour must not thin away the hour's previous snapshot."""
+    repo_dir = tmp_path / "repo"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "f.txt").write_text("v1")
+    env = _env_for_local_repo(repo_dir)
+    assert init_repo(env).returncode == 0
+
+    picked_id = _backup_at(
+        source_dir, taken_at="2026-09-01 10:20:00", tag="2026-hourly-a", env=env
+    )
+    (source_dir / "f.txt").write_text("v2")
+    extra_tick_id = _backup_at(
+        source_dir, taken_at="2026-09-01 10:40:00", tag="2026-hourly-b", env=env
+    )
+
+    _forget(env, keep_hourly=1)
+
+    assert _snapshot_ids(env) == {picked_id, extra_tick_id}
+
+
+def test_backup_skips_unchanged_files_when_each_tick_reads_a_new_snapshot_path(
+    tmp_path: Path,
+) -> None:
+    """A tick reading a new snapshot path must still reuse the previous backup's file metadata.
+
+    outer_trigger reads every tick from `<mount>/snapshots/<timestamp>/home`.
+    The copy below keeps each file's size and mtime but not its inode, as a
+    fresh snapshot seen through another path may not.
+    """
+    repo_dir = tmp_path / "repo"
+    env = _env_for_local_repo(repo_dir)
+    assert init_repo(env).returncode == 0
+
+    first_tick = tmp_path / "snapshots" / "2026-09-24T10:00:00.000000Z" / "home"
+    (first_tick / "workspace").mkdir(parents=True)
+    for index in range(20):
+        (first_tick / "workspace" / f"file-{index}.txt").write_text(f"content {index}")
+    first = restic_backup(
+        source_path=first_tick, excludes=(), tag="tick-1", env_overrides=env
+    )
+    assert first.returncode == 0, first.stderr
+
+    second_tick = tmp_path / "snapshots" / "2026-09-24T11:00:00.000000Z" / "home"
+    shutil.copytree(first_tick, second_tick)
+    (second_tick / "workspace" / "file-7.txt").write_text("changed since tick 1")
+    second = restic_backup(
+        source_path=second_tick, excludes=(), tag="tick-2", env_overrides=env
+    )
+    assert second.returncode == 0, second.stderr
+
+    summary = find_backup_summary(second.stdout)
+    assert summary is not None, second.stdout
+    assert summary["files_unmodified"] == 19
+    assert summary["files_changed"] == 1
+    assert summary["files_new"] == 0
+
+
+def test_backup_stores_the_source_tree_at_the_snapshot_root(tmp_path: Path) -> None:
+    """`<snapshot>:/` restores exactly the backed-up tree -- the subpath Imbue Studio restores from."""
+    repo_dir = tmp_path / "repo"
+    env = _env_for_local_repo(repo_dir)
+    assert init_repo(env).returncode == 0
+    source_dir = tmp_path / "snapshots" / "2026-09-24T10:00:00.000000Z" / "home"
+    (source_dir / "workspace").mkdir(parents=True)
+    (source_dir / "workspace" / "notes.md").write_text("restore me")
+
+    backup_result = restic_backup(
+        source_path=source_dir, excludes=(), tag="tick", env_overrides=env
+    )
+    assert backup_result.returncode == 0, backup_result.stderr
+    snapshot_id = extract_snapshot_id_from_backup_output(backup_result.stdout)
+
+    target_dir = tmp_path / "restored"
+    restore_result = run_restic(
+        ("restore", f"{snapshot_id}:/", "--target", str(target_dir)),
+        env_overrides=env,
+    )
+    assert restore_result.returncode == 0, restore_result.stderr
+    assert sorted(
+        p.relative_to(target_dir).as_posix() for p in target_dir.rglob("*")
+    ) == [
+        "workspace",
+        "workspace/notes.md",
+    ]
+    assert (target_dir / "workspace" / "notes.md").read_text() == "restore me"
 
 
 def test_age_out_forgets_only_expired_restore_markers(tmp_path: Path) -> None:
@@ -279,20 +527,9 @@ def test_age_out_forgets_only_expired_restore_markers(tmp_path: Path) -> None:
 
     # An old restore marker (backdated 30 days via restic --time), a recent
     # restore marker, and an ordinary backup.
-    old_backup = run_restic(
-        (
-            "backup",
-            "--json",
-            "--tag",
-            "restored",
-            "--time",
-            "2000-01-01 00:00:00",
-            str(source_dir),
-        ),
-        env_overrides=env,
+    old_marker_id = _backup_at(
+        source_dir, taken_at="2000-01-01 00:00:00", tag="restored", env=env
     )
-    assert old_backup.returncode == 0, old_backup.stderr
-    old_marker_id = extract_snapshot_id_from_backup_output(old_backup.stdout)
     (source_dir / "f.txt").write_text("data2")
     recent_marker_id = extract_snapshot_id_from_backup_output(
         restic_backup(
@@ -306,9 +543,7 @@ def test_age_out_forgets_only_expired_restore_markers(tmp_path: Path) -> None:
         ).stdout
     )
 
-    state = _LoopState(BackupCapabilities(method=SnapshotMethod.DIRECT))
-    state.events_dir = tmp_path / "events"
-    state.current_tick_id = "tick-integration"
+    state = _state_recording_events(tmp_path)
     _age_out_restore_markers(
         state=state,
         config=BackupConfig(
@@ -325,3 +560,104 @@ def test_age_out_forgets_only_expired_restore_markers(tmp_path: Path) -> None:
     assert ordinary_id in surviving, (
         "ordinary backups are never touched by the marker age-out"
     )
+
+
+def _leave_a_dead_backups_lock(tmp_path: Path, env: dict[str, str]) -> None:
+    """Leave the non-exclusive lock of a `restic backup` that was killed mid-run.
+
+    restic takes the backup's lock before it starts the `--stdin-from-command`
+    child, so the child writing to `locked` means the lock is on disk; the child
+    then blocks on `hold` until it is released.
+    """
+    locked = tmp_path / "locked.fifo"
+    hold = tmp_path / "hold.fifo"
+    os.mkfifo(locked)
+    os.mkfifo(hold)
+    backup = subprocess.Popen(
+        [
+            "restic",
+            "backup",
+            "--stdin-from-command",
+            "--",
+            "sh",
+            "-c",
+            'echo locked > "$1"; cat "$2"',
+            "sh",
+            str(locked),
+            str(hold),
+        ],
+        env={**os.environ, **env},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert locked.read_text().strip() == "locked"
+    finally:
+        backup.kill()
+        # Reaped, so restic sees the lock's PID as gone rather than a zombie.
+        backup.wait()
+    # Opening and closing the write end gives the orphaned `cat` its EOF.
+    hold.write_text("")
+
+
+def test_forget_clears_a_dead_backups_lock_and_applies_retention(
+    tmp_path: Path,
+) -> None:
+    """A killed backup's lock blocks forget until `_run_forget` unlocks and retries.
+
+    forget needs an exclusive lock, which restic refuses while any other lock
+    exists, stale or not; a new backup (non-exclusive) never trips over it, so
+    nothing but forget's own retry clears it.
+    """
+    # Without the flag (restic < 0.17) the backup exits at once and the FIFO read
+    # in _leave_a_dead_backups_lock would block until the timeout.
+    backup_help = subprocess.run(
+        ["restic", "backup", "--help"], capture_output=True, text=True, check=False
+    )
+    if "--stdin-from-command" not in backup_help.stdout:
+        pytest.skip("restic backup has no --stdin-from-command (needs restic >= 0.17)")
+    repo_dir = tmp_path / "repo"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    env = _env_for_local_repo(repo_dir)
+    assert init_repo(env).returncode == 0
+    # Two snapshots more than an hour apart, so `--keep-within 1h` and keep-*=1
+    # leave one to forget once the lock is cleared.
+    snapshot_ids: list[str] = []
+    for version, taken_at in (
+        ("v1", "2026-09-01 10:00:00"),
+        ("v2", "2026-09-01 12:00:00"),
+    ):
+        (source_dir / "f.txt").write_text(version)
+        snapshot_ids.append(
+            _backup_at(source_dir, taken_at=taken_at, tag=version, env=env)
+        )
+
+    _leave_a_dead_backups_lock(tmp_path, env)
+    assert list((repo_dir / "locks").iterdir()), "the killed backup left no lock"
+    blocked = restic_forget(
+        keep_hourly=1, keep_daily=1, keep_weekly=1, keep_monthly=1, env_overrides=env
+    )
+    assert blocked.returncode != 0
+    assert is_repo_locked_error(blocked.stderr), blocked.stderr
+
+    state = _state_recording_events(tmp_path)
+    _run_forget(
+        state=state,
+        config=BackupConfig(
+            retention=RetentionSettings(
+                keep_hourly=1, keep_daily=1, keep_weekly=1, keep_monthly=1
+            )
+        ),
+        env_overrides=env,
+    )
+
+    assert state.events_dir is not None
+    events = [
+        json.loads(line)
+        for line in (state.events_dir / "events.jsonl").read_text().splitlines()
+    ]
+    forget_events = [e for e in events if e["type"] == "FORGET_COMPLETED"]
+    assert [e["exit_code"] for e in forget_events] == [0], forget_events
+    assert _snapshot_ids(env) == {snapshot_ids[-1]}
+    assert list((repo_dir / "locks").iterdir()) == []

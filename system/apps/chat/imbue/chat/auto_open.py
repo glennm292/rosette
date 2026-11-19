@@ -1,17 +1,21 @@
-"""Surfacing the tab of a chat created from outside the workspace, once, where the user is.
+"""Surfacing a chat created from outside the workspace, once, where the user is.
 
-A chat the Mind app starts -- the update run behind "Update now", the help chat behind "Ask
-an agent" -- carries a label asking for its tab to be opened when it appears. The app cannot
-dock a tab itself: it is outside the workspace, and the user may not be looking yet. So the
-chat app reacts to the label on a newly observed agent and asks the shell to open the chat's
-address in every connected client, which files it into whatever view each client is on.
+A chat the Imbue Studio app starts -- the welcome chat it seeds, the update run behind "Update now", the
+help chat behind "Ask an agent" -- carries a label asking to be shown when it appears. The app
+cannot show it itself: it is outside the workspace, and the user may not be looking yet. So the
+chat app reacts to the label on a newly observed agent and asks the shell's ``show`` op
+(desktop-interface contracts.md section 8) to put the chat root with the chat selected on the
+screen of every connected client, on whatever desktop each client is on. It names no page to
+repoint, so the shell raises a window already showing the chat, else points this app's pinned
+window at it (pinned-taskbar-entries plan section 4.8; the pinned window is independent, so each
+client's own view moves and nobody else's does), else opens a chat root window on it.
 
-A chat is owed its tab exactly once. Delivery is remembered on disk, so a restart of this app
-(the update run itself restarts it) neither re-pops a tab the user has since closed nor loses
-one nobody was there to take: with no client connected the open is held and retried until a
+A chat is owed its window exactly once. Delivery is remembered on disk, so a restart of this app
+(the update run itself restarts it) neither re-pops a window the user has since closed nor loses
+one nobody was there to take: with no client connected the show is held and retried until a
 client connects, for as long as the chat exists. Only a chat the ledger already names is left
 to the saved layout -- along with the chats a workspace already had the first time this app
-kept a ledger at all, which are adopted as shown rather than each popping a tab.
+kept a ledger at all, which are adopted as shown rather than each popping a window.
 """
 
 from __future__ import annotations
@@ -23,22 +27,24 @@ from collections.abc import Iterable
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
-from typing import Protocol
-from typing import runtime_checkable
 
-import httpx
-from app_instances.nudge import SHELL_POST_TIMEOUT_SECONDS
 from loguru import logger as _loguru_logger
 from pydantic import Field
 from pydantic import PrivateAttr
+from workspace_layout.errors import ShellAnswerMalformedError
+from workspace_layout.errors import ShellOpError
+from workspace_layout.interfaces import ShellLayoutInterface
+from workspace_layout.primitives import ClientId
+from workspace_layout.primitives import WindowPage
+from workspace_layout.primitives import WindowPath
 
 from imbue.chat.primitives import ChatId
-from imbue.imbue_common.frozen_model import FrozenModel
+from imbue.chat.shell_client import chat_show_args
 from imbue.imbue_common.mutable_model import MutableModel
 
 logger = _loguru_logger
 
-# ``assist`` is the label the Mind app's help flow has always set; ``auto_open`` is the
+# ``assist`` is the label the Imbue Studio app's help flow has always set; ``auto_open`` is the
 # purpose-neutral form any spawner can set. The app sets both.
 AUTO_OPEN_LABELS: Final[tuple[str, ...]] = ("auto_open", "assist")
 
@@ -46,18 +52,22 @@ AUTO_OPEN_LABELS: Final[tuple[str, ...]] = ("auto_open", "assist")
 # The shell has no hook for a client arriving, so a window opened later is found by asking.
 FLUSH_INTERVAL_SECONDS: Final[float] = 3.0
 
-# Beside the chat app's other per-workspace state (see ``message_stamps``).
-DEFAULT_LEDGER_PATH: Final[Path] = Path("data/.apps/chat/auto_opened_chats.json")
+# Beside the chat app's other per-workspace state (see ``message_stamps``), in its data directory.
+LEDGER_FILENAME: Final[str] = "auto_opened_chats.json"
 
 _DELIVERED_KEY: Final = "delivered"
+
+# The chat root: the chat list, beside whichever chat is selected.
+CHAT_ROOT_PAGE: Final[WindowPage] = WindowPage("/")
 
 
 def is_auto_open_labeled(labels: Mapping[str, str]) -> bool:
     return any(labels.get(label) == "true" for label in AUTO_OPEN_LABELS)
 
 
-def chat_address(chat_id: ChatId) -> str:
-    return f"app:chat?instance={chat_id}"
+def chat_root_path(chat_id: ChatId) -> WindowPath:
+    """The chat root's path with the chat selected (plan section 9.1): where the auto-opened window lands."""
+    return WindowPath(f"{CHAT_ROOT_PAGE}?chat={chat_id}")
 
 
 class AutoOpenLedger(MutableModel):
@@ -135,7 +145,7 @@ class AutoOpenLedger(MutableModel):
         """Take chats as already shown without showing them, and leave a ledger behind either way.
 
         What a first boot with no ledger finds is history this app cannot see: every chat the
-        Mind app ever labeled here, back to the workspace's first day. The file is written
+        Imbue Studio app ever labeled here, back to the workspace's first day. The file is written
         even when there is nothing to adopt, so that its existence is what tells the next boot
         the set it reads is the real one.
         """
@@ -153,81 +163,6 @@ class AutoOpenLedger(MutableModel):
             self._save_unlocked()
 
 
-@runtime_checkable
-class ShellLayoutInterface(Protocol):
-    """The two things the reactor asks of the shell: who is connected, and to open a chat for one of them."""
-
-    def connected_client_ids(self) -> list[str]: ...
-
-    def open_chat(self, chat_id: ChatId, client_id: str) -> bool: ...
-
-
-class ShellLayoutClient(FrozenModel):
-    """The shell over loopback: its client list, and its agent-facing op route (contracts.md section 12).
-
-    Unlike ``post_to_shell`` this reports whether the shell accepted the op, because the
-    reactor holds an open the shell refused and tries again.
-    """
-
-    shell_url: str = Field(description="The shell's base URL, without a trailing slash")
-
-    def connected_client_ids(self) -> list[str]:
-        # An answer of the wrong shape reads as no clients, rather than subscripting blind: an
-        # exception here escapes the flush thread's own catch and ends it for the life of the
-        # process, and a reactor with no thread surfaces no tab and says nothing about it.
-        try:
-            response = httpx.get(f"{self.shell_url}/api/clients", timeout=SHELL_POST_TIMEOUT_SECONDS)
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, ValueError) as e:
-            logger.debug("Could not list the shell's clients at {}: {}", self.shell_url, e)
-            return []
-        clients = payload.get("clients") if isinstance(payload, dict) else None
-        if not isinstance(clients, list):
-            logger.warning(
-                "Ignoring a client list of the wrong shape from the shell at {} (expected a JSON object with a "
-                "'clients' list, got {})",
-                self.shell_url,
-                type(payload).__name__,
-            )
-            return []
-        return [
-            str(client["id"])
-            for client in clients
-            if isinstance(client, dict) and client.get("is_connected") and client.get("id")
-        ]
-
-    def open_chat(self, chat_id: ChatId, client_id: str) -> bool:
-        body = {"op": "open", "args": {"address": chat_address(chat_id), "client": client_id}, "requester": ""}
-        try:
-            response = httpx.post(
-                f"{self.shell_url}/api/layout/broadcast", json=body, timeout=SHELL_POST_TIMEOUT_SECONDS
-            )
-        except httpx.HTTPError as e:
-            logger.debug("Could not ask the shell at {} to open chat {}: {}", self.shell_url, chat_id, e)
-            return False
-        if response.is_error:
-            logger.info(
-                "The shell refused to open chat {} for client {} ({}): {}",
-                chat_id,
-                client_id,
-                response.status_code,
-                response.text.strip()[:300],
-            )
-            return False
-        return True
-
-
-class DisconnectedShell(FrozenModel):
-    """A shell with nobody connected: the default until ``main`` installs the real one, and for tests."""
-
-    def connected_client_ids(self) -> list[str]:
-        return []
-
-    def open_chat(self, chat_id: ChatId, client_id: str) -> bool:
-        return False
-
-
 class AutoOpenReactor(MutableModel):
     """Delivers the open a labeled chat is owed, once, to the clients connected when it can.
 
@@ -239,7 +174,7 @@ class AutoOpenReactor(MutableModel):
     model_config = {"arbitrary_types_allowed": True, "extra": "forbid", "frozen": False}
 
     ledger: AutoOpenLedger = Field(description="Which chats' opens have already reached a client")
-    shell: ShellLayoutInterface = Field(description="The shell's client list and op route")
+    shell: ShellLayoutInterface = Field(description="The shell's client list and its show op")
 
     _lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
     _pending_chat_ids: set[ChatId] = PrivateAttr(default_factory=set)
@@ -250,18 +185,18 @@ class AutoOpenReactor(MutableModel):
     def note_appeared(self, chat_id: ChatId, labels: Mapping[str, str]) -> None:
         """A chat whose labeled agent the observe stream just added is owed its open unless it already had it.
 
-        A successor agent of an existing chat never carries the label, so a handoff never re-pops a tab.
+        A successor agent of an existing chat never carries the label, so a handoff never re-pops a window.
         """
         if not is_auto_open_labeled(labels):
             return
         self.request_open(chat_id)
 
     def request_open(self, chat_id: ChatId) -> None:
-        """A chat this app opened on its own (a seeded chat) is owed its tab like a labeled one.
+        """A chat this app opened on its own (a seeded chat) is owed its window like a labeled one.
 
-        Held and retried the same way, so a chat seeded while nobody was connected (the Mind
-        app seeds the workspace's first chat before its window shows the workspace) gets its
-        tab when the first client connects.
+        Held and retried the same way, so a chat seeded while nobody was connected (the Imbue
+        Studio app seeds the workspace's first chat before its window shows the workspace) gets its
+        window when the first client connects.
         """
         if self.ledger.is_delivered(chat_id):
             return
@@ -274,14 +209,14 @@ class AutoOpenReactor(MutableModel):
     def seed_at_startup(self, labels_by_chat_id: Mapping[ChatId, Mapping[str, str]]) -> None:
         """Decide what each labeled chat found at startup is owed: its open, or nothing.
 
-        A restart normally restores the saved layout rather than reopening tabs, so a chat the
+        A restart normally restores the saved layout rather than reopening windows, so a chat the
         ledger already names stays as the user left it. One it does not name is still owed its
         open -- an update run started while no client was connected, whose apply then restarted
         this app before anyone looked -- and holds it for as long as the chat exists.
 
         Except on a boot with no ledger to read, where a chat the ledger does not name means
         nothing: every labeled chat the workspace has is adopted as shown, since the ledger is
-        the only thing that could tell the one chat owed a tab from a year of delivered ones.
+        the only thing that could tell the one chat owed a window from a year of delivered ones.
         """
         if not self.ledger.is_history_known:
             adopted = [chat_id for chat_id, labels in labels_by_chat_id.items() if is_auto_open_labeled(labels)]
@@ -304,15 +239,23 @@ class AutoOpenReactor(MutableModel):
             return set(self._pending_chat_ids)
 
     def flush(self) -> None:
-        """Try every held open against every connected client; the first accepted open delivers it."""
+        """Try every held chat against every connected client; the first client the shell shows it to delivers it."""
         pending = self.pending_chat_ids()
         if not pending:
             return
-        client_ids = self.shell.connected_client_ids()
+        try:
+            client_ids = [client.id for client in self.shell.connected_clients()]
+        except ShellAnswerMalformedError as e:
+            logger.warning("The shell's client list is not one, so {} chat(s) stay held: {}", len(pending), e)
+            return
+        except ShellOpError as e:
+            # The shell may be restarting; the next wake asks again.
+            logger.debug("Could not list the shell's clients, so {} chat(s) stay held: {}", len(pending), e)
+            return
         if not client_ids:
             return
         for chat_id in pending:
-            accepted = [client_id for client_id in client_ids if self.shell.open_chat(chat_id, client_id)]
+            accepted = [client_id for client_id in client_ids if self._is_shown(chat_id, client_id)]
             if accepted:
                 logger.info("Opened chat {} in {} client(s): {}", chat_id, len(accepted), ", ".join(accepted))
                 self.ledger.mark_delivered(chat_id)
@@ -347,6 +290,24 @@ class AutoOpenReactor(MutableModel):
         except (OSError, ValueError, RuntimeError) as e:
             # The thread has to outlive one bad answer from the shell; the next wake retries.
             logger.opt(exception=e).warning("An auto-open flush failed; retrying on the next wake")
+
+    def _is_shown(self, chat_id: ChatId, client_id: ClientId) -> bool:
+        """Ask the shell to show the chat root on the chat to one client; whichever way it shows it counts."""
+        request = chat_show_args(chat_root_path(chat_id), showing=(), repoint=(), client_id=client_id)
+        try:
+            self.shell.show(request)
+        except ShellAnswerMalformedError as e:
+            logger.warning(
+                "The shell answered the show of chat {} to client {} with something else, so it is held: {}",
+                chat_id,
+                client_id,
+                e,
+            )
+            return False
+        except ShellOpError as e:
+            logger.info("The shell did not show chat {} to client {}, so it is held: {}", chat_id, client_id, e)
+            return False
+        return True
 
     def _drop(self, chat_id: ChatId) -> None:
         with self._lock:

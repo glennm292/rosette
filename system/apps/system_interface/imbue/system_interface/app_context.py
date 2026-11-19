@@ -6,9 +6,15 @@ from pydantic import Field
 
 from imbue.imbue_common.mutable_model import MutableModel
 from imbue.system_interface.config import Config
+from imbue.system_interface.presence import PresenceStore
+from imbue.system_interface.presence import PresenceSweep
+from imbue.system_interface.profiles import ProfileResolver
+from imbue.system_interface.roster import RosterAnnouncer
+from imbue.system_interface.roster import RosterSource
+from imbue.system_interface.roster import RosterWatch
 from imbue.system_interface.shell.state import ShellState
-from imbue.system_interface.template_catalog import TemplateCatalogStore
 from imbue.system_interface.update_staleness import UpdateStalenessTracker
+from imbue.system_interface.workspace_name import WorkspaceNameSource
 
 # Key under which the single SystemInterfaceState is stored on ``app.config`` so
 # handlers can fetch it via ``get_state()``.
@@ -36,8 +42,21 @@ class SystemInterfaceState(MutableModel):
     config: Config
     # The shell's own collaborators (the inventory, the stores, the activity log).
     shell: ShellState
-    # The New Tab page's template catalog: fetched from its URL, cached under the shell's state.
-    template_catalog: TemplateCatalogStore
+    # Who is connected right now: the per-user files under data/.state/presence.
+    presence: PresenceStore
+    # The periodic check that notices a silent departure and tells the windows.
+    presence_sweep: PresenceSweep
+    # Each account's display name and avatar, from imbue_cloud through the on-disk cache.
+    profiles: ProfileResolver
+    # Everyone who may be here, computed from the grants, presence, and the profiles.
+    roster: RosterSource
+    # How the roster reaches every window, once per change: the heartbeat route, the sweep, and the watch all push
+    # through it.
+    roster_announcer: RosterAnnouncer
+    # Re-announces the roster when a grants file or the gateway's last-seen record changes.
+    roster_watch: RosterWatch
+    # The workspace's name, from the config or the workspace's mngr records.
+    workspace_name: WorkspaceNameSource
     # Captures the tree HEAD this process started from, so the app shell can
     # say when the served tree has moved under it (see update_staleness.py).
     # A factory (not a shared default): the HEAD read happens per state build,
@@ -48,9 +67,15 @@ class SystemInterfaceState(MutableModel):
         description="The bundle directory the shell routes serve from: the package's own static/ unless the "
         "state is built with another (a test serving a shell it wrote)",
     )
+    # A preview shell is the real desktop with one app swapped, booted over a copy of the
+    # live state: it refuses the verbs that would reach the live workspace (an app's stop
+    # and start, the update notice's), tells its page so, and raises no staleness banner.
+    is_preview: bool = Field(default=False, description="Whether this shell is a preview of a proposed change")
 
     def shutdown(self) -> None:
         """Tear down every owned resource. Idempotent."""
+        self.presence_sweep.stop()
+        self.roster_watch.stop()
         self.shell.broadcaster.shutdown()
         self.shell.stop()
 

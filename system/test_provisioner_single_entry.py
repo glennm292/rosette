@@ -11,6 +11,7 @@ and the same goes for any provider without a Docker build.
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).parents[1]
@@ -59,3 +60,30 @@ def test_every_version_pin_setup_system_expands_has_a_default() -> None:
     defaulted = set(re.findall(r'^: "\$\{(\w+_VERSION):=', setup_system, re.MULTILINE))
     assert expanded != set()
     assert expanded <= defaulted
+
+
+def test_earlyoom_runs_the_fork_the_installer_puts_in_place_and_not_the_apt_package() -> (
+    None
+):
+    """The apt earlyoom reads /proc/<pid>/oom_score, which gVisor serves as 0, so
+    it ignores the priority bands there. supervisord must exec the binary
+    install_earlyoom.sh installs, by absolute path (a bare name would resolve to
+    a reinstalled apt binary on a PATH without /usr/local/bin first), through the
+    timestamping wrapper that execs it, and the apt list must not bring the
+    package back."""
+    installer = (_SCRIPTS_DIR / "install_earlyoom.sh").read_text()
+    (install_path,) = re.findall(r'^INSTALL_PATH="([^"]+)"$', installer, re.MULTILINE)
+    conf = (_REPO_ROOT / "system" / "supervisord.conf.d" / "earlyoom.conf").read_text()
+    (command_line,) = re.findall(r"^command=(.*)$", conf, re.MULTILINE)
+    wrapper, binary = shlex.split(command_line)[:2]
+    assert wrapper.startswith("/home/user/workspace/")
+    assert (_REPO_ROOT / wrapper.removeprefix("/home/user/workspace/")).is_file()
+    assert binary == install_path
+
+    apt_installs = re.findall(
+        r"^apt-get install\b(.*?)(?<!\\)$",
+        _SETUP_SYSTEM_PATH.read_text(),
+        re.MULTILINE | re.DOTALL,
+    )
+    assert apt_installs != []
+    assert all("earlyoom" not in packages.split() for packages in apt_installs)

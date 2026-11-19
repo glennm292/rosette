@@ -78,6 +78,9 @@ SettleActivity = Callable[[], None]
 # ``message.lock``); returns success. Bound by the endpoint to the specific agent -- claude's
 # empty-queue chord path uses it; the base restart-drain and the other overrides ignore it.
 PressChord = Callable[[], bool]
+# Whether the agent is compacting its context (a fresh compacting marker, or a compaction the
+# chat asked for and has not seen finish). Bound by the endpoint to the specific agent.
+IsCompactionInFlight = Callable[[], bool]
 
 
 @contextmanager
@@ -144,6 +147,7 @@ class InterruptToComposer(ABC):
         settle_activity: SettleActivity,
         press_chord: PressChord,
         get_in_flight_block: Callable[[], str],
+        is_compaction_in_flight: IsCompactionInFlight,
     ) -> str:
         """Interrupt the turn and return the queued messages as one block (``""`` = nothing queued).
 
@@ -153,6 +157,8 @@ class InterruptToComposer(ABC):
         ``get_in_flight_block`` reads the session's *Sending* records, so a send aborted
         mid-flight is folded into the returned block (contract A4/B) by the harnesses that
         guarantee ordering (claude, pi); the base restart-drain ignores it.
+        ``is_compaction_in_flight`` lets an implementation cancel a compaction running with no turn
+        in flight.
         Raises :class:`AgentRestartError` if a restart-based implementation cannot restart.
         """
 
@@ -163,21 +169,22 @@ def restart_drain(
     restart_process: RestartProcess,
     settle_activity: SettleActivity,
 ) -> str:
-    """The shared restart-drain: capture the block, restart, settle activity, clear the mirror.
+    """The shared restart-drain: capture the block, restart, clear the mirror, settle activity.
 
     The block is captured BEFORE the restart (which drops the harness queue); the restart is then
-    run, the transcript-derived activity settled (the caller's own next send re-drives it), and
-    the tracked queued set the SIGKILL invalidated cleared -- which also pushes the now-empty
-    group. No empty-queue short-circuit: a stop with nothing queued still interrupts the turn
-    (callers wanting a no-op on an empty queue, e.g. the flush, check first). Raises
-    :class:`AgentRestartError` if the restart fails.
+    run, the tracked queued set the SIGKILL invalidated cleared -- which also pushes the now-empty
+    group -- and the transcript-derived activity settled (the caller's own next send re-drives it).
+    Clearing first means the settle's IDLE never meets the returned messages still queued, which
+    the idle backstop would otherwise show as being delivered. No empty-queue short-circuit: a
+    stop with nothing queued still interrupts the turn (callers wanting a no-op on an empty
+    queue, e.g. the flush, check first). Raises :class:`AgentRestartError` if the restart fails.
     """
     block = watcher.get_queued_block()
     is_restarted, output = restart_process()
     if not is_restarted:
         raise AgentRestartError(f"Failed to restart agent '{agent_info.name}': {output}")
-    settle_activity()
     watcher.clear_queue()
+    settle_activity()
     return block
 
 
@@ -231,7 +238,9 @@ class RestartDrainInterruptToComposer(InterruptToComposer):
         settle_activity: SettleActivity,
         press_chord: PressChord,
         get_in_flight_block: Callable[[], str],
+        is_compaction_in_flight: IsCompactionInFlight,
     ) -> str:
-        # The base restart-drain interrupts via SIGKILL-relaunch; it has no use for the chord
-        # or the in-flight fold (its bounded lock acquire is best-effort, not ordered).
+        # The base restart-drain interrupts via SIGKILL-relaunch, which ends a compaction too; it
+        # has no use for the chord or the in-flight fold (its bounded lock acquire is best-effort,
+        # not ordered).
         return restart_drain_under_message_lock(self._agent_info, watcher, restart_process, settle_activity)

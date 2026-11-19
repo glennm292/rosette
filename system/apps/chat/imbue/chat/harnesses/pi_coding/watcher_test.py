@@ -15,11 +15,14 @@ from typing import Any
 import pytest
 
 from imbue.chat.agent_discovery import AgentInfo
+from imbue.chat.harnesses.events import DisplayKind
 from imbue.chat.harnesses.harness_type import HarnessType
 from imbue.chat.harnesses.pi_coding.inbox import PI_INTERRUPT_KEY
 from imbue.chat.harnesses.pi_coding.inbox import PI_RETRACT_KEY
 from imbue.chat.harnesses.pi_coding.watcher import PiSessionWatcher
 from imbue.chat.harnesses.pi_coding.watcher import PiTranscriptLoader
+from imbue.chat.harnesses.session_watcher import ReplyDraft
+from imbue.chat.harnesses.session_watcher import ReplyDraftSources
 
 
 def _agent_info(state_dir: Path) -> AgentInfo:
@@ -135,6 +138,31 @@ def test_queue_enqueues_from_inbox_and_leaves_on_drained_user_turn(tmp_path: Pat
     # The message drains into the transcript as a user turn -> it leaves the queue.
     _append_session(session, [_message_record("u", _user("please do X"))])
     assert watcher.get_queued_messages() == []
+
+
+def test_compaction_event_does_not_drain_queue(tmp_path: Path) -> None:
+    session = tmp_path / "s.jsonl"
+    _write_session(session, [])
+    _point_marker(tmp_path, session)
+    inbox = tmp_path / "pi_inbox"
+    inbox.write_text(json.dumps("please do X") + "\n")
+    watcher = _build(tmp_path)
+    assert [entry["content"] for entry in watcher.get_queued_messages()] == ["please do X"]
+
+    # Compaction record in session: surfaces as a status event, but must NOT drain the user queue.
+    compaction_record = {
+        "type": "compaction",
+        "id": "c1",
+        "timestamp": "2026-09-21T22:31:30.122Z",
+        "summary": "Compacted context",
+    }
+    _append_session(session, [compaction_record])
+    assert [entry["content"] for entry in watcher.get_queued_messages()] == ["please do X"]
+
+    events = watcher.get_all_events()
+    assert len(events) == 1
+    assert events[0]["event_id"] == "pi-c1"
+    assert events[0]["display"] == DisplayKind.STATUS
 
 
 @pytest.mark.parametrize("sentinel_key", [PI_INTERRUPT_KEY, PI_RETRACT_KEY])
@@ -435,3 +463,48 @@ def test_a_loader_reads_the_session_files_without_watching_or_a_queue(tmp_path: 
     assert {event["agent_id"] for event in events} == {"agent-test"}
     assert loader.get_total_event_count() == 2
     assert not isinstance(loader, PiSessionWatcher)
+
+
+_NO_SOURCES = ReplyDraftSources(capture_pane=lambda: None, read_streamed_reply=lambda: None)
+
+
+def _session_with_one_user_turn(state_dir: Path) -> None:
+    session = state_dir / "plugin" / "pi_coding" / "sessions" / "cwd" / "s.jsonl"
+    _write_session(session, [_message_record("u1", _user("tell me about tides"))])
+    _point_marker(state_dir, session)
+
+
+def test_reply_draft_is_the_text_pi_is_streaming_after_the_last_event(tmp_path: Path) -> None:
+    _session_with_one_user_turn(tmp_path)
+    (tmp_path / "pi_reply_draft").write_text("Tides rise ")
+    watcher = _build(tmp_path)
+    watcher.get_all_events()
+
+    assert watcher.read_reply_draft(_NO_SOURCES) == ReplyDraft(after_event_id="pi-u1", text="Tides rise")
+
+
+def test_reply_draft_is_dropped_once_the_session_file_records_the_reply(tmp_path: Path) -> None:
+    session = tmp_path / "plugin" / "pi_coding" / "sessions" / "cwd" / "s.jsonl"
+    _write_session(
+        session,
+        [
+            _message_record("u1", _user("tell me about tides")),
+            _message_record(
+                "a1", {"role": "assistant", "content": [{"type": "text", "text": "Tides rise twice a day."}]}
+            ),
+        ],
+    )
+    _point_marker(tmp_path, session)
+    (tmp_path / "pi_reply_draft").write_text("Tides rise twice a day.")
+    watcher = _build(tmp_path)
+    watcher.get_all_events()
+
+    assert watcher.read_reply_draft(_NO_SOURCES) == ReplyDraft(after_event_id="pi-a1", text="")
+
+
+def test_reply_draft_is_empty_without_a_draft_file(tmp_path: Path) -> None:
+    _session_with_one_user_turn(tmp_path)
+    watcher = _build(tmp_path)
+    watcher.get_all_events()
+
+    assert watcher.read_reply_draft(_NO_SOURCES) == ReplyDraft(after_event_id="pi-u1", text="")

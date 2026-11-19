@@ -1,0 +1,99 @@
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from "vitest";
+import m from "mithril";
+import { chatRowFixture } from "./chatRowFixture";
+import type { ChatRow } from "./rows";
+import { SendPicker, pickableRows } from "./SendPicker";
+
+function row(chatId: string, title: string, kind: ChatRow["kind"] = "agent"): ChatRow {
+  return chatRowFixture(chatId, { title, kind });
+}
+
+const ROWS = [
+  row("agent-1", "Plan the launch"),
+  row("agent-2", "Fix the tests"),
+  row("agent-3", "New chat", "provisional"),
+  row("room-0123456789abcdef", "Lounge", "room"),
+];
+
+let root: HTMLElement | null = null;
+
+function mount(attrs: { onPick: (chatId: string) => void; onDismiss: () => void; isDraft?: boolean }): HTMLElement {
+  root = document.createElement("div");
+  document.body.appendChild(root);
+  m.mount(root, { view: () => m(SendPicker, { rows: ROWS, text: "hello there", isDraft: false, ...attrs }) });
+  return root;
+}
+
+afterEach(() => {
+  if (root !== null) {
+    m.mount(root, null);
+    root.remove();
+    root = null;
+  }
+});
+
+describe("pickableRows", () => {
+  it("offers the chats that can take a message, narrowed by title, and not a chat that is not an agent yet", () => {
+    expect(pickableRows(ROWS, "").map((candidate) => candidate.chatId)).toEqual([
+      "agent-1",
+      "agent-2",
+      "room-0123456789abcdef",
+    ]);
+    expect(pickableRows(ROWS, "lounge").map((candidate) => candidate.chatId)).toEqual(["room-0123456789abcdef"]);
+    expect(pickableRows(ROWS, "tests").map((candidate) => candidate.chatId)).toEqual(["agent-2"]);
+    expect(pickableRows(ROWS, "zzz")).toEqual([]);
+  });
+});
+
+describe("SendPicker", () => {
+  it("shows the text and the chats, highlights the first, and picks on a click", () => {
+    const onPick = vi.fn();
+    const picker = mount({ onPick, onDismiss: vi.fn() });
+    expect(picker.querySelector(".send-picker-text")!.textContent).toBe("“hello there”");
+    expect(picker.querySelector("[data-send-picker]")!.getAttribute("aria-label")).toBe("Send to which chat?");
+    const targets = Array.from(picker.querySelectorAll("[data-send-target]"));
+    expect(targets.map((target) => target.getAttribute("data-send-target"))).toEqual([
+      "agent-1",
+      "agent-2",
+      "room-0123456789abcdef",
+    ]);
+    expect(targets[0].getAttribute("aria-selected")).toBe("true");
+    (targets[1] as HTMLElement).click();
+    expect(onPick).toHaveBeenCalledWith("agent-2");
+  });
+
+  it("narrows on typing, moves the highlight with the arrows, and Enter picks the highlight", () => {
+    const onPick = vi.fn();
+    const picker = mount({ onPick, onDismiss: vi.fn() });
+    const input = picker.querySelector<HTMLInputElement>("[data-send-picker-search]")!;
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    m.redraw.sync();
+    expect(picker.querySelector('[data-send-target="agent-2"]')!.getAttribute("aria-selected")).toBe("true");
+    expect(
+      Array.from(picker.querySelectorAll("[data-send-target]")).map((row) => row.getAttribute("data-highlighted")),
+    ).toEqual(["false", "true", "false"]);
+    input.value = "plan";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    m.redraw.sync();
+    expect(picker.querySelectorAll("[data-send-target]")).toHaveLength(1);
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(onPick).toHaveBeenCalledWith("agent-1");
+    input.value = "zzz";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    m.redraw.sync();
+    expect(picker.querySelector(".send-picker-no-match")).not.toBeNull();
+  });
+
+  it("says the pick drafts the text when the intake is a draft", () => {
+    const picker = mount({ onPick: vi.fn(), onDismiss: vi.fn(), isDraft: true });
+    expect(picker.querySelector("[data-send-picker]")!.getAttribute("aria-label")).toBe("Draft into which chat?");
+  });
+
+  it("dismisses on Escape", () => {
+    const onDismiss = vi.fn();
+    mount({ onPick: vi.fn(), onDismiss });
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+});

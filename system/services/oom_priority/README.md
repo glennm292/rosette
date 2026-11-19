@@ -7,19 +7,77 @@ the small amount of Python that *steers* and *records* it.
 
 ## How it fits together
 
-earlyoom picks its victim by reading `/proc/*/oom_score`, the kernel "badness"
-value -- which already folds in each process's `oom_score_adj`. So the whole
-priority scheme is just: set each process's `oom_score_adj` once, at startup,
-into one of a few bands.
+The workspace runs the [imbue-ai fork of earlyoom](https://github.com/imbue-ai/earlyoom)
+(installed by `system/scripts/install_earlyoom.sh`), which picks its victim by
+the kernel's "badness", computed from each process's `oom_score_adj` and memory:
+
+    VmRSS + VmSwap + VmPTE + oom_score_adj * (MemTotal + SwapTotal) / 1000
+
+Under gVisor the fork counts the sum of the `Anonymous:` lines in
+`/proc/<pid>/smaps` in place of `VmRSS`: gVisor's `VmRSS` counts every page of
+each range it has mapped, so each claude process would carry the whole claude
+binary, which killing one of them does not free.
+
+Upstream earlyoom reads `/proc/*/oom_score` instead, which gVisor serves as 0
+for every process, so under gVisor it shed the largest process whatever its
+band. On a Linux kernel (runc) the fork's order is the kernel's own. So the
+whole priority scheme is just: set each process's `oom_score_adj` once, at
+startup, into one of a few bands; one band point is worth MemTotal/1000 of
+memory.
+
+What MemTotal *is* depends on the container runtime. A local docker workspace
+runs with the memory cap the template's `[providers.docker]` block sets
+(`default_memory`, changeable per workspace with `mngr docker resize`). Under
+gVisor (runsc, the default on Linux) the container's `/proc/meminfo` reports
+that cap as MemTotal, so earlyoom's thresholds and badness scores are relative
+to the workspace's own limit and shedding starts before the cgroup OOM killer
+does. Under runc (the macOS fallback, and the create form's default runtime)
+`/proc/meminfo` reports the whole machine, so the workspace publishes its own
+cgroup's limit and headroom for earlyoom instead (see below). A resize while the
+container runs changes the cgroup cap at once but a gVisor container's reported
+MemTotal only after a restart. A lima workspace runs directly in its VM, so
+MemTotal is the VM's own RAM (the lima create template's `--memory`,
+changeable with `mngr lima resize`): earlyoom's thresholds follow the VM's
+size, and a resize takes effect once the VM restarts at the new size.
+
+Under gVisor, `/proc/meminfo` also misses the memory the runtime itself is
+charged against the cgroup (0.3-0.9 GB on a gen-2 slice), so earlyoom's 10%
+threshold can arrive only after the cgroup has killed the whole sandbox. A
+gen-2 slice VM therefore publishes the cgroup's own limit and headroom into the
+workspace's volume, and so does the VM of a cloud workspace (AWS, GCP, Azure,
+Vultr, OVH: mngr_vps's `mngr-vps-container-meminfo.service`), and earlyoom runs
+with `--host-meminfo /mngr-vol/.host-meminfo`
+(`system/supervisord.conf.d/earlyoom.conf`), acting on
+whichever of the two shows less headroom. A local docker workspace under runc
+publishes the same file for itself: the `publish_cgroup_meminfo` program
+(`bin/publish_cgroup_meminfo.py`, over `cgroup_meminfo`) reads the container's
+own cgroup v2 controller at `/sys/fs/cgroup` four times a second and writes the
+limit as MemTotal and, as MemAvailable, the limit minus the usage plus what the
+kernel frees before it kills in the cgroup: the file cache no process has
+mapped, on both the inactive and the active list, and the reclaimable slab. The
+VM-side publishers add the inactive file cache alone, which is all a gVisor
+sandbox's cgroup holds; under runc a file read twice is on the active list, so
+a workspace whose backup walks a large tree every hour would otherwise read as
+full while its processes use a fraction of its cap. It removes the
+file while the container is uncapped (and keeps checking, since `mngr docker
+resize` can cap a running container), and touches nothing where it has no
+answer: no cgroup v2 memory controller (lima's root cgroup, gVisor's own
+cgroupfs) or a counter it cannot read, so the gen-2 VM's file is never
+disturbed and earlyoom otherwise logs once and uses `/proc/meminfo` alone.
+Under gVisor it exits at once, since the VM publishes the file. earlyoom's swap gate is
+held open (`-s 100,100`): a workspace container can never swap, but under runc
+it sees the host's swap as its own, which would otherwise keep earlyoom from
+ever acting on a laptop with swap.
 
 - **`bands`** -- the `oom_score_adj` value per band and the helper that writes
   it. From least- to most-expendable: never-kill infrastructure (0) < built-in
   services and apps (`SERVICE_BANDS`, 5-75, keyed by service name and by the
   `priority` an app's manifest declares; the chat app sits at 25, just above
-  the shell) <
+  the agent observer at 24, itself just above the shell) <
   user-created services (`USER_SERVICE`, 200) < user agent (300) < worker agent
-  (600) < agent subprocess (900) < Chromium's own processes (910-1000, renderers
-  at the ceiling). Chat agents occupy a *dynamic* range that straddles the worker
+  (600) < the Screen's stack (`SCREEN_STACK`, 850: the desktop an agent or the user
+  launched, so it goes before any agent and after the programs on it) < agent
+  subprocess (900) < Chromium's own processes (910-1000, renderers at the ceiling). Chat agents occupy a *dynamic* range that straddles the worker
   band: `CHAT_AGENT_FLOOR` (300, a chat being engaged with right now) through
   `CHAT_AGENT_BASE` (560, idle but recently used, and the launch band) up to
   `CHAT_AGENT_STALE_CEILING` (800, untouched long enough to count as abandoned).
@@ -27,19 +85,30 @@ into one of a few bands.
   engagement and elapsed idle time (see "Dynamic chat band" below).
   Bands are positive-only: a negative value (true "never kill")
   needs `CAP_SYS_RESOURCE`, which the container does not have, so the never-kill
-  infrastructure (sshd, supervisord, earlyoom, tini, tmux) simply keeps the
-  inherited default of 0 and is additionally shielded by earlyoom `--avoid`. The
-  service order is a best-effort steer, not a hard guarantee -- see "Protection
-  is soft" below.
+  infrastructure (sshd, supervisord, earlyoom, earlyoom-stamp, tini, tmux)
+  simply keeps the inherited default of 0 and is additionally shielded by
+  earlyoom `--avoid`. The service order is a best-effort steer, not a hard
+  guarantee -- see "Protection is soft" below.
+- **`cgroup_meminfo`** -- the container's own memory headroom, read from its
+  cgroup, in the form earlyoom's `--host-meminfo` takes; the
+  `publish_cgroup_meminfo` program writes it under runc.
 - **`app_registry`** -- the narrow, stdlib-only reader of the app registry the
   backstop listener uses: each registered app's `priority` band name, by the
   supervisord program that runs it.
 - **`agent_identity`** -- classifies an agent from its label (primary, chat, or
   worker), used by the launch wrapper to pick the band. An agent whose record
   can't be read matches none of these and is tagged least-protected (worker band).
-- **`registry`** -- one file per agent recording its main-process pid, so a
-  killed pid can be mapped back to "which agent" (earlyoom's after-kill hook is
-  handed only a pid that is already gone).
+- **`registry`** -- one file per agent process recording its pid, start time and
+  boot id, so a killed pid can be mapped back to "which agent" (earlyoom's
+  after-kill hook is handed only a pid that is already gone), and so the chat
+  app's prioritizer can re-tag an agent's processes by its id. A reader counts an
+  entry only while its pid is still that process, started at the recorded time in
+  the same boot: pids are reused within hours under gVisor, `/proc/<id>` also
+  resolves for another process's thread, and the registry outlives a container
+  restart while start times count from boot. An entry written before start times
+  were recorded counts while its pid is a process whose environment carries the
+  agent id the entry names. The kill hook, which reads an entry after its process
+  is gone, can check only that it was recorded in this boot.
 - **`ledger`** -- the append-only shed ledger and the revival-notice bookkeeping.
 
 Tagging happens at three startup points, each setting a process's band directly
@@ -47,14 +116,18 @@ without inspecting the process tree:
 
 | What | When | Band | Set by |
 |---|---|---|---|
-| never-kill infra (sshd, supervisord, earlyoom, tini, tmux) | (inherited) | protected (0) | nothing -- 0 is the default, plus earlyoom `--avoid` |
+| never-kill infra (sshd, supervisord, earlyoom, earlyoom-stamp, tini, tmux) | (inherited) | protected (0) | nothing -- 0 is the default, plus earlyoom `--avoid` |
 | a built-in supervisord service or app | launch | its `SERVICE_BANDS` value (an app's is the `priority` its manifest declares) | `system/services/oom_priority/bin/oom_tag_service.py <service>` (command prefix) |
 | a user-created supervisord service or app | launch | user service (above every built-in) | `system/services/oom_priority/bin/oom_tag_service.py user` (command prefix) |
 | a workspace terminal's shell (a `terminal-N` tmux session's pane, and everything run in it) | session creation | `terminal-session` (the user-service level, 200) | `system/services/oom_priority/bin/oom_tag_service.py terminal-session bash -l`, the session command the terminal app gives `tmux new-session` (a pane otherwise inherits the tmux server's protected 0) |
 | an agent's main process | launch | chat -> the idle-but-fresh chat band (560); worker or unidentifiable -> worker agent | `system/services/oom_priority/bin/agent_oom_launch.py` |
 | an agent's subprocesses | each Bash tool call | agent subprocess (most expendable) | `system/scripts/agent_rewrite_bash_command.py` (PreToolUse; also sets the commit identity) |
-| the browser coordinator | launch | its `SERVICE_BANDS` value (70, the most expendable built-in service) | `system/services/oom_priority/bin/oom_tag_service.py browser` (command prefix) |
-| Chromium's own processes | on fleet events (launch, new page, navigation) | `[SHARED_BROWSER_FLOOR, SHARED_BROWSER]` (910-1000), renderers at the ceiling | the browser service's re-tagging sweep (`browser.oom_retag`) -- see "The Chromium exception" below |
+| a command an agent waits on through `run_in_background.py --waiter` (a lead's wait on its worker) | launch | user service (200), with the runner that reports it; a shed one is started again while its agent runs | `system/scripts/workspace_bare_scripts/run_in_background.py` |
+| the Screen service | launch | `screen` (72, an ordinary service band; Files and Getting Started sit above it) | `system/services/oom_priority/bin/oom_tag_service.py screen` (command prefix) |
+| the four programs of the Screen's stack (`screen-xorg`, `screen-session`, `screen-pulse`, `screen-neko`) and its watcher | launch | `SCREEN_STACK` (850), by program name through `_NON_SERVICE_PROGRAM_BANDS` | `system/services/oom_priority/bin/oom_tag_service.py <program name>` (command prefix) |
+| a program started on the Screen by `screen run` | launch | agent subprocess (900) | the Screen service's launcher (`oom_tag_shell_prefix`) |
+| a program started from the Screen itself (the XFCE menu, a terminal on it) | the Screen service's sweep, every 10 s | agent subprocess (900) | the Screen service's band sweep (`screen.band_sweep`) -- see "The Chromium exception" below |
+| Chromium's own processes | the same sweep, with a burst after a launch or a new tab | `[SHARED_BROWSER_FLOOR, SHARED_BROWSER]` (910-1000), renderers at the ceiling | the Screen service's band sweep -- see "The Chromium exception" below |
 
 Each supervisord service tags itself the same way an agent's main process does:
 its `command` in `system/supervisord.conf.d/<name>.conf` runs `system/services/oom_priority/bin/oom_tag_service.py <key> <the
@@ -87,8 +160,8 @@ unrecognized. The `oom_tag_service.py <key>` prefix passes band keys by name.
 It only ever raises,
 never lowers, so a process already tagged higher (a Chromium process the
 browser sweep has remapped into its band) and the `PROTECTED` programs
-(earlyoom, the listener itself, and the one-shots env-converge and
-vm-exec-register) are never demoted. Because this path *raises*, a built-in
+(earlyoom, the listener itself, publish_cgroup_meminfo, and the one-shots
+env-converge and vm-exec-register) are never demoted. Because this path *raises*, a built-in
 missing from either band map is not merely left alone but actively pushed to
 `USER_SERVICE`, above every other built-in -- so
 `oom_tag_service_test.test_every_built_in_supervisord_program_has_an_explicit_band`
@@ -118,6 +191,16 @@ process, so its band is set before any subprocess exists. A subprocess inherits 
 agent's band by default; the PreToolUse hook raises it the rest of the way so a
 runaway build/test/browser is always shed first.
 
+npm-installed codex needs one exception. Its `codex` command is the npm entry point
+(`bin/codex.js`), which runs the native binary as a child rather than exec'ing it,
+so exec'ing `codex` would leave the registered pid on `node` while earlyoom sheds an
+unregistered child. For `codex` the wrapper therefore execs the native binary
+directly, picking it for this machine's platform exactly as the entry point does,
+with the environment the entry point would set. `system/scripts/setup_system.sh`
+fails the build if a codex version bump moves that binary, and the wrapper warns on
+stderr if it finds the npm entry point without it before falling back to the entry
+point.
+
 ## The Chromium exception
 
 Everything above rests on inheritance: tag a process once and its whole subtree
@@ -133,12 +216,21 @@ The kernel cannot forbid the lowering: without `CAP_SYS_RESOURCE` any process
 may lower its own value back down to its inherited floor (`oom_score_adj_min`,
 0 everywhere in this container). But Chromium writes each value exactly once
 (its continuous re-adjustment is ChromeOS-only), so an external raise sticks.
-The browser service therefore sweeps its descendants and remaps every value
-found below `SHARED_BROWSER_FLOOR` (910) into `[SHARED_BROWSER_FLOOR,
-SHARED_BROWSER]` via `bands.shared_browser_oom_score_adj`. The mapping is
-order-preserving, so Chrome's gradation decides where in the band each process
-lands -- which is what makes earlyoom shed one tab's renderer before the whole
-browser. The sweep only remaps values below the floor, so it is idempotent.
+The Screen service (`system/apps/screen`, which launches the browser's Chromium
+and runs the desktop it shows on) therefore sweeps the process trees of the
+Chromium it launched and of its `screen-session` program and remaps every
+Chromium value found below `SHARED_BROWSER_FLOOR` (910) into
+`[SHARED_BROWSER_FLOOR, SHARED_BROWSER]` via `bands.shared_browser_oom_score_adj`.
+The mapping is order-preserving, so Chrome's gradation decides where in the band
+each process lands -- which is what makes earlyoom shed one tab's renderer
+before the whole browser. The sweep only remaps values below the floor, so it is
+idempotent. The same sweep is what raises everything else started from the Screen
+(the XFCE menu, a terminal on it), which inherits the session's band, to
+`AGENT_SUBPROCESS`, leaving only the session's own programs (`xfce4-session`,
+`xfwm4`, `xfce4-panel`, `xfdesktop`, `xfsettingsd`, `xfconfd`, the D-Bus daemon)
+in the stack's band (`SCREEN_STACK`, 850); under pressure the order is Chromium's
+renderers, then the programs on the Screen, then the stack, then the agents (the
+Screen spec, section 9.4).
 
 The input range is Chrome's own gradation (0-300), **not** 0-1000. Scaling
 against 1000 would compress every Chromium process into 910-937, the bottom
@@ -147,26 +239,19 @@ third of the band, and leave the top to whatever merely *inherited* a high value
 exactly backwards: the renderers hold nearly all of a browser's memory and cost
 one tab to shed, so they belong at the ceiling.
 
-The same reasoning is why the **coordinator is not in this band at all**. It is
-the daemon that launches and drives Chromium, and it is tagged as an ordinary
-(if most-expendable) service. Shedding it frees almost nothing: it holds little
-memory, the Chromium processes outlive its death, and supervisord restarts it
-straight back into the same session. Sitting at the ceiling it was picked first
-under every memory-pressure episode while releasing none of the memory that
-mattered. A descendant that never self-writes inherits its low service value and
-so is remapped near the band's floor, below every renderer -- correct, since it
-too holds almost no memory. Crashpad is never remapped at all: it re-parents to
-init, so the sweep (which walks the daemon's descendants) never sees it, and it
-just keeps the service band it inherited at fork time.
+The same reasoning is why the **Screen service is not in this band at all**. It
+launches Chromium and is tagged as an ordinary service (`screen`, 72). Shedding
+it frees almost nothing: it holds little memory, and supervisord restarts it
+straight back. Sitting at the ceiling it would be picked first under every
+memory-pressure episode while releasing none of the memory that mattered.
+Crashpad is never remapped at all: it re-parents to init, so the sweep (which
+walks the launched Chromium's and the session's descendants) never sees it, and
+it just keeps the band it inherited at fork time.
 
-The sweep is event-driven, not periodic: Chromium processes appear only at
-moments the fleet observes -- a browser launch, a new page (the CDP observer's
-`page` event fires for every new tab, whether opened by an agent command, a
-human in the cast viewer, or a page popup), and a navigation (`framenavigated`
-fires for every frame, and a cross-site navigation can swap in a fresh
-renderer). Each such event triggers a short burst of sweeps (`browser.oom_retag`,
-~1s cadence for ~6s), because the processes spawn and self-write their values
-over the seconds *after* the event; between events the sweeper sleeps.
+The sweep runs every 10 seconds and in a burst after each event that spawns
+Chromium processes (a launch, a new tab opened by the launch path, the open:url
+handler or a restore), about one sweep a second for six seconds, because the
+processes spawn and self-write their values over the seconds *after* the event.
 
 ## Dynamic chat band
 
@@ -200,7 +285,11 @@ The exception is a chat that is **mid-turn** (a running lifecycle state): it is
 doing work right now that a shed would destroy rather than defer, so its
 staleness climb is suspended for the duration of the turn and it stays below the
 worker band. Both edges of the turn count as engagement, so a chat that ran for
-three days starts aging from when its turn *ended*, not when it began.
+three days starts aging from when its turn *ended*, not when it began. A chat
+whose turn has ended to wait on one of its harness's own background tasks (one
+of Claude's, say) counts as mid-turn too, since a shed would end that task
+unreported. One waiting only on `run_in_background.py` commands does not: the
+runner outlives a shed, and its report revives the chat.
 
 Idle time is measured from the most recent of: a message sent through the UI, the
 moment its tab was switched to, either edge of a turn, or -- as a floor -- its own
@@ -209,16 +298,21 @@ with no evidence at all counts as fresh: it is demoted only on positive evidence
 of abandonment. The lifecycle signal is what covers a chat messaged *outside* the
 UI (by `mngr message` or another agent), which the frontend never reports.
 
-Re-tagging is event-driven plus a slow sweep (`SWEEP_INTERVAL_SECONDS`, 60s). The
-events -- each presence report the chat page posts on tab-presence changes
-(`POST /api/chats/<chat_id>/presence`), each message sent through the chat
-app, and each lifecycle change from the observe stream --
-cover everything that changes a chat's engagement. The sweep exists solely because
-staleness is the one input that changes with nothing to announce it: a chat
-crosses a ramp threshold by sitting still. The revive-on-message path is race-free
-without the sweep, because the send blocks until the revived process is ready --
-the wrapper registers its pid before `exec`, so the pid exists by the time the
-frontend reports activity after the send returns.
+Re-tagging is event-driven plus a slow sweep (`SWEEP_INTERVAL_SECONDS`, 60s), and
+every pass runs on the prioritizer's one background thread. The events -- a presence
+report (`POST /api/chats/<chat_id>/presence`) that changes whether any page has the
+chat open or showing (a heartbeat that changes neither asks for nothing), each
+message sent through the chat app, and each lifecycle change from the observe
+stream -- cover everything that changes a chat's engagement. Each only asks that
+thread for a pass, so no request waits on one; passes run one at a time, at most one
+every `MIN_PASS_INTERVAL_SECONDS` (2s), and each reads the pid registry once for
+every chat (`live_pids_by_agent_id`) and `/proc` once per registered process. The
+sweep exists because two inputs change with nothing to announce them: a chat crosses
+a ramp threshold by sitting still, and a page that vanished without its closing
+report stops counting only when its report expires. The revive-on-message path is
+race-free, because the send blocks until the revived process is ready -- the wrapper
+registers its pid before `exec`, so the pid exists by the time the frontend reports
+activity after the send returns.
 
 Across a system-interface restart the per-chat message times are re-seeded from
 the durable client-activity log; without that, every chat would look
@@ -231,10 +325,17 @@ a protected one.
 - **Shed ledger** (`data/.state/oom_priority/events/shed.jsonl`): append-only,
   written by `system/services/oom_priority/bin/earlyoom_record_shed.py` (earlyoom's `-N` after-kill hook).
   One `process_shed` line per kill, carrying the agent name only when an agent's
-  *own* process was shed. Read by the revival-notice hook
-  (`system/services/oom_priority/bin/claude_shed_notice_hook.py`) and the launch-task report poll.
+  *own* process was shed, plus why earlyoom picked the victim (`oom_score_adj`,
+  `badness_kib`, `vm_rss_kib`, and the `ordering`: `kernel_badness`, or
+  `upstream_fallback` if earlyoom's startup self-check could not read those
+  inputs, which also leaves `badness_kib` null; null when earlyoom did not
+  report them). Read by the revival-notice hook
+  (`system/services/oom_priority/bin/claude_shed_notice_hook.sh`, which starts
+  `claude_shed_notice_hook.py` only when the ledger names the agent) and the
+  launch-task report poll.
 - **Agent-pid registry** (`data/.state/oom_priority/agent_pids/<pid>.json`): written
-  by the launch wrapper (`system/services/oom_priority/bin/agent_oom_launch.py`), read by the kill hook.
+  by the launch wrapper (`system/services/oom_priority/bin/agent_oom_launch.py`), read by the kill hook,
+  the chat app's prioritizer, System Monitor, the resource sampler and the memory candidates command.
 
 Both live under `runtime/` so they ride the runtime-backup branch. Their absolute
 location is pinned via `OOM_PRIORITY_RUNTIME_DIR` (see `.mngr/settings.toml`) so
@@ -243,22 +344,183 @@ same files. `paths` is the single source of truth for the layout, and -- like
 every module here -- is stdlib-only, so the hooks (which run under a plain
 `python3`, not `uv`) can import it via a `sys.path` insert.
 
+## Memory candidates
+
+`system/services/oom_priority/bin/memory_candidates.py` lists what could be
+stopped to free memory, next to how much memory is free. It only reads: it
+never stops, kills, or re-tags anything.
+
+```bash
+python3 system/services/oom_priority/bin/memory_candidates.py          # a table
+python3 system/services/oom_priority/bin/memory_candidates.py --json   # the same report as JSON
+python3 system/services/oom_priority/bin/memory_candidates.py --free-memory   # only the free memory line
+```
+
+`--free-memory` reads nothing but the meminfo files, so it is cheap enough to
+poll while memory is short, when the full report's `mngr list` and service
+calls would add to the pressure.
+
+It lists:
+
+- **Free memory**, read where the memory guard reads it (`oom_priority.meminfo`
+  and "How it fits together" above): the `--host-meminfo` headroom file while it
+  is fresh, else `/proc/meminfo`. It takes `MemAvailable`, or `MemFree` when
+  there is no `MemAvailable`, and the output names both the file and the field.
+  The distinction is not cosmetic: under a memory cap the container's own
+  `/proc/meminfo` describes the whole machine or misses what the runtime is
+  charged, so it can read several gigabytes more free than the figure earlyoom
+  acts on. A reader who takes `/proc/meminfo` for the guard's own figure
+  concludes there is room and reruns a command the guard goes on shedding.
+- **Idle chats and workers**, from `mngr list --provider local`, rendered
+  through a `--format` template (the columns are `MNGR_LIST_FIELDS`). This is
+  how `system/scripts/collect_bug_report_diagnostics.py` lists agents too:
+  inside a workspace container the template path answers from local state
+  where `--format json` has failed, and without `--provider local` mngr probes
+  every cloud provider in the settings, none of which can answer from in there.
+  A candidate:
+  - is a chat (`user_created=true`) or a worker (`agent_created=true`). The
+    primary services agent and any agent with neither label (an automation, for
+    example) are never listed;
+  - is `WAITING`, meaning its turn has ended. A `RUNNING` agent is mid-turn, and
+    a `STOPPED` or `DONE` agent holds no memory to free;
+  - is in a chat that is not busy. An agent that ended its turn to wait on a
+    background task (a command started through `run_in_background.py`, or one
+    of Claude's own) is `WAITING` too, but the task's completion will start its
+    next turn, so stopping it would lose work in flight. The chat is the
+    agent's `chat_id` label, else the agent's own id, and it is busy while it
+    holds a live marker under the chats' marker root, read through
+    `system/libs/chat_background_tasks`;
+  - has had no activity for `IDLE_AFTER_SECONDS` (15 minutes). Its last
+    activity is the latest of mngr's `user_activity_time`, `agent_activity_time`
+    and `start_time`. mngr's own `idle_seconds` is not used, because it also
+    counts the host's SSH activity;
+  - is not in the workspace's main chat, the one the chat app's
+    `data/.apps/chat/main_chat.json` names. The chat app starts the main chat's
+    agent again as soon as it finds it stopped, so a note names it instead.
+    A file that is there but cannot be read gets a note too, since the main
+    chat may then be listed.
+
+  Its memory is the summed anonymous memory of its process trees (see below).
+  The trees are rooted at the `pid` mngr reports and at every live pid the
+  agent-pid registry holds for it (codex registers two).
+- **Apps the workspace may stop**, from the shell's `GET /api/inventory` joined
+  to the programs supervisord reports running. A candidate has a program, is not
+  critical (the shell, the chat and the terminal are what the workspace is
+  reached and talked to through), does not share a critical app's program (the
+  stop would take that app down with it), is not internal, and is running. The
+  Screen is left out: its service holds almost nothing and the browser's Chromium
+  processes have their own section below. Each row carries how many windows show
+  the app, which is what decides whether stopping it takes something off the
+  user's screen, and `AUTO-STOP` (`stop_when_no_windows` in JSON), which says
+  whether the shell stops the app by itself once no window has shown it for the
+  grace period. An app it does not is one that may do work between requests, so
+  it is the costlier one to take down. Its memory is the summed anonymous memory
+  of its program's process tree.
+- **The browser while no window shows the Screen**, from the Screen service's
+  `GET /browsers` (`system/apps/screen/README.md`, "The browser"). A candidate
+  is a `running` browser while no window of the `screen` app exists on any
+  desktop, according to the same inventory document. Its memory is the summed
+  anonymous memory of the Chromium processes on its profile and their children.
+
+The Screen's stack never stops for emptiness and the browser is never stopped
+when its windows close, so a browser nobody is looking at keeps its memory until
+it is stopped; closing the Screen's window frees nothing on its own.
+
+Each figure sums the processes' anonymous memory (the `Anonymous` lines of
+`smaps_rollup`, or of `smaps` under gVisor, which has no rollup); under gVisor
+that is also the memory earlyoom scores by. It leaves out the binaries and
+libraries every process maps, which resident size counts in each of them: under
+gVisor an agent harness's `VmRSS` reads up to ten times its anonymous memory.
+Pages a process still shares with its parent after a fork count in both, so a
+browser can read somewhat above what stopping it frees; read the free memory
+again after stopping something.
+
+Each source is read on its own. When `mngr list`, the Screen service, the
+shell or supervisord cannot be read, that section says so, and its candidates are
+`null` in JSON: "unknown", not "none". The other sections are still listed, and
+the command still exits 0. The shell is read once, and its one document answers
+both the apps and whether a window shows the Screen, so a shell that cannot be
+reached takes both sections to "unknown" together.
+
+A lead runs it when one of its agents reports a shed. It shows the user the
+list and the free memory, and stops only what the user approves (a scheduled
+update is the one flow that may go further on its own judgment; see the
+`update-self` skill's "What this pass may do without asking"):
+
+- **A chat**: `mngr stop <name>`, the same command the chat app's own stop
+  runs. The chat restarts on its next message. mngr's send starts a `STOPPED`
+  or `DONE` agent before it delivers: `send_message_to_agents` with
+  `is_start_desired=True`, which the chat app passes from
+  `MngrMessenger.send_to_agent` in `system/apps/chat/imbue/chat/agent_discovery.py`.
+  For codex, which reports "not ready" rather than stopped, `_revive_and_retry_send`
+  in `system/apps/chat/imbue/chat/server.py` starts the agent and retries.
+- **A worker**: `create_worker.py stop --name <name>` (the `launch-task`
+  skill). It archives the worker, so dead-worker recovery does not take it for
+  a crash and restart it. A plain `mngr stop` would look like a crash.
+- **A browser**: `POST /browsers/<name>/stop` on the Screen service. This
+  keeps the browser's profile and tabs; the browser launch path, `uv run --no-sync
+  agentic-browser-fleet new` or `POST /browsers/<name>/start` starts it again.
+- **An app**: `supervisorctl stop <program>`, and `supervisorctl start
+  <program>` to put it back. Stopping the program leaves the app's windows
+  where they are: a window is the shell's, not the app's, and only an explicit
+  close or the shell's own "quit the app" takes one away. While the program is
+  down the shell parks its port, and a connection to that port both answers
+  "Starting <app>" and wakes the app
+  (`system_interface/shell/app_lifecycle.py`). So a window someone is actually
+  looking at starts the app again the moment its page reloads, and only an app
+  nothing is loading stays down. Read the free memory again rather than assuming
+  it did. Every program carries `autostart=true`, so a restart of the services
+  agent (`mngr start --restart system-services`, which every apply runs) starts
+  them all again whether or not anything remembered to.
+
 ## Protection is soft
 
 Two things here are best-effort, not hard guarantees:
 
 - **The never-kill infrastructure isn't truly immortal.** Positive-only bands
-  plus `--avoid` keep sshd, supervisord, earlyoom, tini, and tmux very unlikely
-  to be shed, but under sustained pressure with nothing else to kill earlyoom
-  will eventually take one. Hard "never kill" protection (`oom_score_adj -1000`)
-  needs `CAP_SYS_RESOURCE`, which the container does not grant -- a deferred
-  follow-up.
+  plus `--avoid` keep sshd, supervisord, earlyoom, earlyoom-stamp, tini, and
+  tmux very unlikely to be shed, but under sustained pressure with nothing else
+  to kill earlyoom will eventually take one. Hard "never kill" protection
+  (`oom_score_adj -1000`) needs `CAP_SYS_RESOURCE`, which the container does not
+  grant -- a deferred follow-up.
 - **The service ordering can be reordered by memory usage.** earlyoom picks the
-  highest `/proc/*/oom_score`, which adds each process's live memory badness on
-  top of its `oom_score_adj`. The service bands are only ~10 apart, so a service
-  using enough more memory than the one below it can outweigh the band gap and be
-  shed first. The bands guarantee the ordering only when memory usage is
+  highest badness, which adds each process's live memory on top of its
+  `oom_score_adj` (one band point is worth MemTotal/1000 of memory). The service
+  bands are only ~10 apart, so a service using enough more memory than the one
+  below it can outweigh the band gap and be shed first. The bands guarantee the ordering only when memory usage is
   comparable; in the common case the services are lightweight and the order
   holds. Widening the gaps would need to push the top service bands past the
   agent bands, which would defeat the "services outlive agents" goal, so the
-  bands stay a steer rather than a strict priority.
+  bands stay a steer rather than a strict priority. Under gVisor the memory
+  counted is also approximate: anonymous memory is counted in 2 MiB-aligned
+  blocks (summed over a workspace, about a fifth of what was counted had never
+  been touched), and file pages and
+  shared memory are not counted, so Chromium's shared buffers do not add to
+  its badness.
+
+## The resource sampler
+
+`bin/resource_sampler.py` (the `resource_sampler` supervisord program) is not
+part of the shedding at all: it is the System Monitor app's source for CPU and
+the graphs, kept here because it is an always-on, stdlib-only `/proc` reader
+like the cgroup publisher, and because it credits a busy stretch's CPU through
+the agent-pid registry above. Every 5 s it reads each process's
+`/proc/<pid>/stat` once: the change in the sum over every live process of
+`utime + stime + cutime + cstime` is the CPU used since the last walk (a
+process that exited drops out of the sum while its parent's child counters
+grow by its whole lifetime, so nothing is lost or counted twice), which is the
+only CPU accounting that exists under gVisor, where `/proc/stat` and the load
+average read as zero. It writes under `data/.state/system-monitor/`: the
+latest reading with each process's share of capacity and the last 10 minutes
+(`recent.json`, replaced by rename every sample and read back on start so a
+restart does not cut the graph), a day of minute averages (`history.jsonl`),
+and a `cpu_stretch` event (`events/cpu_stretches/events.jsonl`) whenever usage
+stayed at or above 90% of the available cores for at least two minutes,
+crediting the CPU to the registered agents and supervised programs whose
+descendants used it (`resource_sampler.StretchTracker`). The supervised
+programs come from `supervisor_rpc`, the reader of supervisord's control
+socket (`supervised_pids`), which also carries `stop_program`, the stop the
+System Monitor app's Quit for one of the user's apps goes through (a program
+that is not running already counts as stopped). The memory figure beside each
+reading is the guard's own (`meminfo`, the headroom file while it is fresh,
+else `/proc/meminfo`). The design is `docs/system/specs/system-monitor.md`.

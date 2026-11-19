@@ -9,12 +9,14 @@ vi.mock("@imbue/workspace-ui/src/base-path", () => ({ apiUrl: (path: string) => 
 vi.mock("./Chats", () => ({ getChatById: mockGetChatById }));
 
 import {
+  addModelChoiceFailureListener,
   changedAxes,
   effectiveChoice,
   forgetPendingChoice,
   getChatFastMode,
   setFastMode,
   setModelChoice,
+  showSwitchChoice,
 } from "./ModelSettings";
 import type { ModelChoice } from "./ModelSettings";
 import type { CatalogModelOption } from "./HarnessCatalog";
@@ -31,6 +33,7 @@ const OPUS: CatalogModelOption = {
   supports_fast: true,
   in_picker: true,
   harness_reported_model_id: "claude-opus-4-8",
+  default_effort: null,
 };
 const SONNET: CatalogModelOption = {
   id: "sonnet",
@@ -39,6 +42,7 @@ const SONNET: CatalogModelOption = {
   supports_fast: false,
   in_picker: true,
   harness_reported_model_id: "claude-sonnet-5",
+  default_effort: null,
 };
 
 // A pushed live choice: the identity carries the raw REPORTED id (as the backend sends
@@ -173,6 +177,54 @@ describe("effectiveChoice", () => {
     await flush();
   });
 
+  it("shows a switch's pick without posting it, and holds it through the models a switch passes through", async () => {
+    // The switch applies the pick itself, on the far side of a restart or a create; from there until
+    // the harness writes its model state the pushed live choice names models the user never asked
+    // for -- the account the chat is leaving, then the one the new account last ran.
+    showSwitchChoice("a11", { model_id: "sonnet", effort: "medium", fast: false }, SONNET);
+    expect(mockRequest).not.toHaveBeenCalled();
+
+    const leaving = effectiveChoice("a11", live("claude-opus-4-8", "high", false, OPUS));
+    expect(leaving).toEqual({
+      identity: { model_id: "sonnet", effort: "medium", fast: false },
+      matched: SONNET,
+      isPending: true,
+    });
+    // The agent came up on the new account, on the model IT last ran: still not the pick.
+    expect(effectiveChoice("a11", live("claude-opus-4-8", "medium", false, OPUS))?.matched).toBe(SONNET);
+    // The harness took the pick.
+    expect(effectiveChoice("a11", live("claude-sonnet-5", "medium", false, SONNET))?.isPending).toBe(false);
+    await flush();
+  });
+
+  it("keeps a switch's pick when the chat moves to the new agent, unlike the bar's own", async () => {
+    // What a handoff does: the successor becomes the chat's agent before the harness has reported
+    // the model applied to it. The pick was made FOR that successor, so it is not the old agent's
+    // to forget.
+    mockGetChatById.mockReturnValue(chatSnapshotFixture("a12", { active_agent: { agent_id: "successor" } }));
+    showSwitchChoice("a12", { model_id: "sonnet", effort: "medium", fast: false }, SONNET);
+    forgetPendingChoice("a12");
+    expect(effectiveChoice("a12", live("claude-opus-4-8", "medium", false, OPUS))?.matched).toBe(SONNET);
+
+    setModelChoice("a12", { model_id: "opus[1m]", effort: "high", fast: false }, OPUS, ["model"]);
+    forgetPendingChoice("a12");
+    expect(effectiveChoice("a12", live("claude-opus-4-8", "medium", false, OPUS))?.isPending).toBe(false);
+    await flush();
+  });
+
+  it("gives a switch's pick up once the chat moves on again, to an agent it was never made for", async () => {
+    // A second switch inside the window the first one's pick is held for: its successor is not the
+    // agent the pick was handed over for, and nothing else would drop it -- a pick with no POST
+    // behind it settles only against a live choice that will never match, or the 5-minute timeout.
+    mockGetChatById.mockReturnValue(chatSnapshotFixture("a13", { active_agent: { agent_id: "successor" } }));
+    showSwitchChoice("a13", { model_id: "sonnet", effort: "medium", fast: false }, SONNET);
+
+    mockGetChatById.mockReturnValue(chatSnapshotFixture("a13", { active_agent: { agent_id: "third" } }));
+    forgetPendingChoice("a13");
+    expect(effectiveChoice("a13", live("claude-opus-4-8", "medium", false, OPUS))?.isPending).toBe(false);
+    await flush();
+  });
+
   it("posts the pick to the model endpoint", async () => {
     setModelChoice("a4", { model_id: "opus[1m]", effort: "high", fast: true }, OPUS, ["effort", "fast"]);
     await flush();
@@ -199,6 +251,25 @@ describe("effectiveChoice", () => {
       fast: false,
       axes: ["effort"],
     });
+  });
+
+  it("tells the refusal's reason in words and puts the bar back on the live choice", async () => {
+    // Mithril rejects with `new Error(body)`, so a JSON body's message reads "[object Object]"; the words are in it.
+    const detail = "This chat is switching to Claude 2 (Claude Code); wait for the switch to finish, then try again.";
+    mockRequest.mockRejectedValueOnce(
+      Object.assign(new Error("[object Object]"), { code: 409, response: { detail, phase: "summarizing" } }),
+    );
+    const failures: Array<[string, string]> = [];
+    addModelChoiceFailureListener((chatId, reason) => failures.push([chatId, reason]));
+
+    setModelChoice("a10", { model_id: "sonnet", effort: "medium", fast: false }, SONNET, ["model"]);
+    expect(effectiveChoice("a10", live("claude-opus-4-8", "high", false, OPUS))?.isPending).toBe(true);
+    await flush();
+
+    expect(failures).toEqual([["a10", detail]]);
+    const shown = effectiveChoice("a10", live("claude-opus-4-8", "high", false, OPUS));
+    expect(shown?.matched?.id).toBe("opus[1m]");
+    expect(shown?.isPending).toBe(false);
   });
 
   it("applies rapid picks in click order", async () => {

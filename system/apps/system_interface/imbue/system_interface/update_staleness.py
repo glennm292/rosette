@@ -14,7 +14,7 @@ agent.
 
 "No longer matches" is judged by *what this process runs*, not by raw HEAD
 equality. The workspace repo moves for plenty of reasons that leave this
-server perfectly current -- minds commit their ordinary work here constantly,
+server perfectly current -- agents commit their ordinary work here constantly,
 the apply's own version-history commit lands after the restart, and a
 frontend-only apply rebuilds the served bundle without restarting -- so a bare
 HEAD comparison would show the banner near-permanently and erode the trust the
@@ -46,7 +46,7 @@ logger = _loguru_logger
 WORKSPACE_ROOT_DIRECTORY = Path(__file__).resolve().parents[5]
 
 # The update apply's in-flight marker (see
-# ``.agents/skills/update-self/scripts/update_apply_contract.py``): present exactly while
+# ``.agents/skills/update-self/python/update_self_skill/update_apply_contract.py``): present exactly while
 # an apply is mid-motion or was interrupted before recovery.
 UPDATE_APPLY_MARKER_REL = "data/.state/update-apply/marker.json"
 # The apply's emergency record: written when a rollback could not put a healthy
@@ -66,6 +66,11 @@ STALENESS_TREE_MOVED = "updated-not-activated"
 # is running; absent when consistent.
 UPDATE_STALENESS_META_TAG = "system-interface-update-staleness"
 
+# The meta tag a preview shell's page carries (absent on the live shell), which
+# the frontend reads to hide the verbs a preview refuses.
+PREVIEW_META_TAG = "system-interface-preview"
+PREVIEW_META_CONTENT = "true"
+
 # Bound on the git reads. rev-parse/diff on a local repo are milliseconds; the
 # bound only keeps a wedged git from stalling the app shell.
 _GIT_TIMEOUT_SECONDS = 10.0
@@ -81,41 +86,55 @@ _GIT_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 # lockfile (see ``_BACKEND_MANIFESTS``), or anything else agents routinely
 # commit. (The update apply itself restarts the
 # services agent on every apply, so it keeps no such rule; this one exists for
-# a tree moved by anything else.) Everything under the vendored mngr tree but
-# docs and tests counts -- a missed skew is the failure this whole detector
-# exists to prevent.
+# a tree moved by anything else.)
 #
 # The imported-source prefixes are every workspace tree this process runs code
-# from: its own backend, the vendored mngr tree (its shared libraries are
-# imported here; the tree counts as a whole rather than module by module), and
-# the instances and manifest libraries. All are editable installs resolving straight into these
-# trees, so the moment one advances this process is running old code.
+# from. All are editable installs resolving straight into these trees, so the moment one
+# advances this process is running old code. mngr (imported in-process and shelled out to) is installed from the commit
+# pyproject.toml pins, so a move of that pin reaches this list through the root manifests below.
 # ``test_every_imported_workspace_package_is_covered`` holds this list to the
 # app's actual dependencies.
 _APP_BACKEND_PREFIX = "system/apps/system_interface/imbue/"
-_VENDORED_MNGR_PREFIX = "system/vendor/mngr/"
 _IMPORTED_SOURCE_PREFIXES = (
     _APP_BACKEND_PREFIX,
-    "system/libs/app_instances/",
     "system/libs/app_manifest/",
+    "system/libs/app_schema/",
+    "system/libs/chat_background_tasks/",
+    "system/libs/disk_headroom/",
+    "system/libs/event_streams/",
+    "system/libs/latchkey_access/",
+    "system/libs/share_grants/",
+    "system/libs/workspace_layout/",
+    "system/libs/workspace_profile/",
+    "system/libs/workspace_themes/",
+    "system/services/oom_priority/",
 )
 # The manifests this environment was resolved from. The root ``uv.lock`` is
-# deliberately absent: scaffolding an app relocks it (``uv sync
-# --all-packages``, so the root lockfile learns the new workspace member),
-# which moves nothing this process resolved but would raise the banner on every
-# app a user builds. The root ``pyproject.toml`` stays -- the scaffold no
-# longer edits it, since the ``system/apps/*`` member glob picks a new package
-# up, so it still catches a ``[tool.uv.sources]`` re-point or a
-# ``[tool.uv.workspace]`` members/exclude edit. That leaves this list a
-# deliberate narrowing away from the apply's ``_is_backend_manifest`` in
-# ``.agents/skills/update-self/scripts/update_classification.py``, which it
-# otherwise mirrors: over-counting costs the apply one extra reinstall, and
-# costs this banner the trust it only gets to spend once.
+# deliberately absent: a user skill's dependency change relocks it (skills share
+# the root workspace), which would raise the banner on every such edit though it
+# rarely moves what this process resolved. The root ``pyproject.toml`` stays --
+# nothing the user builds edits it (a user app, service or lib is a standalone
+# project, never a root member), so it still catches a ``[tool.uv.sources]``
+# re-point or a ``[tool.uv.workspace]`` members edit. That leaves this list a
+# deliberate narrowing away from the apply's ``_is_backend_manifest`` and
+# ``_is_app_pyproject`` in
+# ``.agents/skills/update-self/python/update_self_skill/update_classification.py``, which it
+# otherwise mirrors: over-counting costs the apply one extra environment
+# refresh, and costs this banner the trust it only gets to spend once.
 _BACKEND_MANIFESTS = frozenset(
     {
         "system/apps/system_interface/pyproject.toml",
-        "system/libs/app_instances/pyproject.toml",
         "system/libs/app_manifest/pyproject.toml",
+        "system/libs/app_schema/pyproject.toml",
+        "system/libs/chat_background_tasks/pyproject.toml",
+        "system/libs/disk_headroom/pyproject.toml",
+        "system/libs/event_streams/pyproject.toml",
+        "system/libs/latchkey_access/pyproject.toml",
+        "system/libs/share_grants/pyproject.toml",
+        "system/libs/workspace_layout/pyproject.toml",
+        "system/libs/workspace_profile/pyproject.toml",
+        "system/libs/workspace_themes/pyproject.toml",
+        "system/services/oom_priority/pyproject.toml",
         "pyproject.toml",
     }
 )
@@ -130,8 +149,6 @@ def _is_path_relevant_to_this_server(path: str) -> bool:
     """Whether a change to ``path`` leaves this running server stale."""
     if path in _BACKEND_MANIFESTS:
         return True
-    if path.startswith(_VENDORED_MNGR_PREFIX):
-        return not path.endswith(".md") and not _is_test_file(path)
     if path.startswith(_IMPORTED_SOURCE_PREFIXES):
         return path.endswith(".py") and not _is_test_file(path)
     return False
@@ -189,7 +206,7 @@ def _read_changed_paths(repo_root: Path, since_head: str) -> list[str] | None:
     like :func:`_read_head`, everything degrades to "no banner".
     """
     # ``-z``: without it git C-quotes any path with a non-ASCII byte
-    # (``"system/vendor/mngr/.../l\303\257st.py"``), which then starts with a
+    # (``"system/apps/system_interface/.../l\303\257st.py"``), which then starts with a
     # quote and matches no prefix rule.
     output = _read_git(["git", "diff", "--name-only", "-z", since_head, "HEAD"], repo_root)
     if output is None:

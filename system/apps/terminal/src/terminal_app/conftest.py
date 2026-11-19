@@ -1,39 +1,39 @@
 import os
+import shutil
+import subprocess
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from app_instances.testing import (
-    RecordedShellRequests,
-    RecordingNudger,
-    serve_recording_shell,
-)
-from app_manifest.primitives import AppName
-from flask import Flask
 from flask.testing import FlaskClient
+from workspace_layout.testing import LoopbackShell
 
 from terminal_app.data_types import TerminalPaths
-from terminal_app.hooks import HttpShellPoster, build_tmux_hook_blueprint
+from terminal_app.primitives import TmuxSessionName
 from terminal_app.sessions import TmuxSessionSource
 from terminal_app.store import JsonTerminalSessionStore
 from terminal_app.testing import (
     DEFAULT_TEST_WORKDIR,
     ENV_FAKE_TMUX_DIR,
+    TEST_APP_CONTRACT_SOURCE,
+    TEST_PTY_LABEL,
     TEST_SESSION_COMMAND,
     FakeTmux,
+    build_pages_test_client,
     install_fake_tmux,
+    write_registry_labels,
 )
 from terminal_app.tmux import SubprocessTmux
 
 
 @pytest.fixture
 def fake_tmux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeTmux:
-    """A fake ``tmux`` on PATH, reporting a running server with no sessions and no clients."""
+    """A fake ``tmux`` on PATH, reporting a running server with no sessions."""
     fake = install_fake_tmux(tmp_path / "fake-tmux")
     monkeypatch.setenv("PATH", f"{fake.bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv(ENV_FAKE_TMUX_DIR, str(fake.state_dir))
     fake.set_sessions([])
-    fake.set_clients([])
     return fake
 
 
@@ -64,32 +64,40 @@ def session_source(
 
 
 @pytest.fixture
-def recording_shell() -> Iterator[RecordedShellRequests]:
-    with serve_recording_shell() as recorded:
-        yield recorded
+def window_closed_posts() -> list[TmuxSessionName | None]:
+    """One entry per window-closed post the pages under test took: the terminal the hint named."""
+    return []
 
 
 @pytest.fixture
-def recording_nudger() -> RecordingNudger:
-    return RecordingNudger()
+def pages_client(session_source: TmuxSessionSource, tmp_path: Path, window_closed_posts: list[TmuxSessionName | None]) -> FlaskClient:
+    """A test client over the wrapper pages, with the pty registered and a built contract module to serve."""
+    registry_path = write_registry_labels(tmp_path / "apps.toml", {"terminal-pty": TEST_PTY_LABEL})
+    contract_path = tmp_path / "app_contract.js"
+    contract_path.write_text(TEST_APP_CONTRACT_SOURCE)
+    return build_pages_test_client(session_source, registry_path, contract_path, window_closed_posts)
 
 
 @pytest.fixture
-def hook_client(
-    session_source: TmuxSessionSource,
-    terminal_paths: TerminalPaths,
-    recording_shell: RecordedShellRequests,
-    recording_nudger: RecordingNudger,
-) -> FlaskClient:
-    """A test client over the hook route alone, posting to the recording shell."""
-    app = Flask(__name__, static_folder=None)
-    app.register_blueprint(
-        build_tmux_hook_blueprint(
-            source=session_source,
-            paths=terminal_paths,
-            shell=HttpShellPoster(shell_url=recording_shell.base_url),
-            nudger=recording_nudger,
-            app_name=AppName("terminal"),
-        )
-    )
-    return app.test_client()
+def private_tmux_socket(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """A tmux server of the test's own: ``TMUX_TMPDIR`` points a script under test at it (with ``TMUX`` unset, so
+    the one this process runs in is never reached), and the socket path it resolves to is what the test's own
+    calls pass with ``-S``. Under ``/tmp`` directly, since a socket path is held to about 100 bytes."""
+    tmux_tmpdir = Path(tempfile.mkdtemp(prefix="dwt-tmux-", dir="/tmp"))
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmpdir))
+    monkeypatch.delenv("TMUX", raising=False)
+    socket_path = tmux_tmpdir / f"tmux-{os.getuid()}" / "default"
+    # tmux makes the per-user directory itself only when it resolves the socket from the environment; a call that
+    # names the socket with ``-S`` needs it there already.
+    socket_path.parent.mkdir(mode=0o700)
+    yield socket_path
+    assert str(tmux_tmpdir).startswith("/tmp/dwt-tmux-")
+    subprocess.run(["tmux", "-S", str(socket_path), "kill-server"], capture_output=True, timeout=15.0)
+    shutil.rmtree(tmux_tmpdir, ignore_errors=True)
+
+
+@pytest.fixture
+def loopback_shell() -> Iterator[LoopbackShell]:
+    """A loopback stand-in for the shell, answering what a test sets."""
+    with LoopbackShell() as shell:
+        yield shell

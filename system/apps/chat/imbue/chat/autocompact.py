@@ -1,57 +1,113 @@
+import sys
 import threading
+import time
+import traceback
 from collections.abc import Callable
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from typing import Final
 
 from loguru import logger
+from pydantic import ValidationError
 
-from imbue.concurrency_group.errors import ProcessError
-from imbue.concurrency_group.subprocess_utils import FinishedProcess
-from imbue.concurrency_group.subprocess_utils import run_local_command_modern_version
+from imbue.chat.agent_discovery import compact_stale_agents_if_enabled
+from imbue.mngr.errors import MngrError
+from imbue.mngr_autocompact.manager import compact_stale_agents_by_name
 
 _DEFAULT_SWEEP_INTERVAL_SECONDS: Final[float] = 60.0
-_DEFAULT_COMMAND_TIMEOUT_SECONDS: Final[float] = 30.0
-_DEFAULT_CHECK_CONCURRENCY: Final[int] = 4
-_DEFAULT_MNGR_BINARY: Final[str] = "mngr"
+# A slow sweep delays the next tick, so one taking this long is logged.
+SLOW_SWEEP_WARNING_SECONDS: Final[float] = 30.0
+# A plugin call can run for minutes, so ``stop`` does not wait out a sweep in flight; the thread is a daemon.
+_STOP_JOIN_TIMEOUT_SECONDS: Final[float] = 5.0
+# A sweep still in flight this long is logged with the stack it is blocked in, and again each repeat
+# interval it stays in flight, since no other sweep starts until it returns.
+_STUCK_SWEEP_FIRST_WARNING_SECONDS: Final[float] = 120.0
+_STUCK_SWEEP_REPEAT_WARNING_SECONDS: Final[float] = 300.0
+
+
+def compact_stale_opted_in_agents(names: Sequence[str], provider_names: Sequence[str] | None = None) -> list[str]:
+    """Compact whichever of the named agents are stale. ``provider_names`` are the providers they are on, when
+    known: mngr then asks only those instead of first resolving every name through its whole discovery event log."""
+    return compact_stale_agents_if_enabled(
+        names,
+        compact_by_name=lambda mngr_ctx, agent_names: compact_stale_agents_by_name(
+            mngr_ctx, agent_names, provider_names=provider_names
+        ),
+    )
+
+
+def _ignore_compaction_request(agent_name: str) -> None:
+    pass
+
+
+def _ignore_sweep_start(agent_names: Sequence[str]) -> None:
+    pass
+
+
+def _ignore_sweep_finish() -> None:
+    pass
+
+
+def _no_harness_known(agent_name: str) -> str | None:
+    return None
+
+
+def _format_thread_stack(thread: threading.Thread) -> str:
+    frame = sys._current_frames().get(thread.ident) if thread.ident is not None else None
+    if frame is None:
+        return "(the thread has finished)"
+    return "".join(traceback.format_stack(frame)).rstrip("\n")
 
 
 class ChatAutoCompactor:
-    """Schedules periodic context compaction checks for active chat agents.
+    """Schedules periodic idle compaction for the chats that have it on, through mngr's autocompact plugin in process."""
 
-    Runs `mngr autocompact run <agent name>` once every interval for each
-    chat agent that is currently running. All collaborators are injectable for
-    unit testing without subprocesses or real agents.
-    """
-
-    _list_running_chat_agent_names: Callable[[], Sequence[str]]
-    _runner: Callable[..., FinishedProcess]
-    _mngr_binary: str
+    _list_opted_in_chat_agent_names: Callable[[], Sequence[str]]
+    _compact: Callable[[Sequence[str]], Sequence[str]]
+    _on_compaction_requested: Callable[[str], None]
+    _on_sweep_started: Callable[[Sequence[str]], None]
+    _on_sweep_finished: Callable[[], None]
+    _harness_of_agent: Callable[[str], str | None]
+    _monotonic: Callable[[], float]
     _interval_seconds: float
-    _command_timeout_seconds: float
-    _max_concurrency: int
+    _stuck_sweep_first_warning_seconds: float
+    _stuck_sweep_repeat_warning_seconds: float
     _stop_event: threading.Event
     _thread: threading.Thread | None
+    _sweep_worker: threading.Thread | None
 
     @classmethod
     def build(
         cls,
-        list_running_chat_agent_names: Callable[[], Sequence[str]],
-        runner: Callable[..., FinishedProcess] = run_local_command_modern_version,
-        mngr_binary: str = _DEFAULT_MNGR_BINARY,
+        list_opted_in_chat_agent_names: Callable[[], Sequence[str]],
+        # Compacts whichever of the named agents are stale when the mngr config allows it; returns
+        # the names it compacted.
+        compact: Callable[[Sequence[str]], Sequence[str]] = compact_stale_opted_in_agents,
+        on_compaction_requested: Callable[[str], None] = _ignore_compaction_request,
+        # Bracket a plugin call with the names it was handed: the call returns only after every send,
+        # so a compaction can start, and even finish, before its request is reported.
+        on_sweep_started: Callable[[Sequence[str]], None] = _ignore_sweep_start,
+        on_sweep_finished: Callable[[], None] = _ignore_sweep_finish,
+        # Only for the log line.
+        harness_of_agent: Callable[[str], str | None] = _no_harness_known,
+        monotonic: Callable[[], float] = time.monotonic,
         interval_seconds: float = _DEFAULT_SWEEP_INTERVAL_SECONDS,
-        command_timeout_seconds: float = _DEFAULT_COMMAND_TIMEOUT_SECONDS,
-        max_concurrency: int = _DEFAULT_CHECK_CONCURRENCY,
+        stuck_sweep_first_warning_seconds: float = _STUCK_SWEEP_FIRST_WARNING_SECONDS,
+        stuck_sweep_repeat_warning_seconds: float = _STUCK_SWEEP_REPEAT_WARNING_SECONDS,
     ) -> "ChatAutoCompactor":
         instance = cls.__new__(cls)
-        instance._list_running_chat_agent_names = list_running_chat_agent_names
-        instance._runner = runner
-        instance._mngr_binary = mngr_binary
+        instance._list_opted_in_chat_agent_names = list_opted_in_chat_agent_names
+        instance._compact = compact
+        instance._on_compaction_requested = on_compaction_requested
+        instance._on_sweep_started = on_sweep_started
+        instance._on_sweep_finished = on_sweep_finished
+        instance._harness_of_agent = harness_of_agent
+        instance._monotonic = monotonic
         instance._interval_seconds = interval_seconds
-        instance._command_timeout_seconds = command_timeout_seconds
-        instance._max_concurrency = max_concurrency
+        instance._stuck_sweep_first_warning_seconds = stuck_sweep_first_warning_seconds
+        instance._stuck_sweep_repeat_warning_seconds = stuck_sweep_repeat_warning_seconds
         instance._stop_event = threading.Event()
         instance._thread = None
+        instance._sweep_worker = None
         return instance
 
     def start(self) -> None:
@@ -68,65 +124,79 @@ class ChatAutoCompactor:
         thread.start()
 
     def stop(self) -> None:
-        """Signal the background sweep to stop and wait for thread termination."""
+        """Signal the background sweep to stop, waiting briefly for the thread to end."""
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=self._command_timeout_seconds + 5)
+            self._thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+            if self._thread.is_alive():
+                logger.debug("autocompact: the sweep thread is still running a sweep; leaving it to exit")
             self._thread = None
 
-    def sweep(self) -> list[FinishedProcess | None]:
-        """Perform one pass of autocompact checks across all running chat agents."""
+    def sweep(self) -> list[str]:
+        """Run one pass over the opted-in chats; returns the agents compaction was requested for."""
         if self._stop_event.is_set():
             return []
-        names = self._list_running_chat_agent_names()
+        started_at = self._monotonic()
+        requested = self._sweep_opted_in_chats()
+        elapsed_seconds = self._monotonic() - started_at
+        if elapsed_seconds > SLOW_SWEEP_WARNING_SECONDS:
+            logger.warning("autocompact: slow sweep took {:.1f}s", elapsed_seconds)
+        return requested
+
+    def _sweep_opted_in_chats(self) -> list[str]:
+        names = list(self._list_opted_in_chat_agent_names())
         if not names:
             return []
-
-        results: list[FinishedProcess | None] = []
-        with ThreadPoolExecutor(max_workers=self._max_concurrency) as executor:
-            for ran, result in executor.map(self._check_agent_for_sweep, names):
-                if ran:
-                    results.append(result)
-        return results
-
-    def _check_agent_for_sweep(
-        self, agent_name: str
-    ) -> tuple[bool, FinishedProcess | None]:
-        if self._stop_event.is_set():
-            return (False, None)
-        return (True, self.check_agent(agent_name))
-
-    def check_agent(self, agent_name: str) -> FinishedProcess | None:
-        """Run `mngr autocompact run <agent_name>` for a single agent."""
-        command = [self._mngr_binary, "autocompact", "run", agent_name]
+        self._on_sweep_started(names)
         try:
-            result = self._runner(
-                command=command,
-                cwd=None,
-                is_checked=False,
-                timeout=self._command_timeout_seconds,
-            )
-        except (ProcessError, OSError) as e:
-            logger.warning("Failed to run autocompact for {}: {}", agent_name, e)
-            return None
-
-        if result.returncode == 0:
-            return result
-        if result.returncode == 1:
-            # `mngr autocompact run` returns exit code 1 if the agent does not support compaction.
-            logger.debug(
-                "Failed to run autocompact for {}: {}", agent_name, result.stderr
-            )
-            return None
-        logger.warning(
-            "Failed to run autocompact for {}: return code {}, stderr: {}",
-            agent_name,
-            result.returncode,
-            result.stderr,
-        )
-        return None
+            try:
+                requested = list(self._compact(names))
+            except (MngrError, OSError, ValidationError) as e:
+                logger.warning("autocompact: could not request compaction for {}: {}", ", ".join(names), e)
+                return []
+            for name in requested:
+                self._on_compaction_requested(name)
+                harness = self._harness_of_agent(name)
+                if harness is None:
+                    logger.info("autocompact: requested agent={}", name)
+                else:
+                    logger.info("autocompact: requested agent={} harness={}", name, harness)
+            return requested
+        finally:
+            self._on_sweep_finished()
 
     def _run_sweep(self) -> None:
         """Background loop executing sweeps on interval until stopped."""
         while not self._stop_event.wait(self._interval_seconds):
+            self._run_watched_sweep()
+
+    def _run_watched_sweep(self) -> None:
+        """Run one sweep on its own thread and wait for it, logging where it is blocked while it stays in flight."""
+        previous_worker = self._sweep_worker
+        if previous_worker is not None and previous_worker.is_alive():
+            logger.debug("autocompact: skipped a tick; the previous sweep is still running")
+            return
+        worker = threading.Thread(
+            target=self._sweep_logging_unexpected_errors,
+            daemon=True,
+            name="chat-autocompact-sweep-worker",
+        )
+        self._sweep_worker = worker
+        worker.start()
+        worker.join(timeout=self._stuck_sweep_first_warning_seconds)
+        in_flight_seconds = self._stuck_sweep_first_warning_seconds
+        while worker.is_alive() and not self._stop_event.is_set():
+            logger.warning(
+                "autocompact: sweep still running after {:.0f}s; no other sweep starts until it returns. It is at:\n{}",
+                in_flight_seconds,
+                _format_thread_stack(worker),
+            )
+            worker.join(timeout=self._stuck_sweep_repeat_warning_seconds)
+            in_flight_seconds += self._stuck_sweep_repeat_warning_seconds
+
+    def _sweep_logging_unexpected_errors(self) -> None:
+        # An exception escaping a thread reaches only stderr, not the chat service log.
+        try:
             self.sweep()
+        except Exception as e:
+            logger.opt(exception=e).error("autocompact: sweep failed unexpectedly")

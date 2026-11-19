@@ -3,8 +3,8 @@
  *
  * A chat runs in one of three modes (models/FastMode.ts): ``off``, ``auto`` (fast for the
  * workspace's configured number of the user's turns, then standard speed) and ``on``. This module
- * decides when auto's "then" is, and applies a mode the user picks (in the model picker's modal or
- * with ``/fast on`` and ``/fast off`` in the composer).
+ * decides when auto's "then" is, and applies a mode the user picks (in the model picker's Fast
+ * Mode submenu, or with ``/fast on`` and ``/fast off`` in the composer).
  *
  * The check runs per render, where the loaded transcript and the idle flag meet, on a chat whose
  * harness declared the ``fast_mode_limit`` turn check (claude, codex). Auto switches a chat at
@@ -12,11 +12,15 @@
  * it. The first switch in a workspace also raises a short notice explaining what happened and
  * where the mode lives, recorded on the settings so it shows once.
  *
- * A turn is counted exactly as the transcript view counts one, by reusing the boundary rule the
- * timeline groups on, so "5 turns" means five exchanges the user can see. Permission verdicts
- * are excluded on top of that (the app talking to itself), and so are the turns of a seeded
- * chat's seed segment: the Mind app wrote those before any agent ran, so they bought no fast
- * turns.
+ * A turn is a message the message-kind registry marks as one -- a message the user sent, or a
+ * status line between turns -- so "5 turns" means five exchanges the user can see. The timeline
+ * also breaks at system chips, notices and permission and secret verdicts, but none of those is a
+ * turn the user took: the registry marks chips and notices as no turn, and verdicts are excluded on
+ * top of that (the app talking to itself). So are the turns of a seeded chat's seed segment: those
+ * were written before any agent ran, so they bought no fast turns. Nor is the `/compact` the idle
+ * sweep sends a Claude agent: the user never sent it, and it shows on its compaction's chip. Until
+ * something follows a `/compact`, the count cannot tell the sweep's from a typed one, so it leaves
+ * it out; the agent can read idle before the compaction's event reaches the page.
  */
 
 import m from "mithril";
@@ -33,7 +37,13 @@ import { hasFastModeLimit } from "../models/HarnessCatalog";
 import { getChatFastMode, setFastMode } from "../models/ModelSettings";
 import type { TranscriptEvent } from "../models/Response";
 import { SEED_SOURCE } from "../models/Response";
-import { isNonBoundaryUserMessage, resolutionOf } from "./message-classification";
+import {
+  isLandedSweepCompactCommand,
+  isTurnUserMessage,
+  isUnresolvedCompactCommand,
+  resolutionOf,
+  secretResolutionOf,
+} from "./message-classification";
 
 // The chat whose switch raised the notice, or null while none is showing.
 let noticeChatId: string | null = null;
@@ -41,17 +51,22 @@ let noticeChatId: string | null = null;
 /** How many turns the user has actually taken with an agent in this conversation. */
 export function countUserTurns(events: readonly TranscriptEvent[]): number {
   let count = 0;
-  for (const event of events) {
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i];
     if (event.type !== "user_message") {
       continue;
     }
-    if (event.source === SEED_SOURCE) {
+    if (
+      event.source === SEED_SOURCE ||
+      isLandedSweepCompactCommand(events, i) ||
+      isUnresolvedCompactCommand(events, i)
+    ) {
       continue;
     }
-    if (isNonBoundaryUserMessage(event)) {
+    if (!isTurnUserMessage(event)) {
       continue;
     }
-    if (resolutionOf(event) !== null) {
+    if (resolutionOf(event) !== null || secretResolutionOf(event) !== null) {
       continue;
     }
     count = count + 1;

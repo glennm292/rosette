@@ -3,47 +3,86 @@ import json
 import queue
 import re
 import shlex
-from datetime import datetime
-from datetime import timezone
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 from typing import Final
-from typing import assert_never
 
+from app_manifest.content_security_policy import attach_document_policy
+from app_manifest.manifest import describe_validation_error
+from app_manifest.registry import APP_CONTRACT_ROUTE
+from app_manifest.registry import CONTEXT_MENU_ROUTE
+from app_manifest.registry import SHELL_APP_CONTRACT_PATH
+from app_manifest.registry import SHELL_CONTEXT_MENU_PATH
+from app_schema.api_schema import DEFAULT_API_SCHEMA_PATH
+from app_schema.api_schema import register_api_schema_route
+from app_schema.errors import InvalidRequestBodyError
+from app_schema.request_guard import install_request_guard
+from app_schema.routes import error_response
+from app_schema.routes import model_response
 from flask import Flask
 from flask import Response
 from flask import request
 from flask import send_file
 from flask import send_from_directory
+from flask.typing import ResponseReturnValue
 from loguru import logger as _loguru_logger
 from pydantic import ValidationError
 from simple_websocket import ConnectionClosed
 from werkzeug.exceptions import NotFound
+from workspace_layout.errors import InvalidLayoutValueError
+from workspace_layout.identity import participant_key_of
+from workspace_layout.primitives import ParticipantKind
+from workspace_layout.primitives import UserId
 
+from imbue.system_interface.api_models import HeartbeatRequest
+from imbue.system_interface.api_models import HeartbeatResponse
+from imbue.system_interface.api_models import PresenceListing
+from imbue.system_interface.api_models import PresentUserView
+from imbue.system_interface.api_models import ShellHealthResponse
 from imbue.system_interface.app_context import SystemInterfaceState
 from imbue.system_interface.app_context import attach_state
 from imbue.system_interface.app_context import get_state
+from imbue.system_interface.avatar.icons import DEFAULT_ICON_SIZE
+from imbue.system_interface.avatar.routes import icon_png_response
+from imbue.system_interface.avatar.routes import register_avatar_routes
+from imbue.system_interface.avatar.routes import selected_design_id
+from imbue.system_interface.avatar.status import avatar_status_wire_json
 from imbue.system_interface.documents import FRONTEND_BUILT_HEADER
+from imbue.system_interface.documents import MANIFEST_PATH
+from imbue.system_interface.documents import SHELL_BACKGROUND_COLOR
+from imbue.system_interface.documents import THEME_GALLERY_ROUTE
+from imbue.system_interface.documents import TOUCH_ICON_PATH
 from imbue.system_interface.documents import document_response
 from imbue.system_interface.documents import inject_base_path_meta_tag
+from imbue.system_interface.documents import inject_install_tags
 from imbue.system_interface.documents import inject_meta_tag
+from imbue.system_interface.presence import PresenceOutcome
+from imbue.system_interface.presence import PresentUser
+from imbue.system_interface.presence import present_users_wire_json
+from imbue.system_interface.presence import reported_input_moment
+from imbue.system_interface.presence import utc_now
 from imbue.system_interface.request_helpers import handle_unhandled_exception
-from imbue.system_interface.request_helpers import json_response
+from imbue.system_interface.route_table import PRESENCE_HEARTBEAT_PATH
+from imbue.system_interface.route_table import PRESENCE_PATH
+from imbue.system_interface.route_table import ROSTER_ROUTE
+from imbue.system_interface.route_table import SHELL_ROUTE_TABLE
 from imbue.system_interface.shell.data_types import ClientStateReport
+from imbue.system_interface.shell.data_types import PopOutStateReport
+from imbue.system_interface.shell.errors import ClientNotFoundError
+from imbue.system_interface.shell.errors import InvalidShellValueError
 from imbue.system_interface.shell.errors import ShellStateError
-from imbue.system_interface.shell.projects import project_wire_json
-from imbue.system_interface.shell.routes import HTTP_SERVICE_UNAVAILABLE
+from imbue.system_interface.shell.keybindings_routes import register_keybindings_routes
+from imbue.system_interface.shell.route_helpers import HTTP_NOT_FOUND
+from imbue.system_interface.shell.route_helpers import IMAGE_CONTENT_SECURITY_POLICY
+from imbue.system_interface.shell.route_helpers import request_identity
 from imbue.system_interface.shell.routes import register_shell_routes
 from imbue.system_interface.shell.state import ShellState
-from imbue.system_interface.template_catalog import TemplateCatalogAvailability
-from imbue.system_interface.template_catalog import catalog_wire_json
+from imbue.system_interface.shell.tour import ONBOARDING_MEDIA_ORIGIN
+from imbue.system_interface.update_staleness import PREVIEW_META_CONTENT
+from imbue.system_interface.update_staleness import PREVIEW_META_TAG
 from imbue.system_interface.update_staleness import UPDATE_STALENESS_META_TAG
 from imbue.system_interface.wsgi import build_sock
-
-# The browser-side contract module (contracts.md section 10): built as its own library
-# entry into ``static/_static/`` and served with a permissive CORS header, since every
-# app page that speaks the contract loads it from the shell's origin.
-APP_CONTRACT_FILENAME: Final[str] = "app_contract.js"
-APP_CONTRACT_PATH: Final[str] = f"/_static/{APP_CONTRACT_FILENAME}"
 
 # The terminal app's registered name: the not-built placeholder embeds it as the way out.
 _TERMINAL_APP_NAME: Final[str] = "terminal"
@@ -226,14 +265,14 @@ _FRONTEND_NOT_BUILT_TEMPLATE = """<!doctype html>
   // no terminal registered to offer.
   var terminalLabel = __TERMINAL_LABEL__;
 
-  // Mirrors deriveAppOrigin/workspaceHostCoordinate in
-  // system/libs/workspace_ui/src/origin.ts, which is canonical: an app origin is its label
+  // Mirrors deriveAppOrigin in system/libs/workspace_ui/src/origin.ts and workspaceHostCoordinate
+  // in system/libs/workspace_ui/src/app_contract.ts, which are canonical: an app origin is its label
   // prefixed onto the workspace COORDINATE -- the first host-<hex> (or, on a
   // workspace-keyed share domain, bare 32-hex share) label and everything
   // after it -- and never onto this page's host verbatim, which
   // would nest the app under the shell's own label and route back here.
   //
-  // It differs from origin.ts in one way, deliberately: no coordinate label
+  // It differs from them in one way, deliberately: no coordinate label
   // means no origin, rather than falling back to the host unchanged. The shell
   // can assume it is running inside a workspace; this page cannot (a direct
   // hit on the loopback port has no coordinate), and a made-up origin would
@@ -330,22 +369,40 @@ def _shell_update_staleness() -> str | None:
     seconds per open tab for the length of an outage, and the placeholder
     itself never asks (it carries no banner). Reading staleness forks git, and
     an outage is precisely when the tree has moved and both of its reads run.
+    Skipped for a preview shell too: it serves a worktree the live tree is
+    expected to differ from, so the banner would only ever say so.
     """
-    if request.method == "HEAD":
+    if request.method == "HEAD" or get_state().is_preview:
         return None
     return get_state().update_staleness.staleness()
 
 
+def _inject_preview_meta_tag(html_content: str, is_preview: bool) -> str:
+    """Mark a preview shell's page so the frontend hides the verbs the backend refuses."""
+    if not is_preview:
+        return html_content
+    return inject_meta_tag(html_content, PREVIEW_META_TAG, PREVIEW_META_CONTENT)
+
+
+def _root_path() -> str:
+    """The path prefix the shell is served under, with no trailing slash (empty at the origin's root)."""
+    return (request.script_root or "").rstrip("/")
+
+
 def _index() -> Response:
-    index_path = get_state().static_directory / "index.html"
+    """The workspace's page: the desktop its windows render in, or a placeholder while the frontend is not built."""
+    state = get_state()
+    index_path = state.static_directory / "index.html"
     if index_path.exists():
         staleness = _shell_update_staleness()
-        root_path = (request.script_root or "").rstrip("/")
+        root_path = _root_path()
         html_content = index_path.read_text()
         html_content = inject_base_path_meta_tag(html_content, root_path)
+        html_content = inject_install_tags(html_content, state.workspace_name.resolve(), root_path)
         html_content = _inject_update_staleness_meta_tag(html_content, staleness)
+        html_content = _inject_preview_meta_tag(html_content, state.is_preview)
         return document_response(html_content, is_frontend_built=True)
-    return _frontend_not_built_response()
+    return _frontend_not_built_response(index_path)
 
 
 def render_frontend_not_built_page(terminal_label: str | None) -> str:
@@ -377,8 +434,9 @@ def render_frontend_not_built_page(terminal_label: str | None) -> str:
     )
 
 
-def _frontend_not_built_response() -> Response:
-    """Render the placeholder shown when there is no compiled bundle to serve.
+def _frontend_not_built_response(missing_page: Path) -> Response:
+    """Render the placeholder shown when there is no compiled bundle to serve; ``missing_page`` is the built page
+    the request wanted.
 
     A ``HEAD`` gets the header and nothing else. That is the placeholder's own
     poll asking whether the bundle is back yet -- every ten seconds, for every
@@ -392,61 +450,207 @@ def _frontend_not_built_response() -> Response:
     # Logged with the resolved directory because the usual cause is that the
     # served tree was replaced under a running service, which is otherwise
     # invisible from the supervisor logs.
-    _loguru_logger.warning(
-        "Served the not-built placeholder: no frontend bundle at {}", get_state().static_directory / "index.html"
-    )
+    _loguru_logger.warning("Served the not-built placeholder: no frontend bundle at {}", missing_page)
     return document_response(render_frontend_not_built_page(_terminal_origin_label()), is_frontend_built=False)
 
 
+def _theme_gallery() -> Response:
+    """The theme gallery page (workspace-themes plan section 8.2), a second page of the shell's build."""
+    gallery_path = get_state().static_directory / THEME_GALLERY_FILENAME
+    if not gallery_path.exists():
+        return _frontend_not_built_response(gallery_path)
+    html_content = inject_base_path_meta_tag(gallery_path.read_text(), _root_path())
+    return document_response(html_content, is_frontend_built=True)
+
+
 def _index_catch_all(path: str) -> Response:
-    # Every other path is a client-side route and renders the app shell.
+    """The workspace's page again, for every path the page routes on its own; an unknown API path is a 404."""
+    # Every other path is a client-side route and renders the app shell -- except an
+    # unknown API path, whose caller wants an answer it can parse, not a page.
+    if path == API_PREFIX.strip("/") or path.startswith(API_PREFIX):
+        return error_response(f"No such API route: /{path}", HTTP_NOT_FOUND)
     return _index()
 
 
 def _health_endpoint() -> Response:
     """The probe route of contracts.md section 5: alive, and whether the built frontend is being served."""
     is_frontend_built = (get_state().static_directory / "index.html").exists()
-    return json_response({"status": "ok", "is_frontend_built": is_frontend_built})
+    return model_response(ShellHealthResponse(status="ok", is_frontend_built=is_frontend_built))
 
 
-TEMPLATES_CATALOG_PATH: Final[str] = "/api/templates-catalog"
-_TEMPLATES_UNAVAILABLE_DETAIL: Final[str] = "failed to load templates"
+THEME_GALLERY_FILENAME: Final[str] = "theme-gallery.html"
+
+# Every route the shell answers as JSON lives under it; an unknown path under it is a JSON 404.
+API_PREFIX: Final[str] = "api/"
 
 
-def _templates_catalog_endpoint() -> Response:
-    """The New Tab page's template catalog: the freshest copy the store holds, with each drawing
-    resolved to a URL; ``catalog`` is null when no catalog URL is configured, and a 503 says
-    nothing could be loaded."""
-    state = get_state()
-    reading = state.template_catalog.read()
-    match reading.availability:
-        case TemplateCatalogAvailability.DISABLED:
-            return json_response({"catalog": None, "is_stale": False})
-        case TemplateCatalogAvailability.UNAVAILABLE:
-            return json_response({"detail": _TEMPLATES_UNAVAILABLE_DETAIL}, status_code=HTTP_SERVICE_UNAVAILABLE)
-        case TemplateCatalogAvailability.FRESH | TemplateCatalogAvailability.STALE:
-            assert reading.catalog is not None, "a fresh or stale reading carries its catalog"
-            return json_response(
-                {
-                    "catalog": catalog_wire_json(reading.catalog, state.template_catalog.catalog_url),
-                    "is_stale": reading.availability is TemplateCatalogAvailability.STALE,
-                }
-            )
-        case _ as unreachable:
-            assert_never(unreachable)
+def _present_users_wire_json(users: Sequence[PresentUser]) -> list[dict[str, Any]]:
+    return present_users_wire_json(users, get_state().profiles, utc_now())
 
 
-def _serve_app_contract() -> Response:
-    """Serve the browser-side contract module (contracts.md section 10) for any origin's app page."""
-    contract_path = get_state().static_directory / "_static" / APP_CONTRACT_FILENAME
-    if not contract_path.is_file():
+def _presence_endpoint() -> Response:
+    """The connected users right now (one entry per user), for backends and tests that prefer HTTP to the files."""
+    users = get_state().presence.connected_users(utc_now())
+    return model_response(
+        PresenceListing(users=tuple(PresentUserView.model_validate(user) for user in _present_users_wire_json(users)))
+    )
+
+
+def _roster_wire_json() -> dict[str, Any]:
+    return get_state().roster.document(utc_now()).model_dump(mode="json")
+
+
+def _broadcast_presence_if_changed(outcome: PresenceOutcome) -> None:
+    """Announce what a heartbeat or a sweep changed: the connected set and the roster when someone came or went,
+    the roster alone when a person's newest input time moved (the multiplayer spec, section 4.3), since every other
+    window reads "Active" or "Idle" off the roster it was last pushed."""
+    if outcome.is_membership_changed:
+        _shell().broadcaster.broadcast_presence_updated(_present_users_wire_json(outcome.users))
+    if outcome.is_membership_changed or outcome.is_input_changed:
+        get_state().roster_announcer.announce()
+
+
+def _roster_endpoint() -> Response:
+    """Everyone who may be here, in roster order (the multiplayer spec, section 4.2)."""
+    return model_response(get_state().roster.document(utc_now()))
+
+
+# A picture a page's cache may keep for good: its URL carries the version, so a newer picture is a newer URL. Only
+# an answer under the current version is kept so, since a stale page asking under an older one gets these bytes too.
+_VERSIONED_PICTURE_CACHE_CONTROL: Final[str] = "public, max-age=31536000, immutable"
+# The participant keys that name a person, whose id part the profile is kept under.
+_USER_KEY_PREFIX: Final[str] = "user:"
+
+
+def _participant_picture_endpoint(key: str) -> ResponseReturnValue:
+    """A person's profile picture from the shell's own origin (the multiplayer spec, section 4.2): fetched from the
+    profile's URL once and kept, so the pages, whose policy admits no outside image, can show it. 404 for a key that
+    is not a person's the roster lists, or a person with no picture."""
+    now = utc_now()
+    roster = get_state().roster
+    # Only a person the roster lists by account has a picture here: no id a page names is parsed, fetched, or
+    # cached unless the roster built the key from a valid one.
+    is_listed_person = key.startswith(_USER_KEY_PREFIX) and any(
+        str(entry.key) == key and entry.kind == ParticipantKind.PERSON for entry in roster.document(now).participants
+    )
+    if not is_listed_person:
+        return error_response("Only a person listed in the roster has a profile picture here", HTTP_NOT_FOUND)
+    picture = roster.profiles.resolve_picture(UserId(key.removeprefix(_USER_KEY_PREFIX)), now)
+    if picture is None:
+        return error_response("No profile picture", HTTP_NOT_FOUND)
+    response = Response(picture.content, mimetype=picture.media_type)
+    # The bytes are an outside host's, under whatever image type it declared: sent as the shell's own images are.
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Content-Security-Policy"] = IMAGE_CONTENT_SECURITY_POLICY
+    is_current_version = request.args.get("v") == picture.version
+    response.headers["Cache-Control"] = _VERSIONED_PICTURE_CACHE_CONTROL if is_current_version else "no-cache"
+    return response
+
+
+def _parse_heartbeat() -> HeartbeatRequest:
+    """The heartbeat's body, read here rather than by ``parse_request_body`` because a page from before the body was
+    sent posts none at all, which is a heartbeat carrying nothing; anything else is refused as the helper refuses it."""
+    if not request.get_data():
+        return HeartbeatRequest()
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        raise InvalidRequestBodyError("the request body must be a JSON object")
+    try:
+        return HeartbeatRequest.model_validate(body)
+    except ValidationError as e:
+        raise InvalidRequestBodyError(describe_validation_error(e)) from e
+
+
+def _presence_heartbeat_endpoint() -> Response:
+    """One shell page's heartbeat: record the requester's presence (the owner of an unshared workspace under the
+    ``owner`` key), the page's newest input time, and the windows a person interacted with since the last heartbeat
+    (the app-usage-signals spec, section 6.3), and answer their own identity record and participant key.
+
+    Answers 204 and records nothing for a visiting agent, which never heartbeats: there is no file for one here.
+    """
+    identity = request_identity()
+    heartbeat = _parse_heartbeat()
+    if identity.agent_id is not None:
+        return Response(status=204)
+    now = utc_now()
+    try:
+        outcome = get_state().presence.heartbeat(
+            identity, now, reported_input_moment(now, heartbeat.input_age_seconds, heartbeat.last_input_at)
+        )
+    except (InvalidShellValueError, InvalidLayoutValueError) as e:
+        return error_response(str(e), 400)
+    _broadcast_presence_if_changed(outcome)
+    if heartbeat.client_id is not None:
+        _shell().record_window_input(heartbeat.client_id, heartbeat.input_windows)
+    return model_response(HeartbeatResponse(identity=identity, participant=participant_key_of(identity)))
+
+
+# The icon sizes the manifest offers: the touch icon's, and the two an installing browser asks a manifest for.
+_MANIFEST_ICON_SIZES: Final[tuple[int, ...]] = (DEFAULT_ICON_SIZE, 192, 512)
+_MANIFEST_MIMETYPE: Final[str] = "application/manifest+json"
+
+
+def _touch_icon() -> ResponseReturnValue:
+    """The selected avatar as the home-screen icon iOS asks the page for."""
+    return icon_png_response(selected_design_id(_shell()), DEFAULT_ICON_SIZE)
+
+
+def _web_manifest() -> Response:
+    """The web app manifest: the workspace's name, the shell's root as where it opens and what it covers, standalone,
+    the page colour, and the selected avatar's icons."""
+    root = f"{_root_path()}/"
+    name = get_state().workspace_name.resolve()
+    design_id = selected_design_id(_shell())
+    manifest = {
+        "name": name,
+        "short_name": name,
+        "start_url": root,
+        "scope": root,
+        "display": "standalone",
+        "background_color": SHELL_BACKGROUND_COLOR,
+        "theme_color": SHELL_BACKGROUND_COLOR,
+        "icons": [
+            {
+                "src": f"{root}api/avatars/{design_id}/icon.png?size={size}",
+                "sizes": f"{size}x{size}",
+                "type": "image/png",
+            }
+            for size in _MANIFEST_ICON_SIZES
+        ],
+    }
+    response = Response(json.dumps(manifest), mimetype=_MANIFEST_MIMETYPE)
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+def _serve_shell_module(basename: str) -> Response:
+    """Serve one of the browser-side modules every app serves (the contract, desktop contracts.md section 7, and
+    the element context menu) from the shell's own origin.
+
+    An app page imports them from its own origin (each app serves the same build output), since a
+    cross-origin module import carries no cookie and the forwarder refuses it; this copy is what
+    the e2e stub pages import.
+    """
+    module_path = get_state().static_directory / "_static" / basename
+    if not module_path.is_file():
         return Response(status=404)
-    response = send_file(contract_path, mimetype="text/javascript")
+    response = send_file(module_path, mimetype="text/javascript")
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
 
 
+def _serve_app_contract() -> Response:
+    """The app contract module: how an app's page talks to the shell framing it."""
+    return _serve_shell_module(SHELL_APP_CONTRACT_PATH.name)
+
+
+def _serve_context_menu() -> Response:
+    """The element context menu module: the right-click menu that hands an element on a page to a chat."""
+    return _serve_shell_module(SHELL_CONTEXT_MENU_PATH.name)
+
+
 def _favicon() -> Response:
+    """The page's icon."""
     favicon_path = get_state().static_directory / "favicon.ico"
     if favicon_path.exists():
         return send_file(favicon_path, mimetype="image/x-icon")
@@ -454,6 +658,7 @@ def _favicon() -> Response:
 
 
 def _serve_asset(filename: str) -> Response:
+    """One file of the page's built bundle, by name."""
     assets_directory = get_state().static_directory / "assets"
     # A missing asset is a plain 404, as for the favicon above, rather than the
     # HTML error page ``send_from_directory`` would raise. Existence and safety
@@ -467,8 +672,14 @@ def _serve_asset(filename: str) -> Response:
 
 
 def _ws_endpoint(websocket: Any) -> None:
-    """The one WebSocket per window (contracts.md section 8)."""
-    _run_ws_broadcast_loop(websocket=websocket, shell=get_state().shell)
+    """The one WebSocket per window (desktop contracts.md section 6)."""
+    state = get_state()
+    _run_ws_broadcast_loop(
+        websocket=websocket,
+        shell=state.shell,
+        initial_presence=_present_users_wire_json(state.presence.connected_users(utc_now())),
+        initial_roster=_roster_wire_json(),
+    )
 
 
 def _handle_client_state_message(
@@ -479,10 +690,14 @@ def _handle_client_state_message(
 ) -> bool:
     """Process one incoming WebSocket message; returns True for a well-formed ``client_state``.
 
-    ``client_state`` is the only message type clients send: it registers the browser's client
-    id, device kind, and active view (on connect and on every view switch). Registration feeds
-    the broadcaster's client registry (which targets layout ops), the client record, and the
-    client-activity log (a ``view_switch`` when the report names a different previous view).
+    ``client_state`` is the only message type clients send: it registers the browser's client id and the
+    desktop it is on, on connect and on every switch. Registration feeds the broadcaster's client registry
+    (which targets layout ops), the client record, and the client-activity log (a ``desktop_switch`` when
+    the report names a different previous desktop). A following report (a window that followed the client's stored
+    desktop, pushed or read on a reconnect) registers the connection and only stamps the client as seen. A moving
+    report made before a move its page had not heard of is not recorded, and its connection is told the record. A
+    pop-out's report registers its connection under its client and nothing more: the client's record and active
+    desktop are its main window's.
     """
     try:
         parsed = json.loads(raw_message)
@@ -492,60 +707,124 @@ def _handle_client_state_message(
     if not isinstance(parsed, dict) or parsed.get("type") != "client_state":
         _loguru_logger.warning("Ignored unexpected WebSocket message type from client: {!r}", parsed)
         return False
+    body = {key: value for key, value in parsed.items() if key != "type"}
+    if body.get("is_pop_out") is True:
+        return _register_pop_out(body, client_queue, shell, is_first_report)
     try:
-        report = ClientStateReport.model_validate({key: value for key, value in parsed.items() if key != "type"})
+        report = ClientStateReport.model_validate(body)
     except ValidationError as e:
         _loguru_logger.warning("Ignored a malformed client_state report: {}", e.errors()[0]["msg"])
         return False
-    shell.broadcaster.set_client_info(
-        client_queue, str(report.client_id), str(report.active_view), report.device_kind.value
-    )
+    shell.broadcaster.set_client_info(client_queue, str(report.client_id), str(report.active_desktop))
+    # A window that followed the stored desktop may name a desktop a later move has already replaced: recording it
+    # would move the client back and set its windows following again. So it only stamps the client as seen.
     # A state file the shell cannot write is a warning, not a dropped socket: the live
     # registration above is what the layout ops need, and the next report retries the write.
-    try:
-        outcome = shell.clients.record_report(report, datetime.now(timezone.utc))
-    except ShellStateError as e:
-        _loguru_logger.opt(exception=e).warning("Could not record the client report for {}", report.client_id)
+    is_superseded = False
+    if report.is_following:
+        try:
+            shell.record_client_seen(report.client_id)
+        except ClientNotFoundError as e:
+            _loguru_logger.opt(exception=e).debug("No client record to stamp as seen for {}", report.client_id)
+        except ShellStateError as e:
+            _loguru_logger.opt(exception=e).warning("Could not stamp the client {} as seen", report.client_id)
     else:
-        # Only a report that moved the stored view is broadcast: a window following a push reports the
-        # view it was pushed to, which matches the record, so the chain ends after one hop.
-        if outcome.is_active_view_changed:
-            shell.broadcaster.broadcast_active_view_changed(str(report.client_id), str(report.active_view))
+        is_superseded = _record_moving_report(report, client_queue, shell)
     if is_first_report:
         _loguru_logger.info(
-            "WS client registered: client_id={} view={} device={} (conn {})",
+            "WS client registered: client_id={} desktop={} (conn {})",
             report.client_id,
-            report.active_view,
-            report.device_kind.value,
+            report.active_desktop,
             id(client_queue),
         )
-    elif report.previous_view and report.previous_view != report.active_view:
-        _loguru_logger.info(
-            "WS client {} switched view {} -> {} (conn {})",
-            report.client_id,
-            report.previous_view,
-            report.active_view,
-            id(client_queue),
-        )
-        try:
-            shell.activity.append_view_switch(
-                str(report.client_id), report.device_kind.value, report.previous_view, str(report.active_view)
-            )
-        except OSError as e:
-            _loguru_logger.opt(exception=e).warning("Could not log the view switch for {}", report.client_id)
-    else:
-        # A re-report on an already-registered connection with an unchanged view.
-        pass
+        return True
+    if not is_superseded:
+        _log_client_switches(report, client_queue, shell)
     return True
 
 
-def _run_ws_broadcast_loop(websocket: Any, shell: ShellState) -> None:
+def _record_moving_report(
+    report: ClientStateReport, client_queue: "queue.Queue[str | None]", shell: ShellState
+) -> bool:
+    """Record a report that moves the client; answers whether it was superseded, made before a move its page had not
+    heard of. A superseded report is not recorded: the page follows that move instead, and since the move may have been
+    announced before this connection could hear it (an op landing as the page loads), the connection is told the
+    client's record again; a window that heard it already ignores it."""
+    try:
+        outcome = shell.record_client_report(report)
+    except ShellStateError as e:
+        _loguru_logger.opt(exception=e).warning("Could not record the client report for {}", report.client_id)
+        return False
+    if not outcome.is_superseded:
+        return False
+    _loguru_logger.info(
+        "WS client {} reported desktop {} at revision {}, before a later move: not recorded (conn {})",
+        report.client_id,
+        report.active_desktop,
+        report.revision,
+        id(client_queue),
+    )
+    shell.broadcaster.send_active_desktop_changed_to(
+        client_queue, str(report.client_id), str(outcome.record.active_desktop), outcome.record.desktop_revision
+    )
+    return True
+
+
+def _register_pop_out(
+    body: dict[str, Any],
+    client_queue: "queue.Queue[str | None]",
+    shell: ShellState,
+    is_first_report: bool,
+) -> bool:
+    try:
+        report = PopOutStateReport.model_validate(body)
+    except ValidationError as e:
+        _loguru_logger.warning("Ignored a malformed pop-out client_state report: {}", e.errors()[0]["msg"])
+        return False
+    shell.broadcaster.set_pop_out_info(client_queue, str(report.client_id))
+    if is_first_report:
+        _loguru_logger.info("WS pop-out registered: client_id={} (conn {})", report.client_id, id(client_queue))
+    return True
+
+
+def _log_client_switches(
+    report: ClientStateReport, client_queue: "queue.Queue[str | None]", shell: ShellState
+) -> None:
+    """Log, and append to the activity log, the desktop switch a re-report names (a following report, and a report
+    whose previous desktop is empty or unchanged, names none)."""
+    is_desktop_switch = (
+        not report.is_following and bool(report.previous_desktop) and report.previous_desktop != report.active_desktop
+    )
+    # A switch the log cannot take is a warning: the record already moved the client.
+    if is_desktop_switch:
+        _loguru_logger.info(
+            "WS client {} switched desktop {} -> {} (conn {})",
+            report.client_id,
+            report.previous_desktop,
+            report.active_desktop,
+            id(client_queue),
+        )
+        try:
+            shell.activity.append_desktop_switch(
+                str(report.client_id), report.previous_desktop, str(report.active_desktop)
+            )
+        except OSError as e:
+            _loguru_logger.opt(exception=e).warning("Could not log the desktop switch for {}", report.client_id)
+
+
+def _run_ws_broadcast_loop(
+    websocket: Any, shell: ShellState, initial_presence: list[dict[str, Any]], initial_roster: dict[str, Any]
+) -> None:
     """Stream the shell broadcaster's messages to ``websocket`` until the client disconnects.
 
     Each WebSocket connection owns its own thread (flask-sock + the threaded WSGI server), so
     this loop blocks on the per-client queue and forwards messages. flask-sock's keepalive
     closes a half-dead peer, surfacing as ``ConnectionClosed`` from ``send``; the broadcaster
     can also evict a hopelessly-behind client by pushing the shutdown sentinel (``None``).
+
+    The connect sends the inventory, the desktops, the connected users, and the roster
+    (``initial_presence`` and ``initial_roster``, read by the caller before the loop starts) so a window paints
+    from one snapshot; later changes arrive as broadcasts.
 
     Incoming ``client_state`` registrations are drained non-blockingly on each loop iteration.
     """
@@ -554,14 +833,37 @@ def _run_ws_broadcast_loop(websocket: Any, shell: ShellState) -> None:
     _loguru_logger.info("WS /api/ws connection opened (conn {})", id(client_queue))
     disconnect_reason = "handler exited"
     try:
-        websocket.send(json.dumps({"type": "apps_updated", "apps": shell.inventory.serialized()}))
+        websocket.send(
+            json.dumps(
+                {"type": "apps_updated", "apps": [app.model_dump(mode="json") for app in shell.inventory.views()]}
+            )
+        )
         websocket.send(
             json.dumps(
                 {
-                    "type": "projects_updated",
-                    "projects": [project_wire_json(project) for project in shell.projects.list_projects()],
+                    "type": "desktops_updated",
+                    "desktops": [
+                        desktop.model_dump(mode="json") for desktop in shell.desktop_views(shell.list_desktops())
+                    ],
                 }
             )
+        )
+        websocket.send(json.dumps({"type": "avatar_status", **avatar_status_wire_json(shell.avatar_status.current())}))
+        # The notice too, so a window that reconnects after a rollback restarted this shell
+        # sees the outcome without a fetch of its own.
+        notice = shell.update_notice.current()
+        websocket.send(
+            json.dumps({"type": "update_notice_changed", "notice": notice.wire_json() if notice is not None else None})
+        )
+        websocket.send(json.dumps({"type": "presence_updated", "users": initial_presence}))
+        websocket.send(json.dumps({"type": "roster_updated", **initial_roster}))
+        # The chats' activity too, when the chat app has reported it: the agent's card lists it from the connect.
+        chats_activity = shell.chats_activity.current()
+        if chats_activity is not None:
+            websocket.send(json.dumps({"type": "chats_activity", **chats_activity.model_dump(mode="json")}))
+        # The tray's resource gauge as it stands; later changes are broadcast by its monitor.
+        websocket.send(
+            json.dumps({"type": "resource_gauge_changed", "view": shell.resource_gauge.view().model_dump(mode="json")})
         )
 
         is_client_registered = False
@@ -569,10 +871,16 @@ def _run_ws_broadcast_loop(websocket: Any, shell: ShellState) -> None:
         while not shutdown:
             incoming = websocket.receive(timeout=0)
             while incoming is not None:
-                if _handle_client_state_message(
-                    str(incoming), client_queue, shell, is_first_report=not is_client_registered
+                if (
+                    _handle_client_state_message(
+                        str(incoming), client_queue, shell, is_first_report=not is_client_registered
+                    )
+                    and not is_client_registered
                 ):
                     is_client_registered = True
+                    # A window registering changes which clients are connected (a socket that dropped and came
+                    # back among them), which the tray's viewing ring reads off the clients listing.
+                    ws_broadcaster.broadcast_clients_updated()
                 incoming = websocket.receive(timeout=0)
             try:
                 message = client_queue.get(timeout=1.0)
@@ -590,10 +898,18 @@ def _run_ws_broadcast_loop(websocket: Any, shell: ShellState) -> None:
         _loguru_logger.info(
             "WS /api/ws connection closed (conn {}, client_id={}, reason: {})",
             id(client_queue),
-            client_info["client_id"] if client_info is not None else "<unregistered>",
+            client_info.client_id if client_info is not None else "<unregistered>",
             disconnect_reason,
         )
         ws_broadcaster.unregister(client_queue)
+        # A registered window going away changes which clients are connected and where, which the tray's
+        # viewing ring reads off the clients listing; a window that never registered was never listed.
+        if client_info is not None:
+            ws_broadcaster.broadcast_clients_updated()
+
+
+APP_DISPLAY_NAME: Final[str] = "Workspace"
+APP_DESCRIPTION: Final[str] = "The workspace's shell: its windows, desktops and apps, and who is here."
 
 
 def create_application(state: SystemInterfaceState) -> Flask:
@@ -607,16 +923,35 @@ def create_application(state: SystemInterfaceState) -> Flask:
     # static_folder=None disables Flask's default /static route; the shell serves its own
     # static assets explicitly below.
     application = Flask(__name__, static_folder=None)
+    # The two browser-side modules are served to other origins on purpose (a CORS header below).
+    install_request_guard(application, exempt_rules=frozenset({APP_CONTRACT_ROUTE, CONTEXT_MENU_ROUTE}))
     attach_state(application, state)
+    attach_document_policy(application, {"img-src": f"'self' data: blob: {ONBOARDING_MEDIA_ORIGIN}"})
     application.register_error_handler(Exception, handle_unhandled_exception)
     sock = build_sock(application)
 
     application.add_url_rule("/", view_func=_index, methods=["GET"])
     application.add_url_rule("/favicon.ico", view_func=_favicon, methods=["GET"])
+    application.add_url_rule(TOUCH_ICON_PATH, view_func=_touch_icon, methods=["GET"])
+    application.add_url_rule(MANIFEST_PATH, view_func=_web_manifest, methods=["GET"])
     application.add_url_rule("/api/health", view_func=_health_endpoint, methods=["GET"])
-    application.add_url_rule(APP_CONTRACT_PATH, view_func=_serve_app_contract, methods=["GET"])
-    application.add_url_rule(TEMPLATES_CATALOG_PATH, view_func=_templates_catalog_endpoint, methods=["GET"])
+    application.add_url_rule(THEME_GALLERY_ROUTE, view_func=_theme_gallery, methods=["GET"])
+    register_api_schema_route(
+        application,
+        DEFAULT_API_SCHEMA_PATH,
+        title=APP_DISPLAY_NAME,
+        description=APP_DESCRIPTION,
+        route_table=SHELL_ROUTE_TABLE,
+    )
+    application.add_url_rule(APP_CONTRACT_ROUTE, view_func=_serve_app_contract, methods=["GET"])
+    application.add_url_rule(CONTEXT_MENU_ROUTE, view_func=_serve_context_menu, methods=["GET"])
+    application.add_url_rule(PRESENCE_PATH, view_func=_presence_endpoint, methods=["GET"])
+    application.add_url_rule(PRESENCE_HEARTBEAT_PATH, view_func=_presence_heartbeat_endpoint, methods=["POST"])
+    application.add_url_rule(ROSTER_ROUTE, view_func=_roster_endpoint, methods=["GET"])
+    application.add_url_rule(f"{ROSTER_ROUTE}/<key>/picture", view_func=_participant_picture_endpoint, methods=["GET"])
     register_shell_routes(application)
+    register_keybindings_routes(application)
+    register_avatar_routes(application)
     sock.route("/api/ws")(_ws_endpoint)
 
     # Registered unconditionally, even when the bundle is absent at startup: the directory can

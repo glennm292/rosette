@@ -1,7 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 # What kind of help a line needs. A line opening with "?" is always ANSWER;
 # otherwise the tutor picks.

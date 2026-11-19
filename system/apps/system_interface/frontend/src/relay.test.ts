@@ -11,6 +11,7 @@ import {
   resetEmbedderRelayForTesting,
   sendToChildFrame,
   setChildFrameMessageHandler,
+  setEmbedderAppMessageHandler,
 } from "./relay";
 
 // jsdom's location is http://localhost:3000, which carries no workspace coordinate, so the
@@ -50,6 +51,19 @@ afterEach(() => {
   resetEmbedderRelayForTesting();
   document.body.innerHTML = "";
   Object.defineProperty(window, "parent", { value: window, configurable: true });
+});
+
+describe("the origin the shell framed", () => {
+  it("accepts a shell message from a frame's own origin off the family, and still refuses a third origin", () => {
+    const handler = vi.fn();
+    setChildFrameMessageHandler("shell:location", handler);
+    const frame = mountFrame();
+    frame.src = "http://127.0.0.1:7001/new";
+    post({ type: "shell:location", path: "/x" }, "http://127.0.0.1:7001", frameWindow(frame));
+    expect(handler).toHaveBeenCalledWith(frame, expect.objectContaining({ path: "/x" }));
+    post({ type: "shell:location", path: "/y" }, FOREIGN_ORIGIN, frameWindow(frame));
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("isWorkspaceFamilyOrigin", () => {
@@ -114,6 +128,34 @@ describe("the embedder relay", () => {
 
     expect(firstSpy).toHaveBeenCalledWith(verdicts, "*");
     expect(secondSpy).toHaveBeenCalledWith(verdicts, "*");
+  });
+
+  it("hands a chrome message of a type the contract does not define to the app-message handler, beside the frames", () => {
+    const chrome = framedUnderChrome();
+    const frame = mountFrame();
+    const frameSpy = vi.spyOn(frameWindow(frame), "postMessage");
+    const handler = vi.fn();
+    setEmbedderAppMessageHandler(handler);
+    const destination = { type: "minds:show-routine", routine_id: "inbox-digest" };
+
+    post(destination, "https://chrome.example", chrome);
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith(destination);
+    expect(frameSpy).toHaveBeenCalledWith(destination, "*");
+  });
+
+  it("hands the app-message handler neither a contract type, which the embed endpoint's observer takes, nor a frame's message", () => {
+    const chrome = framedUnderChrome();
+    const frame = mountFrame();
+    const handler = vi.fn();
+    setEmbedderAppMessageHandler(handler);
+
+    post({ type: "minds:focus-chat", chatId: "agent-7" }, "https://chrome.example", chrome);
+    post({ type: "minds:show-routine", routine_id: "inbox-digest" }, SHELL_ORIGIN, frameWindow(frame));
+    post({ type: "open:file", path: "/home/user/plan.md" }, SHELL_ORIGIN, frameWindow(frame));
+
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("forwards nothing upward on a top-level page", () => {

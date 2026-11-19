@@ -6,20 +6,26 @@
 import m from "mithril";
 import "./style.css";
 import { getChatAgentId, getChatId, getChatSessionId } from "./document-meta";
-import { addActiveAgentChangedListener, initChats } from "./models/Chats";
+import { addActiveAgentChangedListener, addMentionsUpdatedListener, initChats } from "./models/Chats";
 import { forgetPendingChoice } from "./models/ModelSettings";
 import { trackPendingLaneSettlement } from "./models/PendingLane";
+import { ensureParticipants } from "./models/Participants";
 import { closeProviderChooser, isProviderChooserOpen, loadAccountsWithRetry } from "./models/Providers";
 import { ProviderChooserModal } from "./views/ProviderChooserModal";
 import { llmApi } from "./llm-api";
 import type { LlmApi } from "./llm-api";
 import { runHook } from "./hooks";
 import { trackBackendArrivals } from "./models/OutgoingMessages";
-import { isMessageCarriedBySwitch } from "./models/Response";
+import { countSentTurnsSince, isMessageCarriedBySwitch } from "./models/Response";
 import { ChatPanel } from "./views/ChatPanel";
 import { SubagentView } from "./views/SubagentView";
 import { initShellPermissionResolutions } from "./views/permission-card";
-import { connectChatToShell, isFrameRendered } from "./shell";
+import { connectChatToShell, getShellHandshake, isFrameRendered } from "./shell";
+import { installElementContextMenu } from "@imbue/workspace-ui/src/context_menu";
+import { installCursorHidingWhileTyping } from "@imbue/workspace-ui/src/hideCursorWhileTyping";
+import { createContextMenuOpener } from "@imbue/workspace-ui/src/components/contextMenuOpener";
+import { prependToComposer } from "./views/MessageInput";
+import { COMPACT_MEDIA_QUERY, isCompactLayout } from "./compactLayout";
 
 declare global {
   interface Window {
@@ -38,10 +44,10 @@ function ChatDocument(chatId: string, agentId: string, sessionId: string): m.Com
       // below (the transcript's scroll container, the composer) is laid out from this height.
       return m("div", { class: "chat-document flex flex-col", style: "height: 100vh" }, [
         sessionId === ""
-          ? m(ChatPanel, { chatId, isVisible: isFrameRendered() })
+          ? m(ChatPanel, { chatId, isVisible: isFrameRendered(), isCompact: isCompactLayout() })
           : m(SubagentView, { chatId, agentId, subagentSessionId: sessionId }),
-        // The provider chooser: the page of a chat awaiting an account offers it, and the model
-        // bar's "+ Add a provider" and a provider-fault notice open it from inside a chat.
+        // The provider chooser: a chat with no provider to start on opens it from its composer, and
+        // the model bar's "+ Add a provider" and a provider-fault notice open it too.
         isProviderChooserOpen() ? m(ProviderChooserModal, { onDismiss: closeProviderChooser }) : null,
       ]);
     },
@@ -54,16 +60,38 @@ async function bootstrap(): Promise<void> {
   const sessionId = getChatSessionId();
   // The chat app's own WebSocket, read for this page's own chat.
   initChats();
-  trackBackendArrivals(isMessageCarriedBySwitch);
+  trackBackendArrivals(isMessageCarriedBySwitch, countSentTurnsSince);
   trackPendingLaneSettlement();
   // A chat that moved to a new agent starts on that harness's own model (spec 5.12): an
   // optimistic pick made for the old agent would otherwise sit on the bar until its timeout.
   addActiveAgentChangedListener((chatId) => forgetPendingChoice(chatId));
   initShellPermissionResolutions();
-  // Only the chat's own page reports the chat's presence: a subagent view is a second page
-  // of the same chat in the same client, and its reports would overwrite the chat page's.
-  connectChatToShell(chatId, { isPresenceReported: sessionId === "" });
+  const isChatPage = sessionId === "";
+  // Only the chat's own page reports the chat's presence: a subagent view on screen is not the
+  // chat being read.
+  const connection = connectChatToShell(chatId, {
+    isPresenceReported: isChatPage,
+    path: isChatPage ? `/${chatId}` : `/${chatId}.${agentId}.${sessionId}`,
+  });
+  // The element menu (element-reference-menu plan section 7.3): a chat page drafts a reference straight into its
+  // own composer (which attaches it as a file), whoever frames it; a sub-agent view has no composer and asks the
+  // shell, through the root.
+  installElementContextMenu({
+    connection,
+    handshake: getShellHandshake,
+    draft: isChatPage ? (text) => prependToComposer(chatId, text) : undefined,
+    isDraftAvailable: isChatPage ? () => true : undefined,
+    open: createContextMenuOpener().open,
+  });
+  // The pointer hides while text is typed into the composer.
+  installCursorHidingWhileTyping(document);
   void loadAccountsWithRetry();
+  // Who this page is and who everyone else is, so a turn is drawn as the viewer's own or as another person's;
+  // read again when someone's mentions change, which is the one push that follows a sender joining.
+  void ensureParticipants();
+  addMentionsUpdatedListener(() => void ensureParticipants());
+  // A page visited directly follows its own width into and out of the phone layout; a framed one is told.
+  window.matchMedia(COMPACT_MEDIA_QUERY).addEventListener("change", () => m.redraw());
   const rootElement = document.getElementById("app");
   if (rootElement) {
     m.mount(rootElement, ChatDocument(chatId, agentId, sessionId));

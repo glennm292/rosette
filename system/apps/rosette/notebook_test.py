@@ -2,13 +2,13 @@ import json
 from pathlib import Path
 
 import pytest
-
-from rosette.data_types import Notebook
-from rosette.data_types import Row
-from rosette.notebook import CLEARED_FILENAME
-from rosette.notebook import LEGACY_ARCHIVE_DIRNAME
-from rosette.notebook import NotebookStorageError
-from rosette.notebook import NotebookStore
+from rosette.data_types import Notebook, Row
+from rosette.notebook import (
+    CLEARED_FILENAME,
+    LEGACY_ARCHIVE_DIRNAME,
+    NotebookStorageError,
+    NotebookStore,
+)
 
 
 def _row(row_id: str, text: str) -> Row:
@@ -49,6 +49,7 @@ def test_undo_puts_a_clearing_back_and_marks_it_restored(tmp_path: Path) -> None
     store = _store_with(tmp_path, "keep", "cut")
     _, clearing = store.delete_row_and_below("r1")
     store.delete_row_and_below("r0")
+    assert clearing is not None
 
     notebook = store.restore_clearing(clearing)
 

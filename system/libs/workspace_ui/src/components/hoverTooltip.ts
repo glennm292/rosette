@@ -3,15 +3,14 @@
  * next to its target, positioned (fixed) under the target after a hover-intent
  * delay.
  *
- * Tab content in dockview can use neither of the usual tooltip mechanisms.
- * Native ``title`` is suppressed: dockview marks every tab ``draggable``
- * (tab.js sets ``element.draggable = true``, plus
- * ``-webkit-user-drag: element``), and Chromium hides ``title`` tooltips on
- * draggable elements and their descendants. A CSS ``::after`` bubble is
- * clipped by the tab strip's overflow (``.dv-tabs-container`` is
- * ``overflow: auto`` and ``.dv-groupview`` is ``overflow: hidden``). A
- * body-level, fixed-position element driven by our own listeners avoids both:
- * it is not a native tooltip, and it is not inside the clipping container.
+ * The desktop's chrome can use neither of the usual tooltip mechanisms.
+ * Native ``title`` cannot be timed or styled, and much of the chrome it would
+ * sit on is dragged by pointer (a window's title bar, a shortcut icon), where a
+ * native tooltip surfacing mid-gesture is noise. A CSS ``::after`` bubble is
+ * clipped by the container its trigger sits in: a window's body is
+ * ``overflow: hidden`` and the taskbar's entries strip scrolls. A body-level,
+ * fixed-position element driven by our own listeners avoids both: it is not a
+ * native tooltip, and it is not inside the clipping container.
  *
  * That being the only mechanism that works everywhere in the workspace, it is
  * the one every workspace tooltip uses: 250ms hover-intent delay, keyboard
@@ -32,15 +31,21 @@
  * leaves the document takes the bubble with it. A trigger must be IN the
  * document to be heard -- a detached tree never reaches the listeners.
  *
- * The one deliberate exception is the project rail: a rail row sits directly
- * above the row it is being compared against (e.g. the shortcut a hover is
- * about to reveal versus the one below it), so a centered-below bubble covers
- * exactly the row the tooltip is meant to help someone choose. ``placeTooltip``
- * takes an optional ``placement`` for that one case, defaulting to the shared
- * centered-below behavior everywhere else.
+ * A tooltip is one short line. A trigger that has a detail worth a glance -- a
+ * reason, a time -- adds it as an optional second line in quieter text
+ * (``detail``), which keeps the first line short rather than stretching it.
+ *
+ * The exceptions are both the same problem: a bubble under the trigger covers
+ * the thing the pointer is choosing between. The chat rail takes ``right``,
+ * because a rail row sits directly above the row it is being compared against;
+ * a list of rows that raise their own tooltips takes ``above``, because the
+ * rows below the pointer are what a bubble would cover. ``placeTooltip`` takes
+ * an optional ``placement`` for those, defaulting to the shared centered-below
+ * behavior everywhere else.
  */
 
 import type m from "mithril";
+import { applyPartAttrs, partAttrs } from "../themes/parts";
 
 /** Hover-intent delay before a tooltip appears. */
 const TOOLTIP_DELAY_MS = 250;
@@ -58,6 +63,10 @@ const TOOLTIP_MARGIN = 6;
  * clears the modal overlays. */
 const TOOLTIP_CLASS =
   "hover-tooltip type-helper pointer-events-none fixed z-(--z-tooltip) hidden max-w-[480px] items-center gap-1.5 rounded-md bg-inverse px-2 py-1 text-center whitespace-normal text-on-accent shadow-overlay dark:bg-surface dark:text-primary";
+
+/** The second line: the bubble's own text, quieter, and cut off after two lines with an ellipsis -- a glance, not the
+ * place to read a long error in full. */
+const DETAIL_CLASS = "hover-tooltip-detail line-clamp-2 opacity-70";
 
 /** The part of a ``DOMRect`` the placement needs. */
 export interface TooltipAnchor {
@@ -83,7 +92,7 @@ export interface TooltipPosition {
  * places the bubble beside the trigger instead, so it never covers the row
  * underneath.
  */
-export type TooltipPlacement = "below" | "right";
+export type TooltipPlacement = "below" | "above" | "right";
 
 /**
  * Where the bubble goes for the default ``"below"`` placement: centered under
@@ -97,6 +106,23 @@ function placeTooltipBelow(anchor: TooltipAnchor, bubble: TooltipSize, viewport:
   const above = anchor.top - bubble.height - TOOLTIP_GAP;
   const overflowsBottom = below + bubble.height > viewport.height - TOOLTIP_MARGIN;
   const top = overflowsBottom && above >= TOOLTIP_MARGIN ? above : below;
+  return {
+    left: Math.max(TOOLTIP_MARGIN, Math.min(centered, viewport.width - TOOLTIP_MARGIN - bubble.width)),
+    top: Math.max(TOOLTIP_MARGIN, top),
+  };
+}
+
+/**
+ * Where the bubble goes for ``"above"`` placement: the mirror of the default,
+ * centered OVER the trigger and flipped below on a top overflow.
+ */
+function placeTooltipAbove(anchor: TooltipAnchor, bubble: TooltipSize, viewport: TooltipSize): TooltipPosition {
+  const centered = anchor.left + anchor.width / 2 - bubble.width / 2;
+  const above = anchor.top - bubble.height - TOOLTIP_GAP;
+  const below = anchor.bottom + TOOLTIP_GAP;
+  const overflowsTop = above < TOOLTIP_MARGIN;
+  const fitsBelow = below + bubble.height <= viewport.height - TOOLTIP_MARGIN;
+  const top = overflowsTop && fitsBelow ? below : above;
   return {
     left: Math.max(TOOLTIP_MARGIN, Math.min(centered, viewport.width - TOOLTIP_MARGIN - bubble.width)),
     top: Math.max(TOOLTIP_MARGIN, top),
@@ -137,20 +163,26 @@ export function placeTooltip(
   switch (placement) {
     case "below":
       return placeTooltipBelow(anchor, bubble, viewport);
+    case "above":
+      return placeTooltipAbove(anchor, bubble, viewport);
     case "right":
       return placeTooltipRight(anchor, bubble, viewport);
   }
 }
 
-/** The attribute a trigger carries its text in, and the one it names a
+/** The attribute a trigger carries its text in, the one its optional second line, and the one it names a
  *  non-default placement in. */
 const TOOLTIP_ATTR = "data-hover-tooltip";
+const DETAIL_ATTR = "data-hover-tooltip-detail";
 const PLACEMENT_ATTR = "data-hover-tooltip-placement";
+const MAX_WIDTH_ATTR = "data-hover-tooltip-max-width";
 
 // One bubble is enough: only one tooltip is ever visible, so every trigger
 // shares it. ``pendingFor`` and ``shownFor`` name the trigger a scheduled or
 // visible bubble belongs to, so a trigger only ever dismisses its own.
 let bubbleElement: HTMLDivElement | null = null;
+// What the bubble shows, both lines, so a change to either while it is up redraws it.
+let shownContent: string | null = null;
 let pendingTimer: number | null = null;
 let pendingFor: Element | null = null;
 let shownFor: Element | null = null;
@@ -165,6 +197,7 @@ function ensureBubble(): HTMLDivElement {
     bubbleElement = document.createElement("div");
     bubbleElement.className = TOOLTIP_CLASS;
     bubbleElement.setAttribute("role", "tooltip");
+    applyPartAttrs(bubbleElement, partAttrs("tooltip"));
     document.body.appendChild(bubbleElement);
   }
   return bubbleElement;
@@ -192,9 +225,29 @@ function dropTooltip(): void {
   hideBubble();
 }
 
+function contentKey(text: string, detail: string | null): string {
+  return detail === null ? text : `${text}\n${detail}`;
+}
+
 function showBubble(target: Element, text: string, placement: TooltipPlacement): void {
   const element = ensureBubble();
-  element.textContent = text;
+  const detail = target.getAttribute(DETAIL_ATTR);
+  if (detail === null) {
+    element.textContent = text;
+  } else {
+    const line = document.createElement("span");
+    line.textContent = text;
+    const second = document.createElement("span");
+    second.className = DETAIL_CLASS;
+    second.textContent = detail;
+    element.replaceChildren(line, second);
+  }
+  // Two lines stack; one sits in the row the bubble lays its content out in.
+  element.style.flexDirection = detail === null ? "" : "column";
+  element.style.rowGap = detail === null ? "" : "0";
+  shownContent = contentKey(text, detail);
+  const maxWidth = target.getAttribute(MAX_WIDTH_ATTR);
+  element.style.maxWidth = maxWidth === null ? "" : `${maxWidth}px`;
   // Measure at the natural width: clear the width a previous show fixed, and
   // park the bubble at the origin first, since a stale ``left`` would cap the
   // shrink-to-fit width at (viewport - left) and wrap the label.
@@ -231,7 +284,8 @@ function tooltipTextOf(element: Element): string | null {
 }
 
 function placementOf(element: Element): TooltipPlacement {
-  return element.getAttribute(PLACEMENT_ATTR) === "right" ? "right" : "below";
+  const named = element.getAttribute(PLACEMENT_ATTR);
+  return named === "right" || named === "above" ? named : "below";
 }
 
 /** Keep a shown bubble honest: its trigger can lose its text or be torn out of
@@ -244,7 +298,7 @@ function watchShownTrigger(target: Element): void {
     const text = tooltipTextOf(shownFor);
     if (text === null) {
       hideBubble();
-    } else if (bubbleElement?.textContent !== text) {
+    } else if (shownContent !== contentKey(text, shownFor.getAttribute(DETAIL_ATTR))) {
       showBubble(shownFor, text, placementOf(shownFor));
     }
   });
@@ -253,7 +307,7 @@ function watchShownTrigger(target: Element): void {
   // check needs the whole tree, and that is childList alone -- watching every
   // element's attributes would put a record on every unrelated DOM write while
   // a bubble happens to be up.
-  shownObserver.observe(target, { attributeFilter: [TOOLTIP_ATTR] });
+  shownObserver.observe(target, { attributeFilter: [TOOLTIP_ATTR, DETAIL_ATTR] });
   shownObserver.observe(document.body, { childList: true, subtree: true });
 }
 
@@ -359,7 +413,7 @@ function wireListeners(): void {
 
 /**
  * Give an element a tooltip, or take it away with ``null``. For DOM this
- * workspace builds by hand (the lightbox, the dock's tab strip); mithril views
+ * workspace builds by hand (the lightbox); mithril views
  * spread ``hoverTooltipAttrs`` instead. Removing the element needs no cleanup:
  * nothing is attached to it.
  */
@@ -392,7 +446,11 @@ export function setHoverTooltip(element: Element, text: string | null, placement
  * redraws and runs only the current vnode's hooks, so anything a vanished
  * spread left behind would have nothing to clean it up.
  */
-export function hoverTooltipAttrs(text: string | null, placement: TooltipPlacement = "below"): m.Attributes {
+export function hoverTooltipAttrs(
+  text: string | null,
+  placement: TooltipPlacement = "below",
+  options: { maxWidth?: number; detail?: string | null } = {},
+): m.Attributes {
   wireListeners();
   // Null values are what mithril removes an attribute for, on the update where
   // they appear -- so a caller passing null, and a caller dropping the spread,
@@ -400,5 +458,9 @@ export function hoverTooltipAttrs(text: string | null, placement: TooltipPlaceme
   return {
     [TOOLTIP_ATTR]: text,
     [PLACEMENT_ATTR]: placement === "below" ? null : placement,
+    // A narrower bubble for a sentence or two of explanation, which reads better wrapped than in one long line.
+    [MAX_WIDTH_ATTR]: options.maxWidth ?? null,
+    // The optional second line, in quieter text under the first.
+    [DETAIL_ATTR]: text === null ? null : (options.detail ?? null),
   };
 }

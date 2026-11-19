@@ -43,16 +43,10 @@ def _run(
         )
 
 
-# --- the shebang, which is a fork bomb if it is wrong -------------------------------------
-
-
 def test_the_shebang_is_absolute() -> None:
     """`#!/usr/bin/env bash` -- which every other script here uses -- would make `env` resolve
     `bash` back to this shim, forever, killing every command the agent runs."""
     assert _SHIM.read_text().splitlines()[0] == "#!/bin/bash"
-
-
-# --- the guards fire ----------------------------------------------------------------------
 
 
 def test_it_blocks_a_git_history_rewrite() -> None:
@@ -62,9 +56,15 @@ def test_it_blocks_a_git_history_rewrite() -> None:
 
 
 def test_it_blocks_a_pipe_into_head() -> None:
-    result = _run("-c", "ls | head -5")
+    result = _run("-c", "pytest | head -5")
     assert result.returncode == 2
     assert "tail or head" in result.stderr
+
+
+def test_it_blocks_a_foreground_sleep() -> None:
+    result = _run("-c", "sleep 240; cat /tmp/out.txt")
+    assert result.returncode == 2
+    assert "foreground `sleep`" in result.stderr
 
 
 def test_a_quote_in_the_command_does_not_defeat_a_guard() -> None:
@@ -100,16 +100,17 @@ def test_a_guard_that_writes_to_stderr_but_exits_zero_stays_silent(
     assert "No command found" not in result.stderr
 
 
-# --- the rewrite --------------------------------------------------------------------------
+_PROC_OOM = Path("/proc/self/oom_score_adj")
 
 
+@pytest.mark.skipif(
+    not os.access(_PROC_OOM, os.W_OK),
+    reason=f"{_PROC_OOM} is not writable here; there is no tag for the shim to apply",
+)
 def test_the_oom_tag_is_applied() -> None:
-    result = _run("-c", "cat /proc/self/oom_score_adj")
+    result = _run("-c", f"cat {_PROC_OOM}")
     assert result.returncode == 0
     assert result.stdout.strip() == "900"
-
-
-# --- transparency: it must be indistinguishable from bash ----------------------------------
 
 
 def test_it_preserves_the_exit_code() -> None:
@@ -140,9 +141,6 @@ def test_a_non_dash_c_invocation_passes_straight_through() -> None:
     assert "GNU bash" in result.stdout
 
 
-# --- scoping and the kill switch -----------------------------------------------------------
-
-
 def test_a_nested_invocation_is_not_guarded_again() -> None:
     """Policing the whole process tree would block third-party code the agent did not write
     (a build whose package script pipes into head), and re-apply the prefix at every level."""
@@ -156,9 +154,6 @@ def test_the_kill_switch_disables_every_guard() -> None:
     assert result.returncode != 2, "the kill switch must work without a redeploy"
     # Prove the guard stayed silent, not merely that some other exit code came back.
     assert "git rebase" not in result.stderr
-
-
-# --- fail open ------------------------------------------------------------------------------
 
 
 def test_it_runs_the_command_when_the_guards_are_missing(tmp_path: Path) -> None:
@@ -175,9 +170,6 @@ def test_quoting_forms_survive_the_round_trip(command: str) -> None:
     assert _run("-c", command).returncode == 0
 
 
-# --- the two SOFT policies, which reach agy only through this shim ------------------------
-
-
 def _with_open_step(tmp_path: Path) -> dict[str, str]:
     """An env whose tickets dir holds one open step, and whose state dir has a turn marker."""
     tickets = tmp_path / "tickets"
@@ -185,18 +177,29 @@ def _with_open_step(tmp_path: Path) -> dict[str, str]:
     state = tmp_path / "state"
     state.mkdir()
     (state / "active").write_text("")
-    subprocess.run(
-        [
-            str(_WORK_DIR / "system" / "vendor" / "tk" / "ticket"),
-            "create",
-            "--step",
-            "An open step",
-        ],
-        env={**os.environ, "TICKETS_DIR": str(tickets)},
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    ticket = str(_WORK_DIR / "system" / "vendor" / "tk" / "ticket")
+    env = {**os.environ, "TICKETS_DIR": str(tickets)}
+
+    def run_tk(*arguments: str) -> str:
+        # Checked, and the output carried onto the failure: a setup step that fails
+        # quietly leaves the tickets dir in a state no caller asked for, and the
+        # tests then fail somewhere else entirely with no sign of why.
+        result = subprocess.run(
+            [ticket, *arguments], env=env, capture_output=True, text=True, timeout=30
+        )
+        assert result.returncode == 0, (
+            f"tk {' '.join(arguments)} failed ({result.returncode}): "
+            f"{result.stdout}{result.stderr}"
+        )
+        return result.stdout
+
+    # `create` only declares the step; `start` is what makes one in_progress, which is
+    # what "an open step" means to both policies. Without it the tickets dir holds a
+    # declared-but-unstarted step, and the shim correctly emits the OTHER reminder
+    # ("none is currently in_progress") -- which is what these tests then saw.
+    created = run_tk("create", "--step", "An open step")
+    step_id = created.split("Created ", 1)[1].split(":", 1)[0].strip()
+    run_tk("start", step_id)
     return {"TICKETS_DIR": str(tickets), "MNGR_AGENT_STATE_DIR": str(state)}
 
 
@@ -220,21 +223,34 @@ def test_the_reminder_does_not_repeat_within_one_turn(tmp_path: Path) -> None:
     assert "Open task reminder" not in result.stderr
 
 
+def _recreate_with_a_new_inode(marker: Path) -> None:
+    """Replace `marker` with a file the kernel gave a different inode number.
+
+    The turn key IS the inode, so a recreate that reuses the old number is not a new
+    turn and the reminder correctly stays quiet. Holding the freed number down with
+    other files makes reuse unlikely but never impossible -- CI hit the reuse and read
+    it as a failure. Rename the confirmed-new inode into place instead, and say so
+    plainly if the loop cannot get one, so this can never fail as if it were the shim.
+    """
+    original_inode = marker.stat().st_ino
+    for attempt in range(64):
+        candidate = marker.with_name(f"{marker.name}.candidate{attempt}")
+        candidate.write_text("")
+        if candidate.stat().st_ino != original_inode:
+            candidate.replace(marker)
+            return
+        candidate.unlink()
+    raise AssertionError(
+        f"could not obtain an inode other than {original_inode} in 64 attempts"
+    )
+
+
 def test_the_reminder_returns_on_the_next_turn(tmp_path: Path) -> None:
     """The idle->busy edge of a new turn recreates the marker, which is a new inode."""
     env = _with_open_step(tmp_path)
     _run("-c", "echo first", env=env)
     marker = Path(env["MNGR_AGENT_STATE_DIR"]) / "active"
-    marker.unlink()
-    # Force a genuinely different inode. A bare unlink+create often reuses the SAME one -- CI
-    # did exactly that and the reminder correctly did not re-fire, so asserting on a recreate
-    # would be asserting on the kernel's allocator rather than on this code.
-    hold = [tmp_path / f"hold{i}" for i in range(64)]
-    for h in hold:
-        h.write_text("")
-    marker.write_text("")
-    for h in hold:
-        h.unlink()
+    _recreate_with_a_new_inode(marker)
     result = _run("-c", "echo next-turn", env=env)
     assert "Open task reminder" in result.stderr
 

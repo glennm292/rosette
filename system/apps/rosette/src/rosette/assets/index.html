@@ -445,6 +445,12 @@ body {
   .gloss > .answer { animation: ink .42s cubic-bezier(.2, .7, .3, 1) both; }
 }
 
+/* Only a first answer writes itself in. A replacement for one already on the
+   page changes in place: re-drawing an answer the student is reading blanks
+   the column and wipes it back, and over an edit that is re-read more than
+   once, that reads as flickering. */
+.gloss.was-answered > .answer { animation: none; }
+
 @keyframes ink {
   from { clip-path: inset(0 100% 0 0); }
   to   { clip-path: inset(0 0 0 0); }
@@ -582,6 +588,7 @@ body {
   </div>
   <div class="status">
     <span class="tally" id="tally"></span>
+    <a class="clear" href="/review">Review</a>
     <button class="clear" id="clear" type="button" hidden>Clear</button>
     <button class="clear" id="connect" type="button"></button>
   </div>
@@ -615,6 +622,11 @@ body {
 // already coming before the student looks right. Pressing Enter sends at once
 // and does not wait for this.
 const IDLE_SEND_MS = 500;
+// The same wait for a line that already has an answer. Longer, because every
+// pause while rewording one asks again and replaces an answer the student is
+// still reading -- three times over one edit, in the logs. Enter and clicking
+// away both still send at once, so nothing waits on this that need not.
+const IDLE_RESEND_MS = 1800;
 // How long to hold off after the connection to the server drops.
 const RECONNECT_MS = 1000;
 
@@ -745,6 +757,11 @@ function paintGloss(rowId) {
   // Only touch the DOM when the content actually changed, so an open "see the
   // full response" panel is not snapped shut by a poll that changed nothing.
   if (glossElement.dataset.rendered !== nextHtml) {
+    // Set before the answer exists, so the rule above decides whether this one
+    // writes itself in or simply appears in place of the one already there.
+    glossElement.classList.toggle(
+      "was-answered", Boolean(glossElement.dataset.rendered) && nextHtml !== ""
+    );
     glossElement.innerHTML = nextHtml;
     glossElement.dataset.rendered = nextHtml;
   }
@@ -1011,10 +1028,12 @@ const idleTimerByRowId = new Map();
 function queueSend(rowId) {
   const existingTimer = idleTimerByRowId.get(rowId);
   if (existingTimer) window.clearTimeout(existingTimer);
+  const stored = answerByRowId.get(rowId);
+  const wait = stored && stored.analysis ? IDLE_RESEND_MS : IDLE_SEND_MS;
   idleTimerByRowId.set(rowId, window.setTimeout(() => {
     idleTimerByRowId.delete(rowId);
     flushRow(rowId);
-  }, IDLE_SEND_MS));
+  }, wait));
 }
 
 function flushRow(rowId) {
@@ -1434,13 +1453,26 @@ notebookElement.addEventListener("input", handleInput);
 notebookElement.addEventListener("focusin", handleFocusIn);
 notebookElement.addEventListener("focusout", handleFocusOut);
 notebookElement.addEventListener("click", handleClick);
+function cutButtonUnder(target) {
+  return target && target.closest ? target.closest(".cut") : null;
+}
+
+// These fire again every time the pointer crosses from one piece of the
+// scissors to another -- the icon inside the button, or the button itself --
+// although it never left. Comparing where the pointer came from with where it
+// went keeps the preview on through all of that, instead of blinking it off and
+// on across every line below several times a second.
 notebookElement.addEventListener("mouseover", event => {
-  const cutButton = event.target.closest ? event.target.closest(".cut") : null;
-  if (cutButton) previewCut(cutButton.dataset.cut, true);
+  const entered = cutButtonUnder(event.target);
+  if (entered && cutButtonUnder(event.relatedTarget) !== entered) {
+    previewCut(entered.dataset.cut, true);
+  }
 });
 notebookElement.addEventListener("mouseout", event => {
-  const cutButton = event.target.closest ? event.target.closest(".cut") : null;
-  if (cutButton) previewCut(cutButton.dataset.cut, false);
+  const left = cutButtonUnder(event.target);
+  if (left && cutButtonUnder(event.relatedTarget) !== left) {
+    previewCut(left.dataset.cut, false);
+  }
 });
 cutUndoButton.addEventListener("click", () => undoCut(cutUndoButton.dataset.undo));
 

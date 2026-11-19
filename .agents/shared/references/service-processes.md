@@ -9,9 +9,9 @@ command, logs) or adds/removes a program, rather than only its code.
 Background services are defined as `[program:<name>]` sections, one program
 per file under `system/supervisord.conf.d/`, pulled in by an `[include]` glob
 in `system/supervisord.conf` at the repo root (which otherwise holds only the
-daemon's own config). `uv run bootstrap` runs first-boot
-setup and then `exec`s `supervisord` in the foreground (in the `bootstrap`
-tmux window); supervisord starts and supervises every program. supervisord
+daemon's own config). The `bootstrap` tmux window syncs the venv and runs
+`bootstrap`, which does first-boot setup and then `exec`s `supervisord` in the
+foreground; supervisord starts and supervises every program. supervisord
 does **not** watch the config file -- you apply changes with
 `supervisorctl`.
 
@@ -19,10 +19,12 @@ does **not** watch the config file -- you apply changes with
 
 ```ini
 [program:my-service]
-command=python3 system/services/oom_priority/bin/oom_tag_service.py user uv run my-service
+command=python3 system/services/oom_priority/bin/oom_tag_service.py user bash -c "python3 system/scripts/workspace_bare_scripts/venv_links.py ensure-project system/services/my_service && uv sync --locked --project system/services/my_service && exec system/services/my_service/.venv/bin/my-service"
 directory=/home/user/workspace
 autostart=true
 autorestart=true
+# A built-in service retries forever. A user app bounds its crash loop instead;
+# see the startsecs/startretries field below.
 startretries=1000000
 stopasgroup=true
 killasgroup=true
@@ -36,28 +38,32 @@ stderr_logfile_backups=3
 
 Key fields:
 
-- `command` -- the program to run. **supervisord exec's this directly (no
+- `command` -- the program to run. Never run a long-running program under
+  `uv run`: sync `--frozen`, then `exec` the entry point, so no `uv` process
+  stays resident as its parent (see
+  [running-python.md](running-python.md)). **supervisord exec's this directly (no
   shell)**, so anything that chains with `&&`, sets an inline env var, or uses
   other shell syntax must be wrapped in `bash -c "..."`:
 
   ```ini
-  command=python3 system/services/oom_priority/bin/oom_tag_service.py user bash -c "python3 system/scripts/forward_port.py --manifest system/apps/foo/app.toml --url http://localhost:8090 && foo"
+  command=python3 system/services/oom_priority/bin/oom_tag_service.py user bash -c "python3 system/scripts/workspace_bare_scripts/venv_links.py ensure-project system/apps/foo && uv sync --locked --project system/apps/foo && python3 system/scripts/forward_port.py --manifest system/apps/foo/app.toml --url http://localhost:8090 && exec system/apps/foo/.venv/bin/foo"
   ```
 
   The `python3 system/services/oom_priority/bin/oom_tag_service.py user` prefix is the **OOM band tag**
   (see below) -- keep it as the outermost command, in front of any `bash -c`
   wrapper. `forward_port.py --manifest` reads the app's `app.toml` (its
   registered name, display name, icon, and the supervisord `program` that
-  runs it, which is what lets the workspace offer Stop/Start for the app) and
-  registers the app at `--url`. The manifest's `name` becomes the leading
+  runs it, which is what lets the shell Quit the app, stop it once no window
+  shows it, hold its port while it is stopped, and start it again on the next
+  request) and registers the app at `--url`. The manifest's `name` becomes the leading
   label of the app's origin hostname (`http://<name>.<workspace-host>/`), so
   it must be DNS-safe: lowercase letters/digits with single hyphens
   (underscores are tolerated only for legacy names like `system_interface`),
   not `localhost`, and not starting with `host-` or `agent-`. The app then
-  runs as its own tool's entry point (`foo`, installed by
-  `uv tool install -e system/apps/foo`), never through `uv run`: every Python
-  app has its own uv tool environment, and the root venv is for background
-  services. A registration with no app directory (a preview, an isolated test
+  execs its entry point from a venv, never through `uv run`: a built-in from the
+  root venv (`.venv/bin/foo`), and a user-built app or service from its own,
+  after syncing it (`system/apps/foo/.venv/bin/foo`; see "User packages are
+  standalone projects" in [running-python.md](running-python.md)). A registration with no app directory (a preview, an isolated test
   server, the owner-exec service) keeps the manifest-less
   `forward_port.py --name <name> --url <url>` form with `--internal` or
   `--no-icon`, and never passes `--program`.
@@ -69,6 +75,20 @@ Key fields:
   use `true`.) For a **one-shot** task that should run once and then stay
   stopped, use `autorestart=false` plus `startsecs=0` and `exitcodes=0` (see the
   `deferred-install` program for an example).
+- `startsecs` / `startretries` -- how a crash loop ends. A program that dies
+  before it has been up `startsecs` counts as a *failed start*, so supervisord
+  backs off and gives up in FATAL after `startretries` attempts. A **user app**
+  carries `startsecs=30` and `startretries=5` (what the `build-app` scaffolder
+  writes), so a broken app stops rather than restarting several times a second
+  for the life of the workspace -- each restart also re-registers the app. The
+  **built-in services** keep `startretries=1000000`, deliberately: the workspace
+  is unusable without them, so retrying forever beats giving up. Note that a
+  program with `startsecs=30` sits in `STARTING` for its first 30 seconds, and
+  `supervisorctl start`/`restart` block for that long although the app answers
+  within a second; bounce an app with `uv run --no-sync system/scripts/workspace_scripts/verify_app.py
+  <name> --restart ...` instead, which starts it through supervisord's RPC
+  without waiting and reads readiness from the port. Only `BACKOFF` or `FATAL`
+  means it failed.
 - `stopasgroup=true` / `killasgroup=true` -- signal the whole `bash -c` process
   group on stop, so a wrapped command shuts down cleanly.
 - `stdout_logfile` / `stderr_logfile` (+ `*_maxbytes` / `*_backups`) --
@@ -77,6 +97,13 @@ Key fields:
   supervisord writes AUTO logs into its `childlogdir` (`/var/log/supervisor`)
   instead.
 
+A service that needs a credential the user supplied through the
+`connect-external-service` skill's secret card runs its entry point under
+`python3 system/scripts/with_secrets.py data/.secrets/<name>.env -- <command>`
+inside the `bash -c` string, so the file's variables reach that process and
+nothing else does; the value goes in no config file and no command line, and
+the secrets guard refuses the direct reads of the file it recognises.
+
 Services inherit the agent environment (`MNGR_AGENT_STATE_DIR`,
 `MNGR_HOST_DIR`, `LATCHKEY_*`, ...) from the bootstrap shell
 that launched supervisord -- you do not need a per-program `environment=`.
@@ -84,6 +111,13 @@ that launched supervisord -- you do not need a per-program `environment=`.
 to a provider account on its `mngr create`, and a create that names no account
 gets the workspace's default one from `.mngr/settings.local.toml`, which the
 chat app maintains; `~/.claude` holds no credential.)
+
+One built-in program has no app directory and no manifest: `agent-observer`
+runs `mngr observe --quiet` from the primary agent's work dir and writes the
+agent lifecycle event file under `MNGR_HOST_DIR` that every chat instance
+follows. There is exactly one per workspace (it holds mngr's single-writer
+lock); a chat never starts its own, and `supervisorctl restart agent-observer`
+is how to bounce it.
 
 ## OOM priority (memory-pressure shedding)
 
@@ -124,8 +158,7 @@ than ~1s later, and it keeps the command self-documenting.
    forgets the removed program.
 
 For an app, also drop its `data/.state/apps.toml` entry with
-`python3 system/scripts/forward_port.py --name <name> --remove` and its tool
-environment with `uv tool uninstall <name>`; for a scaffolded web lib,
+`python3 system/scripts/forward_port.py --name <name> --remove`; for a scaffolded web lib,
 `build-app`'s `cleanup.md` reference covers the full teardown.
 
 ## Modifying a service
@@ -133,7 +166,9 @@ environment with `uv tool uninstall <name>`; for a scaffolded web lib,
 1. Change the program's `command` (or other fields) in its `system/supervisord.conf.d/<name>.conf`.
 2. `supervisorctl reread && supervisorctl update` applies the change (it
    restarts the program when its definition changed). To bounce a program
-   without editing its config, use `supervisorctl restart <name>`.
+   without editing its config, use `uv run --no-sync system/scripts/workspace_scripts/verify_app.py
+   <name> --restart` for an app (no 30 s wait) or `supervisorctl restart <name>`
+   for a daemon.
 
 ## Inspecting services
 

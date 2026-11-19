@@ -1,7 +1,7 @@
 """A worker's lead address survives a rename because it is the lead's agent id.
 
 `create_worker.py launch` stamps `lead_agent` with the lead's id, and `worker-reporting.md`
-has the worker read `mngr transcript $LEAD_AGENT`. This runs the real vendored mngr to pin
+has the worker read `mngr transcript $LEAD_AGENT`. This runs the real mngr to pin
 the fact it rests on: an agent stays reachable by its id across a `mngr rename`, and is
 not reachable by its old name. It costs a `uv run mngr create`.
 """
@@ -37,7 +37,17 @@ def test_an_agent_stays_addressable_by_id_across_a_rename(tmp_path: Path) -> Non
         pytest.skip("uv is not on PATH")
     project = tmp_path / "project"
     (project / ".mngr").mkdir(parents=True)
-    (project / ".mngr" / "settings.toml").write_text("is_allowed_in_pytest = true\n")
+    # The lookups below resolve a name across every *enabled* provider, and one that
+    # resolves nowhere reports the first provider it could not reach rather than "not
+    # found". The docker provider is on by built-in default and has no daemon to reach
+    # inside a workspace container. This test creates a local agent and looks it up, so
+    # the two providers that answer over a network are turned off, matching the block the
+    # chat app's prepare_isolated_mngr_host_dir writes.
+    (project / ".mngr" / "settings.toml").write_text(
+        "is_allowed_in_pytest = true\n\n"
+        "[providers.modal]\nis_enabled = false\n\n"
+        "[providers.docker]\nis_enabled = false\n"
+    )
     (project / "README.md").write_text("lead\n")
     subprocess.run(["git", "init", "-q", str(project)], check=True)
     subprocess.run(["git", "add", "-A"], cwd=project, check=True)
@@ -86,10 +96,10 @@ def test_an_agent_stays_addressable_by_id_across_a_rename(tmp_path: Path) -> Non
         renamed = _mngr(project, host_dir, "rename", "lead-before", "lead-after")
         assert renamed.returncode == 0, renamed.stderr
 
-        # The worker's transcript read resolves the agent by id (a command agent has no
-        # transcript to show, which is the error mngr answers once it has found the agent).
+        # The worker's transcript read resolves the agent by id (a command agent wrote no
+        # transcript, which is the error mngr answers once it has found the agent).
         transcript = _mngr(project, host_dir, "transcript", agent_id)
-        assert "does not produce a common transcript" in transcript.stderr
+        assert "No common transcript found" in transcript.stderr
         assert "Could not find agent" not in transcript.stderr
 
         # The old name is what a name-stamped worker would read: it is gone.

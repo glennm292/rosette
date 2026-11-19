@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from chat_background_tasks.markers import TaskSource
 from mngr_cli_contract.contract import assert_mngr_argv_valid
 from pydantic import Field
 from pydantic import PrivateAttr
@@ -18,6 +19,8 @@ from imbue.chat.agent_discovery import AgentInfo
 from imbue.chat.agent_discovery import SendFailedError
 from imbue.chat.agent_manager import _account_binding_args
 from imbue.chat.agent_manager import _build_chat_create_command
+from imbue.chat.background_tasks import BackgroundTask
+from imbue.chat.chat_autocompact import ChatAutocompactState
 from imbue.chat.chat_handoffs import HandoffCancelledError
 from imbue.chat.chat_handoffs import HandoffDeps
 from imbue.chat.chat_handoffs import HandoffRunner
@@ -93,6 +96,7 @@ class _FakeWorkspace(MutableModel):
     events_by_agent: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     delivered: list[tuple[str, str, str]] = Field(default_factory=list)
     applied: list[tuple[str, ModelPick]] = Field(default_factory=list)
+    launch_fast_applied: list[tuple[ChatId, str]] = Field(default_factory=list)
     # Every deliver and apply in the order they happened, so a test can assert the pick landed
     # before the successor's first message.
     steps: list[str] = Field(default_factory=list)
@@ -137,10 +141,11 @@ class _FakeWorkspace(MutableModel):
             handoff = record.handoff
             assert handoff is not None
             if handoff.held_sends:
-                remaining = handoff.model_copy_update(
-                    to_update(handoff.field_ref().held_sends, handoff.held_sends[1:])
+                self.store.write(
+                    record.model_copy_update(
+                        to_update(record.field_ref().handoff, handoff.with_oldest_held_send_delivered())
+                    )
                 )
-                self.store.write(record.model_copy_update(to_update(record.field_ref().handoff, remaining)))
                 return handoff.held_sends[0]
             self.store.write(record.model_copy_update(to_update(record.field_ref().handoff, None)))
             return None
@@ -181,6 +186,9 @@ class _FakeWorkspace(MutableModel):
             raise ModelApplyError(f"Unknown model '{pick.model_id}'")
         self.applied.append((agent_info.id, pick))
         self.steps.append("apply")
+
+    def apply_launch_fast_mode(self, chat_id: ChatId, agent_info: AgentInfo) -> None:
+        self.launch_fast_applied.append((chat_id, agent_info.id))
 
     def delivered_prompt(self, handoff_id: str = "h-1") -> str:
         """The handoff prompt the successor received, the one send under the prompt's own id."""
@@ -342,13 +350,16 @@ def _runner(workspace: _FakeWorkspace, **overrides: Any) -> HandoffRunner:
         resolve_account=lambda account_id: _OPENAI_ACCOUNT,
         deliver=workspace.deliver,
         apply_model=workspace.apply_model,
+        apply_launch_fast_mode=workspace.apply_launch_fast_mode,
         drain_to_composer=workspace.drain_to_composer,
         ensure_watcher=workspace.ensure_watcher,
+        get_background_tasks=lambda chat_id: (),
         stop_agent=workspace.stop_agent,
         destroy_agent=workspace.destroy_agent,
         note_agent_renamed=workspace.note_agent_renamed,
         note_agent_created=workspace.note_agent_created,
         build_create_command=workspace.build_create_command,
+        get_autocompact_state=lambda chat_id: ChatAutocompactState(is_enabled=False),
         broadcast_transcript_events=workspace.broadcast,
         now=lambda: _NOW,
         monotonic=workspace.monotonic,
@@ -361,7 +372,7 @@ def _runner(workspace: _FakeWorkspace, **overrides: Any) -> HandoffRunner:
 
 
 def test_the_archival_rename_argv_is_accepted_by_the_live_cli() -> None:
-    """The archive is one rename carrying every label, checked against the vendored mngr like the manager's argvs."""
+    """The archive is one rename carrying every label, checked against mngr like the manager's argvs."""
     argv = archive_rename_command(
         "mngr",
         "agent-123",
@@ -470,7 +481,7 @@ def test_a_handoff_runs_every_phase_and_the_successor_takes_over(tmp_path: Path)
     create = argv[1].split(" ")
     assert create[:3] == ["create", "Chat-1", "--id"] and create[3] == successor
     assert "--type codex" in argv[1]
-    assert f"--label chat_id={chat_id} --label chat_seq=2" in argv[1]
+    assert f"--label chat_id={chat_id} --label chat_seq=2 --label autocompact=off" in argv[1]
     assert f"--label account={_OPENAI_ACCOUNT.id}" in argv[1]
     assert "--label project=inbox" in argv[1]
     assert "--message" not in argv[1]
@@ -479,7 +490,15 @@ def test_a_handoff_runs_every_phase_and_the_successor_takes_over(tmp_path: Path)
     assert f"also on disk at {summary}" in prompt
     assert "<predecessor-summary>\n# Summary\n\nThe user wants the tests green.\n</predecessor-summary>" in prompt
     assert "${" not in prompt
-    assert successor in workspace.agents and workspace.agents[successor].labels["chat_seq"] == "2"
+    assert successor in workspace.agents and workspace.agents[successor].labels == {
+        "user_created": "true",
+        "display_name": "Chat 1",
+        "account": _OPENAI_ACCOUNT.id,
+        "project": "inbox",
+        "chat_id": str(chat_id),
+        "chat_seq": "2",
+        "autocompact": "off",
+    }
     # The chip went out on the chat's stream, and the held send followed the prompt to the successor.
     assert [(chat, [event["type"] for event in events]) for chat, events in workspace.broadcasts] == [
         (str(chat_id), [AGENT_SWITCH_EVENT_TYPE])
@@ -496,8 +515,9 @@ def test_a_handoff_runs_every_phase_and_the_successor_takes_over(tmp_path: Path)
         (successor, prompt, prompt_message_id("h-1")),
         (successor, "and also this", "m-2"),
     ]
-    # No pick was made, so the successor keeps its harness's default.
+    # No pick was made, so the successor keeps its harness's default model and is handed the chat's launch fast mode.
     assert workspace.applied == []
+    assert workspace.launch_fast_applied == [(chat_id, successor)]
 
 
 def test_a_summary_over_the_inline_limit_is_pointed_at_rather_than_carried(tmp_path: Path) -> None:
@@ -636,8 +656,47 @@ def test_the_prompt_names_an_earlier_predecessor_by_the_archival_name_it_was_giv
     assert successor in workspace.agents
 
 
+def test_the_prompt_says_which_waited_on_tasks_the_switch_stopped_and_which_still_report(tmp_path: Path) -> None:
+    """The switch stops the retiring agent, which ends its background tasks. Claude's own end unreported; a command
+    started through the runner still reports to the chat, saying how it ended. The successor is told which is which,
+    so it restarts what was lost and waits for what is coming."""
+    workspace, _, _ = _workspace(tmp_path, phase=HandoffPhase.SUMMARIZING)
+    tasks = (
+        BackgroundTask(
+            source=TaskSource.HARNESS,
+            id="bg-1",
+            description="Run the test suite",
+            started_at="2026-10-08T12:00:00+00:00",
+            pid=1,
+            harness="claude",
+            kind="shell",
+            command="pytest -q",
+        ),
+        BackgroundTask(
+            source=TaskSource.RUN_IN_BACKGROUND,
+            id="task-1",
+            description="Rebuild the worker image",
+            started_at="2026-10-08T12:01:00+00:00",
+            pid=2,
+            command="docker build -t worker . | tee build.log",
+        ),
+    )
+
+    _runner(workspace, get_background_tasks=lambda chat_id: tasks).run(workspace.chat_id, "h-1")
+
+    prompt = workspace.delivered_prompt()
+    assert (
+        "| Task | Started by | Command | Started | What happens now |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Run the test suite | Claude Code's own background shell | `pytest -q` | 2026-10-08 12:00 UTC "
+        "| Ended with no report. Start it again if it is still needed. |\n"
+        "| Rebuild the worker image | run_in_background.py | `docker build -t worker . \\| tee build.log` "
+        "| 2026-10-08 12:01 UTC | Its report, saying how it ended, arrives in this chat as a message. |\n"
+    ) in prompt
+
+
 def test_the_prompt_leaves_out_a_seeded_chats_seed_segment(tmp_path: Path) -> None:
-    """A seeded chat's first member is the seed the Mind app wrote, not an agent mngr knows: it has no
+    """A seeded chat's first member is the seed the Imbue Studio app wrote, not an agent mngr knows: it has no
     state dir and no transcript to read, so the predecessors the successor is pointed at start with the
     chat's first real agent."""
     workspace, first, successor = _workspace(tmp_path, phase=HandoffPhase.SUMMARIZING)
@@ -723,6 +782,36 @@ def test_a_busy_agent_is_waited_for_until_it_goes_idle(tmp_path: Path) -> None:
 
     assert workspace.record().handoff is None
     assert workspace.clock == pytest.approx(2.0)
+
+
+def test_a_compaction_ahead_of_the_summary_turn_is_waited_out_without_ending_the_wait(tmp_path: Path) -> None:
+    workspace, first, _successor = _workspace(tmp_path, phase=HandoffPhase.SUMMARIZING)
+    workspace.is_summary_written_on_request = False
+    # A compaction longer than the idle grace, a moment idle before the summary turn starts, then
+    # the turn: the idle reading right after the compaction must not end the wait.
+    readings = iter(
+        [
+            ActivityState.COMPACTING,
+            ActivityState.COMPACTING,
+            ActivityState.COMPACTING,
+            ActivityState.COMPACTING,
+            ActivityState.IDLE,
+            ActivityState.THINKING,
+            ActivityState.IDLE,
+        ]
+    )
+
+    def get_agent_state(agent_id: str) -> AgentStateItem | None:
+        state = workspace.get_agent_state(agent_id)
+        if state is None or agent_id != first:
+            return state
+        return state.model_copy_update(to_update(state.field_ref().activity_state, next(readings, ActivityState.IDLE)))
+
+    runner = _runner(workspace, get_agent_state=get_agent_state)
+    runner.run(workspace.chat_id, "h-1")
+
+    assert workspace.record().handoff is None
+    assert workspace.clock == pytest.approx(6.0)
 
 
 def test_a_refused_summary_request_is_a_missing_summary_not_a_stuck_handoff(tmp_path: Path) -> None:
@@ -848,6 +937,8 @@ def test_a_model_pick_is_applied_to_the_successor_before_its_first_message(tmp_p
 
     assert workspace.record().handoff is None
     assert workspace.applied == [(successor, _PICK)]
+    # The pick names its own fast mode, so the chat's launch fast mode is not applied on top of it.
+    assert workspace.launch_fast_applied == []
     assert workspace.steps.index("apply") < workspace.steps.index(f"deliver:{prompt_message_id('h-1')}")
 
 
@@ -969,6 +1060,18 @@ def test_a_transcript_counts_as_having_a_user_turn_only_for_a_message_the_user_t
         },
     ]
     assert has_user_turn(prompted) is True
+    # A seeded chat's first send is the user's words behind the context block its launch wrapped
+    # them in, so the chat it started has something to summarize from its very first turn.
+    seeded_first_send = [
+        {
+            "event_id": "u-s",
+            "type": "user_message",
+            "display": "prompt_with_context",
+            "display_body": "1",
+            "timestamp": "2026-09-13T11:04:00+00:00",
+        }
+    ]
+    assert has_user_turn(seeded_first_send) is True
 
 
 def test_a_half_made_successor_is_destroyed_and_created_again(tmp_path: Path) -> None:

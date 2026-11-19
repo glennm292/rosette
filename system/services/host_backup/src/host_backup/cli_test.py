@@ -4,29 +4,36 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from host_backup.cli import (
     EXIT_BACKUP_FAILED,
+    EXIT_BACKUP_SKIPPED_OVER_QUOTA,
     EXIT_BACKUP_SUCCEEDED,
     EXIT_BACKUPS_NOT_CONFIGURED,
+    EXIT_NO_COMPLETION_OBSERVED,
+    _EventsLogFollower,
     _exit_code_for_completion,
-    _scan_for_inflight_tick_ids,
     _wait_for_next_completion,
+    _wait_for_tick_to_end,
+    backup_now_main,
 )
-from host_backup.events import BackupEventType, make_event, write_event
+from host_backup.config import BACKUP_TOML_PATH
+from host_backup.events import (
+    EVENTS_LOG_ROTATION_BYTES,
+    BackupEventType,
+    rotate_events_log_if_over,
+)
+from host_backup.testing import write_tick
 
 # Long enough that a waiter which fails to recognise a terminal event is
 # unambiguously stuck rather than merely slow, short enough that the test still
 # finishes if that regression reappears.
 _GENEROUS_TIMEOUT_SECONDS = 3.0
-
-
-def _write_tick(events_dir: Path, *types: BackupEventType, tick_id: str) -> None:
-    for event_type in types:
-        write_event(events_dir, make_event(event_type, tick_id=tick_id))
 
 
 @pytest.mark.parametrize(
@@ -45,6 +52,14 @@ def _write_tick(events_dir: Path, *types: BackupEventType, tick_id: str) -> None
             BackupEventType.SNAPSHOT_FAILED,
             EXIT_BACKUP_FAILED,
             id="snapshot-failed",
+        ),
+        # Out of backup storage: the tick freed space instead of backing up,
+        # which a caller names rather than treats as a broken service.
+        pytest.param(
+            (),
+            BackupEventType.BACKUP_SKIPPED_OVER_QUOTA,
+            EXIT_BACKUP_SKIPPED_OVER_QUOTA,
+            id="over-quota",
         ),
         # An unhandled error, recorded by the loop's outer handler.
         pytest.param(
@@ -74,7 +89,8 @@ def test_wait_ends_on_every_tick_ending_and_maps_it_to_an_exit_code(
     expected_exit_code: int,
 ) -> None:
     """Every way a tick can end has to end the wait and pick out its own exit code."""
-    _write_tick(
+    follower = _EventsLogFollower(tmp_path / "events.jsonl")
+    write_tick(
         tmp_path,
         BackupEventType.BACKUP_STARTED,
         *mid_tick_events,
@@ -82,7 +98,7 @@ def test_wait_ends_on_every_tick_ending_and_maps_it_to_an_exit_code(
         tick_id="tick-under-test",
     )
     completion = _wait_for_next_completion(
-        tmp_path / "events.jsonl", 0, time.monotonic() + _GENEROUS_TIMEOUT_SECONDS
+        follower, time.monotonic() + _GENEROUS_TIMEOUT_SECONDS
     )
     assert completion is not None
     assert completion["type"] == terminal_event.value
@@ -91,54 +107,268 @@ def test_wait_ends_on_every_tick_ending_and_maps_it_to_an_exit_code(
 
 def test_wait_times_out_when_the_tick_never_resolves(tmp_path: Path) -> None:
     """A tick that emits nothing terminal still has to hit the deadline and report it."""
-    _write_tick(tmp_path, BackupEventType.BACKUP_STARTED, tick_id="tick-hung")
-    events_path = tmp_path / "events.jsonl"
-    completion = _wait_for_next_completion(events_path, 0, time.monotonic() + 0.1)
+    follower = _EventsLogFollower(tmp_path / "events.jsonl")
+    write_tick(tmp_path, BackupEventType.BACKUP_STARTED, tick_id="tick-hung")
+    completion = _wait_for_next_completion(follower, time.monotonic() + 0.1)
     assert completion is None
 
 
 def test_wait_ignores_events_already_present_before_the_trigger(tmp_path: Path) -> None:
     """Only events appended after the config bump count as this run's completion."""
-    _write_tick(
+    write_tick(
         tmp_path, BackupEventType.RESTIC_BACKUP_SUCCEEDED, tick_id="tick-previous"
     )
-    events_path = tmp_path / "events.jsonl"
-    completion = _wait_for_next_completion(
-        events_path, events_path.stat().st_size, time.monotonic() + 0.1
-    )
+    follower = _EventsLogFollower(tmp_path / "events.jsonl")
+    completion = _wait_for_next_completion(follower, time.monotonic() + 0.1)
     assert completion is None
 
 
-def test_inflight_scan_treats_every_tick_ending_as_finished(tmp_path: Path) -> None:
-    """A tick that ended without a restic event is not in flight, so nothing waits on it."""
-    _write_tick(
-        tmp_path,
-        BackupEventType.BACKUP_STARTED,
-        BackupEventType.SNAPSHOT_FAILED,
-        tick_id="tick-snapshot",
+@pytest.mark.parametrize(
+    "new_log_filler_bytes",
+    [
+        pytest.param(0, id="new-log-shorter-than-the-old-offset"),
+        pytest.param(
+            EVENTS_LOG_ROTATION_BYTES, id="new-log-longer-than-the-old-offset"
+        ),
+    ],
+)
+def test_wait_follows_the_log_across_a_rotation(
+    tmp_path: Path, new_log_filler_bytes: int
+) -> None:
+    """The runner rotates the log at the top of the very tick the command triggered,
+    so that tick's events all land in a fresh file. A waiter that kept a byte offset
+    into the path read the new file from the old one's end -- nothing at all when the
+    new file is shorter, only what follows the tick when it is longer -- and timed
+    out on a tick that had finished."""
+    events_path = tmp_path / "events.jsonl"
+    write_tick(
+        tmp_path, BackupEventType.RESTIC_BACKUP_SUCCEEDED, tick_id="tick-previous"
     )
-    _write_tick(
+    with events_path.open("r+b") as fh:
+        fh.seek(EVENTS_LOG_ROTATION_BYTES)
+        fh.write(b"\n")
+    follower = _EventsLogFollower(events_path)
+
+    rotate_events_log_if_over(tmp_path)
+    write_tick(
         tmp_path,
         BackupEventType.BACKUP_STARTED,
         BackupEventType.TICK_SKIPPED_DUE_TO_MISSING_SECRETS,
-        tick_id="tick-skip",
+        tick_id="tick-triggered",
     )
-    _write_tick(tmp_path, BackupEventType.BACKUP_STARTED, tick_id="tick-running")
-    pending = _scan_for_inflight_tick_ids(tmp_path / "events.jsonl", max_lines=200)
-    assert pending == {"tick-running"}
+    with events_path.open("ab") as fh:
+        fh.write(b"\0" * new_log_filler_bytes + b"\n")
+
+    completion = _wait_for_next_completion(
+        follower, time.monotonic() + _GENEROUS_TIMEOUT_SECONDS
+    )
+
+    assert completion is not None
+    assert completion["tick_id"] == "tick-triggered"
+    assert (
+        completion["type"] == BackupEventType.TICK_SKIPPED_DUE_TO_MISSING_SECRETS.value
+    )
 
 
-def test_inflight_scan_ignores_foreign_event_sources(tmp_path: Path) -> None:
-    """Only `backup`-sourced events are considered, so a shared log cannot wedge the wait."""
-    events_path = tmp_path / "events.jsonl"
-    events_path.write_text(
-        json.dumps(
-            {
-                "type": BackupEventType.BACKUP_STARTED.value,
-                "source": "something-else",
-                "tick_id": "tick-foreign",
-            }
-        )
-        + "\n"
+@pytest.fixture
+def backup_events_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The events dir `host-backup-now` resolves, with backup.toml's relative path under
+    `tmp_path`."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MNGR_HOST_DIR", raising=False)
+    monkeypatch.setenv("MNGR_AGENT_STATE_DIR", str(tmp_path / "state"))
+    return tmp_path / "state" / "events" / "backup"
+
+
+def test_backup_now_triggers_nothing_when_the_inflight_tick_outlasts_the_timeout(
+    tmp_path: Path, backup_events_dir: Path
+) -> None:
+    """A tick triggered after the deadline is one nobody waits for, so none is triggered."""
+    write_tick(backup_events_dir, BackupEventType.BACKUP_STARTED, tick_id="tick-busy")
+
+    result = CliRunner().invoke(backup_now_main, ["--timeout", "0.2"])
+
+    assert result.exit_code == EXIT_NO_COMPLETION_OBSERVED
+    assert not (tmp_path / BACKUP_TOML_PATH).exists()
+
+
+def test_backup_now_triggers_past_a_tick_that_never_finished(
+    tmp_path: Path, backup_events_dir: Path
+) -> None:
+    write_tick(backup_events_dir, BackupEventType.BACKUP_STARTED, tick_id="tick-killed")
+    write_tick(
+        backup_events_dir,
+        BackupEventType.BACKUP_STARTED,
+        BackupEventType.RESTIC_BACKUP_SUCCEEDED,
+        tick_id="tick-after-restart",
     )
-    assert _scan_for_inflight_tick_ids(events_path, max_lines=200) == set()
+
+    result = CliRunner().invoke(backup_now_main, ["--timeout", "0.2"])
+
+    # No runner is reading the bumped config here, so the triggered tick never ends.
+    assert result.exit_code == EXIT_NO_COMPLETION_OBSERVED
+    assert (tmp_path / BACKUP_TOML_PATH).exists()
+
+
+def test_the_inflight_wait_ends_on_its_own_tick_only(tmp_path: Path) -> None:
+    follower = _EventsLogFollower(tmp_path / "events.jsonl")
+    write_tick(tmp_path, BackupEventType.RESTIC_BACKUP_SUCCEEDED, tick_id="tick-other")
+    assert not _wait_for_tick_to_end(follower, "tick-busy", time.monotonic() + 0.1)
+
+    write_tick(tmp_path, BackupEventType.RESTIC_BACKUP_FAILED, tick_id="tick-busy")
+    assert _wait_for_tick_to_end(
+        follower, "tick-busy", time.monotonic() + _GENEROUS_TIMEOUT_SECONDS
+    )
+
+
+def test_the_inflight_wait_follows_a_tick_that_started_after_the_one_it_waited_for(
+    tmp_path: Path,
+) -> None:
+    """The waited tick's runner was restarted mid-wait: its startup tick is the one in
+    flight now, and the dead tick never ends."""
+    follower = _EventsLogFollower(tmp_path / "events.jsonl")
+    write_tick(
+        tmp_path,
+        BackupEventType.BACKUP_STARTED,
+        BackupEventType.RESTIC_BACKUP_SUCCEEDED,
+        tick_id="tick-after-restart",
+    )
+    assert _wait_for_tick_to_end(
+        follower, "tick-killed", time.monotonic() + _GENEROUS_TIMEOUT_SECONDS
+    )
+
+
+def _write_aged_tick(
+    events_dir: Path, event_type: BackupEventType, tick_id: str, age: timedelta
+) -> None:
+    # The nanosecond, Z-suffixed form `now_iso` stamps on every real event.
+    timestamp = (datetime.now(timezone.utc) - age).strftime("%Y-%m-%dT%H:%M:%S.%f000Z")
+    write_tick(
+        events_dir,
+        BackupEventType.BACKUP_STARTED,
+        event_type,
+        tick_id=tick_id,
+        timestamp=timestamp,
+    )
+
+
+@pytest.mark.parametrize(
+    ("ticks", "expected_exit_code", "expected_outcome"),
+    [
+        pytest.param(
+            ((BackupEventType.RESTIC_BACKUP_SUCCEEDED, timedelta(minutes=50)),),
+            EXIT_BACKUP_SUCCEEDED,
+            BackupEventType.RESTIC_BACKUP_SUCCEEDED.value,
+            id="recent-success",
+        ),
+        # The success is older than two of the default one-hour intervals: the
+        # service is not running, or every tick since has failed.
+        pytest.param(
+            ((BackupEventType.RESTIC_BACKUP_SUCCEEDED, timedelta(hours=3)),),
+            EXIT_BACKUP_FAILED,
+            BackupEventType.RESTIC_BACKUP_SUCCEEDED.value,
+            id="stale-success",
+        ),
+        pytest.param(
+            (
+                (BackupEventType.RESTIC_BACKUP_SUCCEEDED, timedelta(minutes=50)),
+                (BackupEventType.RESTIC_BACKUP_FAILED, timedelta(minutes=5)),
+            ),
+            EXIT_BACKUP_SUCCEEDED,
+            BackupEventType.RESTIC_BACKUP_FAILED.value,
+            id="one-failure-after-a-recent-success",
+        ),
+        # Secrets removed since the last success: no restore point can be taken now.
+        pytest.param(
+            (
+                (BackupEventType.RESTIC_BACKUP_SUCCEEDED, timedelta(minutes=50)),
+                (
+                    BackupEventType.TICK_SKIPPED_DUE_TO_MISSING_SECRETS,
+                    timedelta(minutes=5),
+                ),
+            ),
+            EXIT_BACKUPS_NOT_CONFIGURED,
+            BackupEventType.TICK_SKIPPED_DUE_TO_MISSING_SECRETS.value,
+            id="not-configured",
+        ),
+        # Out of storage since the last success aged out: the newest restore
+        # point is stale, and the caller learns why.
+        pytest.param(
+            (
+                (BackupEventType.RESTIC_BACKUP_SUCCEEDED, timedelta(hours=3)),
+                (BackupEventType.BACKUP_SKIPPED_OVER_QUOTA, timedelta(minutes=5)),
+            ),
+            EXIT_BACKUP_SKIPPED_OVER_QUOTA,
+            BackupEventType.BACKUP_SKIPPED_OVER_QUOTA.value,
+            id="over-quota",
+        ),
+        pytest.param((), EXIT_BACKUP_FAILED, None, id="never-ran"),
+    ],
+)
+def test_check_reports_the_newest_outcomes_and_triggers_nothing(
+    tmp_path: Path,
+    backup_events_dir: Path,
+    ticks: tuple[tuple[BackupEventType, timedelta], ...],
+    expected_exit_code: int,
+    expected_outcome: str | None,
+) -> None:
+    for index, (event_type, age) in enumerate(ticks):
+        _write_aged_tick(backup_events_dir, event_type, f"tick-{index}", age)
+
+    result = CliRunner().invoke(backup_now_main, ["--check"])
+
+    assert result.exit_code == expected_exit_code
+    assert json.loads(result.stdout)["newest_outcome"] == expected_outcome
+    assert not (tmp_path / BACKUP_TOML_PATH).exists()
+
+
+def test_check_finds_the_success_the_rotation_moved_aside(
+    tmp_path: Path, backup_events_dir: Path
+) -> None:
+    """The runner rotates the log as a tick starts, so while that tick runs the newest
+    success is only in the rotated file."""
+    backup_events_dir.mkdir(parents=True)
+    (backup_events_dir / "events.jsonl").write_text(
+        "x" * EVENTS_LOG_ROTATION_BYTES + "\n"
+    )
+    _write_aged_tick(
+        backup_events_dir,
+        BackupEventType.RESTIC_BACKUP_SUCCEEDED,
+        "tick-before-rotation",
+        timedelta(minutes=50),
+    )
+    rotate_events_log_if_over(backup_events_dir)
+    write_tick(
+        backup_events_dir, BackupEventType.BACKUP_STARTED, tick_id="tick-running"
+    )
+
+    result = CliRunner().invoke(backup_now_main, ["--check"])
+
+    assert result.exit_code == EXIT_BACKUP_SUCCEEDED
+    report = json.loads(result.stdout)
+    assert report["newest_outcome"] == BackupEventType.RESTIC_BACKUP_SUCCEEDED.value
+    assert report["inflight_tick_id"] == "tick-running"
+
+
+def test_the_wait_for_the_triggered_tick_skips_a_restart_and_reports_the_next_tick(
+    tmp_path: Path,
+) -> None:
+    """A services restart kills the triggered tick; the restarted service records it
+    abandoned and backs up again as its first tick, which is the outcome to report."""
+    follower = _EventsLogFollower(tmp_path / "events.jsonl")
+    write_tick(tmp_path, BackupEventType.BACKUP_STARTED, tick_id="tick-triggered")
+    write_tick(tmp_path, BackupEventType.TICK_ABANDONED, tick_id="tick-triggered")
+    write_tick(
+        tmp_path,
+        BackupEventType.BACKUP_STARTED,
+        BackupEventType.RESTIC_BACKUP_SUCCEEDED,
+        tick_id="tick-startup",
+    )
+
+    completion = _wait_for_next_completion(
+        follower, time.monotonic() + _GENEROUS_TIMEOUT_SECONDS
+    )
+
+    assert completion is not None
+    assert completion["tick_id"] == "tick-startup"
+    assert _exit_code_for_completion(completion) == EXIT_BACKUP_SUCCEEDED

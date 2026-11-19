@@ -1,34 +1,33 @@
 import os
 from collections.abc import Sequence
-from concurrent.futures import Future
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Final
 
-from flask import Flask
-from flask import Response
-from flask import jsonify
-from flask import request
+from flask import Flask, Response, jsonify, request
+from flask.typing import ResponseReturnValue
 from loguru import logger
 from werkzeug.serving import run_simple
 
-from rosette.credentials import CredentialStorageError
-from rosette.credentials import clear_api_key
-from rosette.credentials import describe_credentials
-from rosette.credentials import read_api_key
-from rosette.credentials import store_api_key
-from rosette.data_types import Analysis
-from rosette.data_types import Row
-from rosette.notebook import NotebookStorageError
-from rosette.notebook import NotebookStore
-from rosette.notebook import now_utc_iso
+from rosette.credentials import (
+    CredentialStorageError,
+    clear_api_key,
+    describe_credentials,
+    read_api_key,
+    store_api_key,
+)
+from rosette.data_types import Analysis, Row
+from rosette.notebook import NotebookStorageError, NotebookStore, now_utc_iso
+from rosette.sessions import group_into_sessions
 from rosette.settings import SettingsStore
-from rosette.tutor import CONTEXT_LINE_COUNT
-from rosette.tutor import TUTOR_MODEL
-from rosette.tutor import PrecedingLine
-from rosette.tutor import RosetteError
-from rosette.tutor import analyze_line
+from rosette.tutor import (
+    CONTEXT_LINE_COUNT,
+    TUTOR_MODEL,
+    PrecedingLine,
+    RosetteError,
+    analyze_line,
+)
 
 ASSETS_DIR = Path(__file__).parent / "assets"
 
@@ -232,6 +231,28 @@ def index() -> Response:
     )
 
 
+@app.route("/review")
+def review() -> Response:
+    """The page for looking back over a past sitting's words, lines and questions."""
+    return Response(
+        (ASSETS_DIR / "review.html").read_text(encoding="utf-8"),
+        mimetype="text/html",
+    )
+
+
+@app.route("/api/sessions")
+def get_sessions() -> Response:
+    """Every sitting written so far, the most recent first.
+
+    Both stores are read: what is on the page now, and everything the margin
+    scissors has put away -- which is where a finished evening's work lives.
+    """
+    sessions = group_into_sessions(
+        _notebook_store.load(), _notebook_store.load_cleared()
+    )
+    return jsonify({"sessions": [s.model_dump(mode="json") for s in sessions]})
+
+
 @app.route("/api/notebook")
 def get_notebook() -> Response:
     """The notebook now, or -- given a `since` -- once it differs from that.
@@ -322,7 +343,7 @@ def delete_row_and_below(row_id: str) -> Response:
 
 
 @app.route("/api/notebook/restore", methods=["POST"])
-def restore_notebook() -> Response:
+def restore_notebook() -> ResponseReturnValue:
     body = request.get_json(silent=True)
     if not isinstance(body, dict) or not isinstance(body.get("undo"), str):
         return Response('{"error": "expected a JSON body with an undo string"}', 400)
@@ -359,12 +380,16 @@ def settings() -> Response:
 
 
 @app.route("/api/credentials", methods=["GET", "PUT", "DELETE"])
-def credentials() -> Response:
+def credentials() -> ResponseReturnValue:
     """Report, set, or remove the API key. The key itself is never sent back."""
     if request.method == "GET":
         return jsonify(describe_credentials(DATA_DIR).model_dump(mode="json"))
     if request.method == "DELETE":
-        return jsonify(clear_api_key(DATA_DIR).model_dump(mode="json"))
+        try:
+            return jsonify(clear_api_key(DATA_DIR).model_dump(mode="json"))
+        except CredentialStorageError as e:
+            logger.warning("Could not remove the stored API key: {}", e)
+            return jsonify({"error": str(e)}), 500
     body = request.get_json(silent=True)
     if not isinstance(body, dict) or not isinstance(body.get("api_key"), str):
         return Response('{"error": "expected a JSON body with an api_key string"}', 400)

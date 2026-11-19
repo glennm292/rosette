@@ -4,14 +4,21 @@ import type {
   ToolResultEvent,
   AssistantMessageEvent,
   AgentSwitchEvent,
+  CompactionCause,
   UserMessageEvent,
 } from "../models/Response";
 import type { HandoffNode, StepNode, TimelineItem } from "./turn-grouping";
 import { handoffStateFixture } from "../models/chatSnapshotFixture";
-import { buildSections, hasOpenHandoffRequest, hasUserTurn } from "./turn-grouping";
-import type { PermissionResolution } from "./message-classification";
-
-// --- Event builders ---
+import {
+  buildSections,
+  hasOpenHandoffRequest,
+  hasUserTurn,
+  isTailTurnSettled,
+  liveCompactionOf,
+  type LiveCompaction,
+} from "./turn-grouping";
+import { landedCompaction, runningCompaction } from "./compaction-chips";
+import type { RequestResolution } from "./message-classification";
 
 function userMsg(
   ts: string,
@@ -20,6 +27,16 @@ function userMsg(
   extra: Partial<UserMessageEvent> = {},
 ): UserMessageEvent {
   return { timestamp: ts, type: "user_message", event_id: id, source: "test", role: "user", content, ...extra };
+}
+
+/** A compaction's "Context was compacted" status event. */
+function compacted(ts: string, id: string, cause?: CompactionCause): UserMessageEvent {
+  return userMsg(ts, "Context was compacted", id, {
+    role: "system",
+    display: "status",
+    non_turn_tail: true,
+    ...(cause === undefined ? {} : { compaction_cause: cause }),
+  });
 }
 
 function assistantText(ts: string, text: string, id = `a-${ts}`): AssistantMessageEvent {
@@ -144,6 +161,30 @@ function permissionMsg(ts: string, callId: string, text = "", id = `a-${callId}`
   };
 }
 
+/** A secret-request message: the request script run as a Bash call, carrying the
+ *  backend's `secret_request` display decision. */
+function secretMsg(ts: string, callId: string, id = `a-${callId}`): AssistantMessageEvent {
+  return {
+    ...permissionMsg(ts, callId, "", id),
+    tool_calls: [{ tool_call_id: callId, tool_name: "Bash", input_chars: 140, display: "secret_request" }],
+  };
+}
+
+/** The result of a filed secret request: the echoed object, structured as `secret_request`. */
+function secretResult(ts: string, callId: string, requestId: string, file: string): ToolResultEvent {
+  return {
+    timestamp: ts,
+    type: "tool_result",
+    event_id: `r-${callId}`,
+    source: "test",
+    tool_call_id: callId,
+    tool_name: "Bash",
+    output_chars: 200,
+    is_error: false,
+    secret_request: { request_id: requestId, file, env_path: `data/.secrets/${file}.env`, variables: ["A"] },
+  };
+}
+
 function result(ts: string, callId: string, output: string): ToolResultEvent {
   // Mirror the backend: a parseable response object rides along structured as
   // `permission_request`, the only field the card reads.
@@ -173,7 +214,7 @@ function result(ts: string, callId: string, output: string): ToolResultEvent {
   };
 }
 
-// --- tk stdout decoration helpers (the lines tk prints; see system/vendor/tk/ticket) ---
+// tk stdout decoration helpers (the lines tk prints; see system/vendor/tk/ticket)
 
 /** `tk start` output: the transition line plus, for a step, its title line. */
 function startOut(id: string, title?: string): string {
@@ -191,12 +232,12 @@ function closeOut(id: string, title?: string, summary?: string): string {
 
 /** Build the toolResults map from the event list (as ChatPanel does) and run.
  *  No enrichment argument -- structure and decoration both come from the walk. */
-function run(events: TranscriptEvent[], agentIsIdle = true) {
+function run(events: TranscriptEvent[], isTailSettled = true, liveCompaction: LiveCompaction | null = null) {
   const toolResults = new Map<string, ToolResultEvent>();
   for (const e of events) {
     if (e.type === "tool_result") toolResults.set(e.tool_call_id, e);
   }
-  return buildSections(events, toolResults, agentIsIdle);
+  return buildSections(events, toolResults, isTailSettled, liveCompaction);
 }
 
 function stepItems(items: TimelineItem[]): StepNode[] {
@@ -456,9 +497,7 @@ describe("historical input fallback", () => {
     expect(pending.title).toBe("Read the docs");
   });
 
-  // The fallback used to accept only claude's `Bash` and pi's `bash`, which was the last
-  // piece of harness knowledge in this file -- and it left agy (`run_command`, whose command
-  // lives under `CommandLine`) as the one harness with no fallback at all.
+  // agy's `run_command` keeps its command under `CommandLine`.
   it("recovers decoration from an agy-shaped tool call", () => {
     const agyMsg = (ts: string, command: string, callId: string): AssistantMessageEvent => ({
       ...tkMsg(ts, command, callId),
@@ -542,6 +581,275 @@ describe("narration and close-time ejection", () => {
     expect(sections[0].trailing_reply).toHaveLength(0);
   });
 
+  // A reply still being written goes where its words will land: in the live step, which is
+  // where prose the agent speaks next joins.
+  it("names the live step as the one the agent's next words join", () => {
+    const events = [
+      userMsg("t0", "go"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Do it")),
+      workMsg("t2", "Edit", "w1"),
+      result("t2", "w1", "ok"),
+    ];
+    expect(run(events, /* idle */ false)[0].live_step_id).toBe("s1");
+    expect(run(events, /* idle */ true)[0].live_step_id).toBeNull();
+  });
+
+  // A step carried over a user message shows in both sections; only the tail's copy is live.
+  it("names only the tail section's copy of a carried-over step as live", () => {
+    const events = [
+      userMsg("t0", "go"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Do it")),
+      workMsg("t2", "Edit", "w1"),
+      result("t2", "w1", "ok"),
+      userMsg("t3", "also check this"),
+      workMsg("t4", "Read", "w2"),
+      result("t4", "w2", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections.map((s) => s.live_step_id)).toEqual([null, "s1"]);
+  });
+
+  // A step the agent left open belongs to the earlier request: an answer to the user's next
+  // message is the turn's reply, not that step's narration, while it is written and once it lands.
+  it("keeps a step left open by an earlier turn out of the next turn's answer", () => {
+    const events = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      workMsg("t2", "Bash", "w1"),
+      result("t2", "w1", "ok"),
+      userMsg("t3", "what's the difference between RAM and disk?"),
+      assistantText("t4", "RAM is short-term memory; disk keeps files.", "ans"),
+    ];
+    const writing = run(events.slice(0, -1), /* idle */ false);
+    expect(writing[1].live_step_id).toBeNull();
+
+    const landed = run(events, /* idle */ true);
+    expect(landed[1].trailing_reply.map((e) => e.event_id)).toEqual(["ans"]);
+    // The step stays where it was left, frozen, and is not drawn again in a turn that never took it up.
+    expect(stepItems(landed[1].items)).toHaveLength(0);
+    expect(stepItems(landed[0].items).map((step) => step.ticket_id)).toEqual(["s1"]);
+  });
+
+  // The agent working while the carried-over step is open takes it up again.
+  it("takes a carried-over step up again once the agent works in it", () => {
+    const events = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      userMsg("t3", "keep going"),
+      assistantText("t4", "Looking at the cache next.", "narr"),
+      workMsg("t5", "Bash", "w2"),
+      result("t5", "w2", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections[1].live_step_id).toBe("s1");
+    expect(stepItems(sections[1].items)[0].events.map((e) => e.event_id)).toEqual(["a-w2"]);
+  });
+
+  // Moving a step ends the carried-over step's claim on the turn without taking it up: the agent
+  // closing it and answering leaves the answer as the turn's reply.
+  it("leaves a carried-over step out of the turn once the agent moves a step", () => {
+    const events = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      userMsg("t3", "never mind, what's RAM?"),
+      tkMsg("t4", "tk close s1", "c1"),
+      result("t4", "c1", closeOut("s1", "Check overall disk usage", "Stopped early")),
+      assistantText("t5", "RAM is short-term memory.", "ans"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections[1].live_step_id).toBeNull();
+    expect(stepItems(sections[1].items)[0].status).toBe("done");
+    expect(sections[1].trailing_reply.map((e) => e.event_id)).toEqual(["ans"]);
+  });
+
+  // Closing another step left open earlier is the agent back on that request: the step still
+  // open is current again, so the work that follows joins it.
+  it("takes a carried-over step up again once the agent closes another one left open", () => {
+    const events = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      tkMsg("t2", "tk start s2", "t2"),
+      result("t2", "t2", startOut("s2", "Clear the cache")),
+      userMsg("t3", "keep going"),
+      tkMsg("t4", "tk close s1", "c1"),
+      result("t4", "c1", closeOut("s1", "Check overall disk usage", "Checked")),
+      workMsg("t5", "Bash", "w2"),
+      result("t5", "w2", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections[1].live_step_id).toBe("s2");
+    expect(stepItems(sections[1].items).map((step) => [step.ticket_id, step.status])).toEqual([
+      ["s1", "done"],
+      ["s2", "active"],
+    ]);
+    expect(stepItems(sections[1].items)[1].events.map((e) => e.event_id)).toEqual(["a-w2"]);
+  });
+
+  // Starting another step moves on without taking the carried-over one up, so the new turn draws
+  // only the step it works in.
+  it("draws only the new step when the agent starts another one in the next turn", () => {
+    const events = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      userMsg("t3", "do the photos instead"),
+      tkMsg("t4", "tk start s2", "t2"),
+      result("t4", "t2", startOut("s2", "Sort the photos")),
+      workMsg("t5", "Bash", "w2"),
+      result("t5", "w2", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(stepItems(sections[0].items).map((step) => step.ticket_id)).toEqual(["s1"]);
+    expect(stepItems(sections[1].items).map((step) => step.ticket_id)).toEqual(["s2"]);
+    expect(sections[1].live_step_id).toBe("s2");
+  });
+
+  // An empty turn keeps no copy and the turn after it never took the step up: the step is drawn
+  // once, in the turn that opened it.
+  it("draws a step left open past back-to-back messages only in the turn that opened it", () => {
+    const events = [
+      userMsg("t0", "free up disk", "u1"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      workMsg("t2", "Bash", "w1"),
+      result("t2", "w1", "ok"),
+      userMsg("t3", "wait", "u2"),
+      userMsg("t4", "what's RAM?", "u3"),
+      assistantText("t5", "RAM is short-term memory.", "ans"),
+    ];
+    const sections = run(events, /* idle */ true);
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u1", "u2", "u3"]);
+    expect(sections.map((s) => stepItems(s.items).map((step) => step.ticket_id))).toEqual([["s1"], [], []]);
+    expect(sections[2].trailing_reply.map((e) => e.event_id)).toEqual(["ans"]);
+  });
+
+  // Work batched with the carried-over step's close is work done while it was open: it stays in
+  // the step, as it does in the turn that opened it.
+  it("keeps work batched with a carried-over step's close inside the step", () => {
+    const closeWithWork: AssistantMessageEvent = {
+      ...tkMsg("t4", "tk close s1", "c1"),
+      tool_calls: [
+        { tool_call_id: "w2", tool_name: "Edit", input_chars: 12 },
+        { tool_call_id: "c1", tool_name: "Bash", input_chars: 26, tk_command: "tk close s1", display: "hidden" },
+      ],
+    };
+    const events = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      userMsg("t3", "finish up and tell me what's RAM"),
+      closeWithWork,
+      result("t4", "w2", "ok"),
+      result("t4", "c1", closeOut("s1", "Check overall disk usage", "Cleared the cache")),
+      assistantText("t5", "RAM is short-term memory.", "ans"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(stepItems(sections[1].items)[0].events.map((e) => e.event_id)).toEqual(["a-c1"]);
+    expect(sections[1].trailing_reply.map((e) => e.event_id)).toEqual(["ans"]);
+  });
+
+  // A chip landing before the agent took the step up does not hand it the agent's next words.
+  it("keeps a carried-over step out of the turn across a chip", () => {
+    const events = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      userMsg("t3", "what's RAM?"),
+      assistantText("t4", "RAM is short-term memory.", "ans"),
+      notice("t5", "n1"),
+      assistantText("t6", "The download you asked about earlier finished.", "after"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u-t0", "u-t3", "n1"]);
+    expect(sections[2].live_step_id).toBeNull();
+    expect(stepItems(sections[2].items)).toHaveLength(0);
+    expect(sections[2].trailing_reply.map((e) => e.event_id)).toEqual(["after"]);
+  });
+
+  // A step the turn moved past without taking it up stays off the timeline after a chip too.
+  it("keeps a step the turn moved past off the timeline across a chip", () => {
+    const events = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      workMsg("t2", "Bash", "w1"),
+      result("t2", "w1", "ok"),
+      userMsg("t3", "do the photos instead"),
+      tkMsg("t4", "tk start s2", "t2"),
+      result("t4", "t2", startOut("s2", "Sort the photos")),
+      workMsg("t5", "Bash", "w2"),
+      result("t5", "w2", "ok"),
+      notice("t6", "n1"),
+      workMsg("t7", "Bash", "w3"),
+      result("t7", "w3", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u-t0", "u-t3", "n1"]);
+    expect(sections.map((s) => stepItems(s.items).map((step) => step.ticket_id))).toEqual([["s1"], ["s2"], ["s2"]]);
+    expect(sections[2].live_step_id).toBe("s2");
+  });
+
+  // Once the step the turn started has closed, the one it never took up is still not current
+  // after a chip: the agent's next words are the turn's reply, not that step's caption.
+  it("keeps a step the turn never took up from taking the agent's words after a chip", () => {
+    const events = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      userMsg("t3", "sort the photos instead"),
+      tkMsg("t4", "tk start s2", "t2"),
+      result("t4", "t2", startOut("s2", "Sort the photos")),
+      workMsg("t5", "Bash", "w2"),
+      result("t5", "w2", "ok"),
+      tkMsg("t6", 'tk close s2 "sorted"', "c2"),
+      result("t6", "c2", closeOut("s2", "Sort the photos", "sorted")),
+      notice("t7", "n1"),
+      assistantText("t8", "The photos are sorted.", "after"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u-t0", "u-t3", "n1"]);
+    expect(sections[2].live_step_id).toBeNull();
+    expect(stepItems(sections[2].items)).toHaveLength(0);
+    expect(sections[2].trailing_reply.map((e) => e.event_id)).toEqual(["after"]);
+  });
+
+  // A regular ticket is not a step, so picking one up leaves the carried-over step to be taken up
+  // by the work that follows.
+  it("takes a carried-over step up again after a regular ticket transition", () => {
+    const events = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Check overall disk usage")),
+      userMsg("t3", "keep going"),
+      tkMsg("t4", "tk start cod-oglc", "k2"),
+      result("t4", "k2", startOut("cod-oglc")),
+      workMsg("t5", "Bash", "w2"),
+      result("t5", "w2", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections[1].live_step_id).toBe("s1");
+    expect(stepItems(sections[1].items).map((s) => s.ticket_id)).toEqual(["s1"]);
+    expect(stepItems(sections[1].items)[0].events.map((e) => e.event_id)).toEqual(["a-w2"]);
+  });
+
+  // With every step closed, the agent's next words are ungrouped prose, not a step's.
+  it("names no live step once the open step has closed", () => {
+    const events = [
+      userMsg("t0", "go"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Do it")),
+      tkMsg("t2", 'tk close s1 "did it"', "t2"),
+      result("t2", "t2", closeOut("s1", "Do it", "did it")),
+    ];
+    expect(run(events, /* idle */ false)[0].live_step_id).toBeNull();
+  });
+
   // When the agent goes idle with a step still open, its trailing prose is the
   // wrap-up reply (no spinner, so no in-flight narration to preserve).
   it("treats trailing prose of an idle open step as the below-timeline reply", () => {
@@ -558,6 +866,51 @@ describe("narration and close-time ejection", () => {
     expect(steps[0].is_frontier).toBe(false);
     expect(steps[0].narration).toBeNull();
     expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["reply"]);
+  });
+
+  it("counts a compaction as settled, so the tail turn renders as it did when idle", () => {
+    expect(isTailTurnSettled("IDLE")).toBe(true);
+    expect(isTailTurnSettled("COMPACTING")).toBe(true);
+    expect(isTailTurnSettled("THINKING")).toBe(false);
+    expect(isTailTurnSettled("TOOL_RUNNING")).toBe(false);
+    expect(isTailTurnSettled(null)).toBe(false);
+    expect(isTailTurnSettled(undefined)).toBe(false);
+  });
+
+  // An idle compaction runs after the turn ended: the finished turn must not re-open with a
+  // spinning step and its closing prose demoted to narration.
+  it("keeps a finished turn settled while the agent compacts after it", () => {
+    const events = [
+      userMsg("t0", "go"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Do it")),
+      workMsg("t2", "Edit", "w1"),
+      result("t2", "w1", "ok"),
+      assistantText("t3", "All done.", "reply"),
+    ];
+    const compacting = run(events, isTailTurnSettled("COMPACTING"));
+    expect(compacting).toEqual(run(events, isTailTurnSettled("IDLE")));
+    const steps = stepItems(compacting[0].items);
+    expect(steps[0].is_frontier).toBe(false);
+    expect(compacting[0].trailing_reply.map((e) => e.event_id)).toEqual(["reply"]);
+  });
+
+  // A compaction inside a running turn hides the frontier only until the turn resumes.
+  it("restores the live frontier once a mid-turn compaction gives way to work", () => {
+    const events = [
+      userMsg("t0", "go"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Do it")),
+      assistantText("t2", "Looking into it now.", "narr"),
+    ];
+    const during = stepItems(run(events, isTailTurnSettled("COMPACTING"))[0].items);
+    expect(during).toHaveLength(1);
+    expect(during[0].is_frontier).toBe(false);
+    const resumed = run(events, isTailTurnSettled("TOOL_RUNNING"));
+    const steps = stepItems(resumed[0].items);
+    expect(steps[0].is_frontier).toBe(true);
+    expect(steps[0].narration).toBe("Looking into it now.");
+    expect(resumed[0].trailing_reply).toHaveLength(0);
   });
 
   it("treats prose before the first step as an ungrouped (leading) item", () => {
@@ -723,6 +1076,53 @@ describe("carryover", () => {
     expect(stepItems(sections[1].items)[0].is_carryover).toBe(true);
     expect(stepItems(sections[1].items)[0].events.map((e) => e.event_id)).toEqual(["a-w2"]);
   });
+
+  // Two messages sent back to back reach the agent together; the open step shows once, under the
+  // second, not also as an empty node under the first.
+  it("carries a step past back-to-back user messages without an empty node between them", () => {
+    const events = [
+      userMsg("t0", "first", "u1"),
+      tkMsg("t1", "tk start s1", "t1"),
+      result("t1", "t1", startOut("s1", "Do it")),
+      workMsg("t2", "Edit", "w1"),
+      result("t2", "w1", "ok"),
+      userMsg("t5", "also check X", "u2"),
+      userMsg("t6", "and Y", "u3"),
+      workMsg("t7", "Edit", "w2"),
+      result("t7", "w2", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u1", "u2", "u3"]);
+    expect(sections[1].items).toEqual([]);
+    const carried = stepItems(sections[2].items);
+    expect(carried.map((s) => s.ticket_id)).toEqual(["s1"]);
+    expect(carried[0].is_carryover).toBe(true);
+    expect(carried[0].events.map((e) => e.event_id)).toEqual(["a-w2"]);
+  });
+
+  // A fresh start leaves no handoff node behind, so a message the retiring agent never answered
+  // leaves a section holding only the carried-over step: it shows once, in the successor's turn.
+  it("carries a step past a message and a fresh-start switch without an empty node between them", () => {
+    const events: TranscriptEvent[] = [
+      userMsg("t0", "first", "u1"),
+      tkMsg("t1", "tk start s1", "k1"),
+      result("t1", "k1", startOut("s1", "Do it")),
+      workMsg("t2", "Edit", "w1"),
+      result("t2", "w1", "ok"),
+      userMsg("t3", "never mind, switch", "u2"),
+      agentSwitch("t4", "sw1", "claude", "pi", null, true),
+      userMsg("t5", "carry on in pi", "u3"),
+      workMsg("t6", "Edit", "w2"),
+      result("t6", "w2", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections.map((s) => s.user_event?.event_id ?? null)).toEqual(["u1", "u2", null, "u3"]);
+    expect(sections[1].items).toEqual([]);
+    expect(sections[2].items).toEqual([]);
+    const carried = stepItems(sections[3].items);
+    expect(carried.map((s) => s.ticket_id)).toEqual(["s1"]);
+    expect(carried[0].events.map((e) => e.event_id)).toEqual(["a-w2"]);
+  });
 });
 
 describe("pending roster", () => {
@@ -870,81 +1270,24 @@ describe("audit regressions", () => {
     expect(steps[0].events.map((e) => e.event_id)).toEqual(["a-w1", "a-w2"]);
   });
 
-  // A stop-hook chip renders at its chronological position in the timeline.
-  // Chips are no longer reply boundaries: the wrap-up reply is the final run of
-  // ungrouped prose regardless of where a chip fell.
-  it("renders a stop-hook chip at its position with the reply below the timeline", () => {
-    const events = [
-      userMsg("t0", "go"),
-      tkMsg("t1", "tk start s1", "k1"),
-      result("t1", "k1", startOut("s1", "Do it")),
-      userMsg("t2", "Stop hook feedback:\nhook", "sh1", { display: "chip", display_label: "Stop hook feedback" }),
-      workMsg("t3", "Edit", "w1"),
-      result("t3", "w1", "ok"),
-      tkMsg("t4", "tk close s1", "k2"),
-      result("t4", "k2", closeOut("s1", "Do it", "did it")),
-      assistantText("t5", "All wrapped up.", "reply"),
-    ];
-    const sections = run(events);
-    expect(sections[0].items.some((i) => i.kind === "chip")).toBe(true);
-    expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["reply"]);
-  });
-
-  // A browser-fleet nudge and a background task-notification are system messages
-  // that arrive on the user rail; they fold into the current turn as a chip (like
-  // a stop hook), NOT as a new turn boundary.
-  it("folds a browser-fleet nudge into the current section as a chip, not a new turn", () => {
-    const events = [
-      userMsg("t0", "go"),
-      assistantText("t1", "working on it", "a1"),
-      userMsg("t2", "<agentic-browser-fleet>Browser foo-1 was handed back to you.</agentic-browser-fleet>", "bf1", {
-        display: "chip",
-        display_label: "Browser fleet",
-        display_body: "Browser foo-1 was handed back to you.",
-      }),
-      assistantText("t3", "resuming", "a2"),
-    ];
-    const sections = run(events);
-    // One section (the fleet nudge did NOT open a second), with a chip inside it.
-    expect(sections.length).toBe(1);
-    expect(sections[0].items.some((i) => i.kind === "chip" && i.event.event_id === "bf1")).toBe(true);
-  });
-
-  it("folds a <task-notification> line into the current section as a chip, not a new turn", () => {
-    const events = [
-      userMsg("t0", "go"),
-      assistantText("t1", "spawned a background task", "a1"),
-      userMsg("t2", "<task-notification>\n<status>completed</status>\n</task-notification>", "tn1", {
-        display: "chip",
-        display_label: "Background task",
-      }),
-      assistantText("t3", "handling the result", "a2"),
-    ];
-    const sections = run(events);
-    expect(sections.length).toBe(1);
-    expect(sections[0].items.some((i) => i.kind === "chip" && i.event.event_id === "tn1")).toBe(true);
-  });
-
   // The post-auto-compaction status carries display: "status" and is the FIRST
   // event of a resumed session -- there is no section open yet. It must still
-  // render (as a status item in a fresh section), not be dropped.
-  it("renders a LEADING compaction status as the opening user event", () => {
-    const summary: UserMessageEvent = {
-      ...userMsg("t0", "Context was compacted", "cs1"),
-      display: "status",
-    };
+  // render (as a compaction in the opening section's inline stream), not be dropped.
+  it("renders a LEADING compaction status in the opening section's inline stream", () => {
+    const summary = compacted("t0", "cs1");
     const events = [summary, assistantText("t1", "continuing the work", "a1")];
     const sections = run(events);
     expect(sections.length).toBe(1);
-    expect(sections[0].user_event?.event_id).toBe("cs1");
+    expect(sections[0].user_event).toBeNull();
+    expect(sections[0].items).toEqual([
+      { kind: "ungrouped", key: "section-pre-ung-0", events: [landedCompaction(summary, false)] },
+    ]);
     expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["a1"]);
+    expect(sections[0].trailing_status).toHaveLength(0);
   });
 
-  it("opens a new section when mid-session compaction occurs, preserving the previous trailing reply", () => {
-    const summary: UserMessageEvent = {
-      ...userMsg("t2", "Context was compacted", "cs2"),
-      display: "status",
-    };
+  it("keeps mid-session compaction inline within the section without opening a new section", () => {
+    const summary = compacted("t2", "cs2");
     const events = [
       userMsg("t0", "go"),
       assistantText("t1", "working", "a1"),
@@ -952,32 +1295,52 @@ describe("audit regressions", () => {
       assistantText("t3", "more", "a2"),
     ];
     const sections = run(events);
-    expect(sections.length).toBe(2);
+    expect(sections.length).toBe(1);
     expect(sections[0].user_event?.event_id).toBe("u-t0");
-    expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["a1"]);
-    expect(sections[1].user_event?.event_id).toBe("cs2");
-    expect(sections[1].trailing_reply.map((e) => e.event_id)).toEqual(["a2"]);
+    // The compaction joins the inline run it landed in, so its chips share that run's chip row.
+    expect(sections[0].items).toEqual([
+      {
+        kind: "ungrouped",
+        key: "section-u-t0-ung-0",
+        events: [events[1] as AssistantMessageEvent, landedCompaction(summary, false)],
+      },
+    ]);
+    expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["a2"]);
+    expect(sections[0].trailing_status).toHaveLength(0);
   });
 
-  it("preserves previous trailing reply when compaction occurs after assistant prose at turn end", () => {
-    const summary: UserMessageEvent = {
-      ...userMsg("t2", "Context was compacted", "cs3"),
-      display: "status",
-    };
+  // The agent's own compaction lands mid-turn, between two runs of tool calls: one run of parts.
+  it("puts a native compaction between the tool calls it landed between", () => {
+    const summary = compacted("t3", "cs-native", "native");
+    const events = [
+      userMsg("t0", "go"),
+      workMsg("t1", "Read", "w1"),
+      result("t1", "w1", "ok"),
+      summary,
+      workMsg("t4", "Edit", "w2"),
+      result("t4", "w2", "ok"),
+      assistantText("t5", "Done.", "reply"),
+    ];
+    const sections = run(events);
+    expect(sections).toHaveLength(1);
+    const ung = sections[0].items.filter((i) => i.kind === "ungrouped");
+    expect(ung).toHaveLength(1);
+    expect(ung[0].kind === "ungrouped" && ung[0].events.map((e) => e.event_id)).toEqual(["a-w1", "cs-native", "a-w2"]);
+    expect(sections[0].trailing_status).toHaveLength(0);
+  });
+
+  it("preserves trailing reply and records trailing status when compaction occurs after assistant prose at turn end", () => {
+    const summary = compacted("t2", "cs3", "idle");
     const events = [userMsg("t0", "Hi", "u1"), assistantText("t1", "Hi Daniel", "a1"), summary];
     const sections = run(events);
-    expect(sections.length).toBe(2);
+    expect(sections.length).toBe(1);
     expect(sections[0].user_event?.event_id).toBe("u1");
     expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["a1"]);
-    expect(sections[1].user_event?.event_id).toBe("cs3");
-    expect(sections[1].trailing_reply).toHaveLength(0);
+    expect(sections[0].trailing_status).toEqual([landedCompaction(summary, true)]);
   });
 
-  it("preserves trailing reply under ProgressBlock when compaction occurs after a turn with steps", () => {
-    const summary: UserMessageEvent = {
-      ...userMsg("t5", "Context was compacted", "cs4"),
-      display: "status",
-    };
+  it("records trailing status under ProgressBlock without creating a new section or duplicating steps", () => {
+    const summary = compacted("t5", "cs4");
     const events = [
       userMsg("t0", "fix bug", "u1"),
       tkMsg("t1", "tk start s1", "k1"),
@@ -990,97 +1353,225 @@ describe("audit regressions", () => {
       summary,
     ];
     const sections = run(events);
-    expect(sections.length).toBe(2);
+    expect(sections.length).toBe(1);
     expect(sections[0].user_event?.event_id).toBe("u1");
     const steps = stepItems(sections[0].items);
     expect(steps.map((s) => s.ticket_id)).toEqual(["s1"]);
     expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["reply"]);
-    expect(sections[1].user_event?.event_id).toBe("cs4");
-    expect(sections[1].trailing_reply).toHaveLength(0);
+    expect(sections[0].trailing_status.map((e) => e.event_id)).toEqual(["cs4"]);
+  });
+
+  // With no reply to follow, a compaction at the end of a turn joins the turn's last chip run.
+  it("appends a compaction that follows no reply to the turn's last chip run", () => {
+    const summary = compacted("t3", "cs-tail", "idle");
+    const events = [userMsg("t0", "go"), workMsg("t1", "Read", "w1"), result("t1", "w1", "ok"), summary];
+    const sections = run(events);
+    expect(sections[0].trailing_status).toHaveLength(0);
+    expect(sections[0].items).toEqual([
+      {
+        kind: "ungrouped",
+        key: "section-u-t0-ung-0",
+        events: [events[1] as AssistantMessageEvent, landedCompaction(summary, true)],
+      },
+    ]);
+  });
+
+  it("does not duplicate active or pending steps when compaction occurs", () => {
+    const summary = compacted("t5", "cs5");
+    const events = [
+      userMsg("t0", "fix bug", "u1"),
+      tkMsg("t1", "tk create --step 'Step 1'\ntk create --step 'Step 2'\ntk create --step 'Step 3'", "tc"),
+      result("t1", "tc", "Created cod-step-s1: Step 1\nCreated cod-step-s2: Step 2\nCreated cod-step-s3: Step 3"),
+      tkMsg("t2", "tk start cod-step-s1", "k1"),
+      result("t2", "k1", startOut("cod-step-s1", "Step 1")),
+      workMsg("t3", "Edit", "w1"),
+      result("t3", "w1", "ok"),
+      tkMsg("t4", "tk close cod-step-s1", "k2"),
+      result("t4", "k2", closeOut("cod-step-s1", "Step 1", "did it")),
+      tkMsg("t5", "tk start cod-step-s2", "k3"),
+      result("t5", "k3", startOut("cod-step-s2", "Step 2")),
+      assistantText("t6", "Working on step 2", "reply"),
+      summary,
+    ];
+    const sections = run(events, /* isTailSettled */ false);
+    expect(sections.length).toBe(1);
+    const steps = stepItems(sections[0].items);
+    // Steps must appear exactly once: cod-step-s1, cod-step-s2, and pending cod-step-s3
+    expect(steps.map((s) => s.ticket_id)).toEqual(["cod-step-s1", "cod-step-s2", "cod-step-s3"]);
+    expect(sections[0].trailing_reply).toHaveLength(0);
+    // No reply to follow, so the compaction stays inline after the live step, ahead of the pending one.
+    expect(sections[0].trailing_status).toHaveLength(0);
+    expect(sections[0].items.map((i) => (i.kind === "step" ? i.step.ticket_id : i.kind))).toEqual([
+      "cod-step-s1",
+      "cod-step-s2",
+      "ungrouped",
+      "cod-step-s3",
+    ]);
+  });
+
+  it("marks the latest idle compaction as the Auto-compact notice's anchor, and no other", () => {
+    const events = [
+      userMsg("t0", "hello"),
+      assistantText("t1", "hi there", "a1"),
+      compacted("t2", "cs-old-idle", "idle"),
+      userMsg("t3", "more"),
+      assistantText("t4", "still here", "a2"),
+      compacted("t5", "cs-new-idle", "idle"),
+      userMsg("t6", "/compact"),
+      compacted("t7", "cs-manual", "manual"),
+    ];
+    const anchors = run(events)
+      .flatMap((s) => [...s.items.flatMap((i) => (i.kind === "ungrouped" ? i.events : [])), ...s.trailing_status])
+      .flatMap((part) => (part.type === "compaction" ? [[part.event_id, part.isNoticeAnchor] as const] : []));
+    expect(anchors).toEqual([
+      ["cs-old-idle", false],
+      ["cs-new-idle", true],
+      ["cs-manual", false],
+    ]);
   });
 });
 
-// Prose sitting immediately before a chip is a delivered reply: an injected
-// user-side line only arrives at a request boundary, so prose can precede one
-// only when that response ended with text and no tool call -- the agent stopped
-// there. The work it does after being woken must not retroactively bury that
-// reply inside the step that happened to still be open. See the stint split in
-// finalizeSection.
-describe("chips as stint boundaries", () => {
-  it("keeps a delivered reply surfaced when a stop hook wakes the agent into the same step", () => {
-    const events = [
-      userMsg("t0", "go"),
-      tkMsg("t1", "tk start s1", "k1"),
-      result("t1", "k1", startOut("s1", "Do it")),
-      workMsg("t2", "Edit", "w1"),
-      result("t2", "w1", "ok"),
-      assistantText("t3", "Here is what I found.", "wrapup"),
-      userMsg("t4", "Stop hook feedback:\nhook", "sh1", { display: "chip", display_label: "Stop hook feedback" }),
-      workMsg("t5", "Edit", "w2"),
-      result("t5", "w2", "ok"),
-      assistantText("t6", "Done now.", "reply"),
-    ];
-    const sections = run(events);
-    const steps = stepItems(sections[0].items);
-    // The wrap-up is ejected from the step, not collapsed inside it alongside
-    // the work that followed the hook.
-    expect(steps[0].events.map((e) => e.event_id)).toEqual(["a-w1", "a-w2"]);
-    // It renders inline at its own position, immediately before the chip.
-    expect(sections[0].items.map((i) => i.kind)).toEqual(["step", "ungrouped", "chip"]);
-    const ung = sections[0].items[1] as { kind: "ungrouped"; events: AssistantMessageEvent[] };
-    expect(ung.events.map((e) => e.event_id)).toEqual(["wrapup"]);
-    expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["reply"]);
+describe("the compaction running now", () => {
+  it("is placed only while the agent compacts", () => {
+    expect(liveCompactionOf("COMPACTING", "idle")).toEqual({ cause: "idle" });
+    expect(liveCompactionOf("COMPACTING", undefined)).toEqual({ cause: null });
+    expect(liveCompactionOf("IDLE", "idle")).toBeNull();
+    expect(liveCompactionOf("THINKING", null)).toBeNull();
+    expect(liveCompactionOf(null, null)).toBeNull();
   });
 
-  it("keeps a delivered reply surfaced when a background-task notice wakes the agent", () => {
+  // idle: the sweep compacts after the turn's reply, so its start chip follows that reply.
+  it("follows the last turn's reply for an idle compaction", () => {
+    const events = [userMsg("t0", "Hi", "u1"), assistantText("t1", "Hi there", "a1")];
+    const sections = run(events, true, { cause: "idle" });
+    expect(sections).toHaveLength(1);
+    expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["a1"]);
+    expect(sections[0].trailing_status).toEqual([runningCompaction("idle")]);
+  });
+
+  // manual: the typed /compact is a turn of its own, and the start chip stands under it.
+  it("stands under the /compact bubble for a compaction the user asked for", () => {
+    const events = [
+      userMsg("t0", "Hi", "u1"),
+      assistantText("t1", "Hi there", "a1"),
+      userMsg("t2", "/compact", "u-compact", { non_turn_tail: true }),
+      userMsg("t2", "/compact", "u-compact-expansion", { display: "hidden", non_turn_tail: true }),
+    ];
+    const sections = run(events, true, { cause: "manual" });
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u1", "u-compact"]);
+    expect(sections[1].items).toEqual([
+      { kind: "ungrouped", key: "section-u-compact-ung-0", events: [runningCompaction("manual")] },
+    ]);
+    expect(sections[1].trailing_status).toHaveLength(0);
+  });
+
+  // native: the agent compacts mid-turn, so the start chip joins the turn's last chip run.
+  it("joins the turn's last chip run for the agent's own compaction", () => {
+    const events = [userMsg("t0", "go"), workMsg("t1", "Read", "w1"), result("t1", "w1", "ok")];
+    const sections = run(events, true, { cause: "native" });
+    expect(sections[0].items).toEqual([
+      {
+        kind: "ungrouped",
+        key: "section-u-t0-ung-0",
+        events: [events[1] as AssistantMessageEvent, runningCompaction("native")],
+      },
+    ]);
+  });
+
+  // The marker can outlast the event by a poll: once the event is on the transcript, it alone shows.
+  it("gives way to the compaction's own event once that lands, whatever hidden lines follow it", () => {
+    const events = [
+      userMsg("t0", "Hi", "u1"),
+      assistantText("t1", "Hi there", "a1"),
+      userMsg("t2", "/compact", "u-compact", { non_turn_tail: true }),
+      compacted("t3", "cs-manual", "manual"),
+      userMsg("t2", "/compact", "u-compact-expansion", { display: "hidden", non_turn_tail: true }),
+    ];
+    const parts = run(events, true, { cause: "manual" }).flatMap((s) => [
+      ...s.items.flatMap((i) => (i.kind === "ungrouped" ? i.events : [])),
+      ...s.trailing_status,
+    ]);
+    expect(parts.map((part) => part.event_id)).toEqual(["cs-manual"]);
+  });
+
+  it("is placed again for a later compaction, after an earlier one's event", () => {
+    const events = [
+      userMsg("t0", "Hi", "u1"),
+      assistantText("t1", "Hi there", "a1"),
+      compacted("t2", "cs-earlier", "idle"),
+      userMsg("t3", "more", "u2"),
+      assistantText("t4", "sure", "a2"),
+    ];
+    const sections = run(events, true, { cause: "idle" });
+    expect(sections[1].trailing_status).toEqual([runningCompaction("idle")]);
+  });
+});
+
+/** A background task's completion, as the backend classifies it: a one-line notice. */
+function notice(ts: string, id: string): UserMessageEvent {
+  return userMsg(ts, "<task-notification>\n<status>completed</status>\n</task-notification>", id, {
+    display: "notice",
+    display_label: "Background task completed",
+    display_body: 'Background command "Wait for the worker" completed',
+  });
+}
+
+function stopHook(ts: string, id: string): UserMessageEvent {
+  return userMsg(ts, "Stop hook feedback:\nhook", id, { display: "chip", display_label: "Stop hook feedback" });
+}
+
+function fleetNudge(ts: string, id: string): UserMessageEvent {
+  return userMsg(ts, "<agentic-browser-fleet>Browser foo-1 was handed back to you.</agentic-browser-fleet>", id, {
+    display: "chip",
+    display_label: "Browser fleet",
+    display_body: "Browser foo-1 was handed back to you.",
+  });
+}
+
+// A system chip or notice arrives between two of the agent's requests and the agent resumes after
+// it, so the timeline breaks there: what the agent said before it stays above it, and what it does
+// after renders below it, in the step carried over to the chip's section.
+describe("system chips and notices break the timeline", () => {
+  it("renders the work the agent resumes after a notice below it, in the step carried over", () => {
     const events = [
       userMsg("t0", "go"),
       tkMsg("t1", "tk start s1", "k1"),
-      result("t1", "k1", startOut("s1", "Do it")),
+      result("t1", "k1", startOut("s1", "Run the update")),
       workMsg("t2", "Bash", "w1"),
       result("t2", "w1", "ok"),
-      assistantText("t3", "Kicked it off; I'll relay the findings.", "wrapup"),
-      userMsg("t4", "<task-notification>\n<status>completed</status>\n</task-notification>", "tn1", {
-        display: "chip",
-        display_label: "Background task",
-      }),
+      assistantText("t3", "It's running in the background; I'll report back.", "wrapup"),
+      notice("t4", "n1"),
       workMsg("t5", "Bash", "w2"),
       result("t5", "w2", "ok"),
+      assistantText("t6", "The worker stalled, so I restarted it.", "narr"),
+      workMsg("t7", "Bash", "w3"),
+      result("t7", "w3", "ok"),
+      tkMsg("t8", "tk close s1", "k2"),
+      result("t8", "k2", closeOut("s1", "Run the update", "Ran it")),
+      assistantText("t9", "Done.", "reply"),
     ];
     const sections = run(events);
-    const steps = stepItems(sections[0].items);
-    expect(steps[0].events.map((e) => e.event_id)).toEqual(["a-w1", "a-w2"]);
-    expect(steps[0].narration).toBeNull();
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u-t0", "n1"]);
+
+    const before = stepItems(sections[0].items);
+    expect(sections[0].items.map((i) => i.kind)).toEqual(["step"]);
+    expect(before[0].events.map((e) => e.event_id)).toEqual(["a-w1"]);
+    expect(before[0].status).toBe("active");
+    // The reply the agent gave before it stopped is that turn's reply, above the notice.
+    expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["wrapup"]);
+
+    const after = stepItems(sections[1].items);
+    expect(after).toHaveLength(1);
+    expect(after[0].ticket_id).toBe("s1");
+    expect(after[0].is_carryover).toBe(true);
+    expect(after[0].status).toBe("done");
+    expect(after[0].events.map((e) => e.event_id)).toEqual(["a-w2", "narr", "a-w3"]);
+    expect(sections[1].trailing_reply.map((e) => e.event_id)).toEqual(["reply"]);
   });
 
-  // The live frontier step's LAST stint has not ended, so its trailing prose is
-  // still in-flight narration. Only its earlier stints -- each of which a chip
-  // proved ended -- get their closing prose ejected.
-  it("ejects a frontier step's pre-chip prose but keeps its live narration", () => {
-    const events = [
-      userMsg("t0", "go"),
-      tkMsg("t1", "tk start s1", "k1"),
-      result("t1", "k1", startOut("s1", "Do it")),
-      workMsg("t2", "Edit", "w1"),
-      result("t2", "w1", "ok"),
-      assistantText("t3", "Here is what I found.", "wrapup"),
-      userMsg("t4", "Stop hook feedback:\nhook", "sh1", { display: "chip", display_label: "Stop hook feedback" }),
-      workMsg("t5", "Edit", "w2"),
-      result("t5", "w2", "ok"),
-      assistantText("t6", "Still going.", "narr"),
-    ];
-    const sections = run(events, /* idle */ false);
-    const steps = stepItems(sections[0].items);
-    expect(steps[0].is_frontier).toBe(true);
-    expect(steps[0].events.map((e) => e.event_id)).toEqual(["a-w1", "a-w2", "narr"]);
-    expect(steps[0].narration).toBe("Still going.");
-    expect(sections[0].trailing_reply).toHaveLength(0);
-  });
-
-  // The flicker variant: the notice lands and the agent has not yet produced
-  // anything. It flips the derived activity state, making the still-open step
-  // the frontier -- which must not retract the reply already shown.
-  it("keeps the reply surfaced when a notice lands before the agent has resumed", () => {
+  // The moment a notice lands, before the agent has done anything: the agent is busy again, but the
+  // reply it gave stays above the notice, and the spinner moves to the step below it.
+  it("keeps the reply above a notice that lands before the agent has resumed", () => {
     const events = [
       userMsg("t0", "go"),
       tkMsg("t1", "tk start s1", "k1"),
@@ -1088,35 +1579,129 @@ describe("chips as stint boundaries", () => {
       workMsg("t2", "Bash", "w1"),
       result("t2", "w1", "ok"),
       assistantText("t3", "All three parts are done.", "wrapup"),
-      userMsg("t4", "<task-notification>\n<status>completed</status>\n</task-notification>", "tn1", {
-        display: "chip",
-        display_label: "Background task",
-      }),
+      notice("t4", "n1"),
     ];
     const sections = run(events, /* idle */ false);
-    const steps = stepItems(sections[0].items);
-    expect(steps[0].events.map((e) => e.event_id)).toEqual(["a-w1"]);
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u-t0", "n1"]);
     expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["wrapup"]);
+    expect(stepItems(sections[0].items)[0].is_frontier).toBe(false);
+    const live = stepItems(sections[1].items)[0];
+    expect(live.is_frontier).toBe(true);
+    expect(live.events).toEqual([]);
+    expect(sections[1].trailing_reply).toEqual([]);
+
+    // What the agent says next, before its first tool call, is the live step's narration, below
+    // the notice -- the earlier reply does not move.
+    const speaking = run([...events, assistantText("t5", "Checking what it reported.", "narr")], false);
+    expect(stepItems(speaking[1].items)[0].narration).toBe("Checking what it reported.");
+    expect(speaking[0].trailing_reply.map((e) => e.event_id)).toEqual(["wrapup"]);
   });
 
-  // Prose mid-stint is ordinary narration: it is followed by more work before
-  // any chip, so it is not a closing remark and must stay in the step.
-  it("leaves mid-stint narration inside the step", () => {
+  // A chip can also land mid-step, right after a tool result (a browser handed back while the agent
+  // works). The step's work up to it stays above; the rest renders below it.
+  it("splits a step at a chip that lands between two tool calls", () => {
+    const events = [
+      userMsg("t0", "go"),
+      tkMsg("t1", "tk start s1", "k1"),
+      result("t1", "k1", startOut("s1", "Sign in")),
+      workMsg("t2", "Bash", "w1"),
+      result("t2", "w1", "ok"),
+      fleetNudge("t3", "bf1"),
+      workMsg("t4", "Bash", "w2"),
+      result("t4", "w2", "ok"),
+      assistantText("t5", "Signed in; checking the session.", "narr"),
+      workMsg("t6", "Bash", "w3"),
+      result("t6", "w3", "ok"),
+    ];
+    const sections = run(events);
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u-t0", "bf1"]);
+    expect(stepItems(sections[0].items)[0].events.map((e) => e.event_id)).toEqual(["a-w1"]);
+    const after = stepItems(sections[1].items)[0];
+    expect(after.events.map((e) => e.event_id)).toEqual(["a-w2", "narr", "a-w3"]);
+    expect(after.narration).toBe("Signed in; checking the session.");
+  });
+
+  // A Stop hook fires once the agent has already answered. The answer stays the turn's reply; the
+  // hook and what the agent does about it follow it.
+  it("keeps the answer as the turn's reply when a stop hook fires after it", () => {
     const events = [
       userMsg("t0", "go"),
       tkMsg("t1", "tk start s1", "k1"),
       result("t1", "k1", startOut("s1", "Do it")),
-      userMsg("t2", "Stop hook feedback:\nhook", "sh1", { display: "chip", display_label: "Stop hook feedback" }),
-      workMsg("t3", "Edit", "w1"),
-      result("t3", "w1", "ok"),
-      assistantText("t4", "Now the tests.", "narr"),
-      workMsg("t5", "Bash", "w2"),
-      result("t5", "w2", "ok"),
+      workMsg("t2", "Edit", "w1"),
+      result("t2", "w1", "ok"),
+      tkMsg("t3", "tk close s1", "k2"),
+      result("t3", "k2", closeOut("s1", "Do it", "did it")),
+      assistantText("t4", "Here is what changed.", "answer"),
+      stopHook("t5", "sh1"),
+      workMsg("t6", "Bash", "w2"),
+      result("t6", "w2", "ok"),
+      assistantText("t7", "Back at the repo root.", "after"),
     ];
     const sections = run(events);
-    const steps = stepItems(sections[0].items);
-    expect(steps[0].events.map((e) => e.event_id)).toEqual(["a-w1", "narr", "a-w2"]);
-    expect(steps[0].narration).toBe("Now the tests.");
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u-t0", "sh1"]);
+    expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["answer"]);
+    // The step closed before the hook, so nothing carries over.
+    expect(sections[1].items.map((i) => i.kind)).toEqual(["ungrouped"]);
+    expect(sections[1].trailing_reply.map((e) => e.event_id)).toEqual(["after"]);
+  });
+
+  it("keeps a plain reply above a notice that follows it in a turn with no steps", () => {
+    const events = [
+      userMsg("t0", "what's up?"),
+      assistantText("t1", "Nothing yet.", "answer"),
+      notice("t2", "n1"),
+      assistantText("t3", "The build finished too.", "followup"),
+    ];
+    const sections = run(events);
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u-t0", "n1"]);
+    expect(sections[0].trailing_reply.map((e) => e.event_id)).toEqual(["answer"]);
+    expect(sections[1].trailing_reply.map((e) => e.event_id)).toEqual(["followup"]);
+  });
+
+  // Two background tasks finishing together deliver two notices back to back. The open step shows
+  // once below them, not also as an empty node between them.
+  it("carries an open step past back-to-back notices without an empty node between them", () => {
+    const events = [
+      userMsg("t0", "go"),
+      tkMsg("t1", "tk start s1", "k1"),
+      result("t1", "k1", startOut("s1", "Do it")),
+      workMsg("t2", "Bash", "w1"),
+      result("t2", "w1", "ok"),
+      assistantText("t3", "Waiting on both.", "wrapup"),
+      notice("t4", "n1"),
+      notice("t5", "n2"),
+      workMsg("t6", "Bash", "w2"),
+      result("t6", "w2", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections.map((s) => s.user_event?.event_id)).toEqual(["u-t0", "n1", "n2"]);
+    expect(sections[1].items).toEqual([]);
+    const live = stepItems(sections[2].items);
+    expect(live).toHaveLength(1);
+    expect(live[0].ticket_id).toBe("s1");
+    expect(live[0].is_frontier).toBe(true);
+    expect(live[0].events.map((e) => e.event_id)).toEqual(["a-w2"]);
+  });
+
+  // The retiring agent's summary turn is one handoff node that takes all of its work, so a chip
+  // landing inside it stays in that turn rather than cutting the node off from its switch.
+  it("leaves a chip that lands inside an open handoff in the handoff's turn", () => {
+    const events: TranscriptEvent[] = [
+      userMsg("t0", "do the thing"),
+      summaryRequest("t1"),
+      workMsg("t2", "Write", "w1"),
+      stopHook("t3", "sh1"),
+      workMsg("t4", "Bash", "w2"),
+      agentSwitch("t5", "sw1"),
+      assistantText("t6", "hello from codex"),
+    ];
+    const sections = run(events);
+    expect(sections).toHaveLength(2);
+    expect(sections[0].items.map((i) => i.kind)).toEqual(["handoff", "chip"]);
+    const node = handoffNodeOf(sections[0].items[0]);
+    expect(node.events.map((e) => e.event_id)).toEqual(["a-w1", "a-w2"]);
+    expect(node.switch?.event_id).toBe("sw1");
   });
 });
 
@@ -1327,12 +1912,13 @@ describe("permission request breaks", () => {
 
 type PermissionItem = {
   kind: "permission";
-  resolutionsByRequestId: ReadonlyMap<string, PermissionResolution>;
+  resolutionsByRequestId: ReadonlyMap<string, RequestResolution>;
+  secretNotesByRequestId: ReadonlyMap<string, string>;
 };
 
 /** The verdict a card would show: its own request's id looked up in the id-keyed
  *  map -- mirrors resolutionForCall in message-renderers.ts. */
-function verdictFor(item: PermissionItem, requestId: string): PermissionResolution | null {
+function verdictFor(item: PermissionItem, requestId: string): RequestResolution | null {
   return item.resolutionsByRequestId.get(requestId) ?? null;
 }
 
@@ -1363,6 +1949,35 @@ describe("permission resolutions", () => {
     expect(sections).toHaveLength(2);
     expect(sections[1].user_event).toBeNull();
     expect(sections.every((s) => !(s.user_event?.content ?? "").includes("was granted"))).toBe(true);
+  });
+
+  it("keeps a step the turn moved past off the timeline across a permission verdict", () => {
+    const events = [
+      userMsg("2026-05-01T01:00:00Z", "free up disk"),
+      tkMsg("2026-05-01T01:00:01Z", "tk start s1", "c-s1"),
+      result("2026-05-01T01:00:01Z", "c-s1", startOut("s1", "Check overall disk usage")),
+      userMsg("2026-05-01T01:00:02Z", "show me my gmail unreads instead"),
+      tkMsg("2026-05-01T01:00:03Z", "tk start s2", "c-s2"),
+      result("2026-05-01T01:00:03Z", "c-s2", startOut("s2", "Connect to your Gmail account")),
+      permissionMsg("2026-05-01T01:00:04Z", "perm"),
+      result("2026-05-01T01:00:04Z", "perm", '{"request_id":"r1"}'),
+      userMsg(
+        "2026-05-01T01:00:05Z",
+        "Your permission request for Gmail was granted. Retry. (request_id: r1)",
+        "u-res",
+        {
+          display: "permission_resolution",
+          resolution: "granted",
+          request_id: "r1",
+        },
+      ),
+      workMsg("2026-05-01T01:00:06Z", "Bash", "w-after"),
+      result("2026-05-01T01:00:06Z", "w-after", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections.map((s) => stepItems(s.items).map((step) => step.ticket_id))).toEqual([["s1"], ["s2"], ["s2"]]);
+    expect(sections[2].live_step_id).toBe("s2");
+    expect(stepItems(sections[2].items)[0].events.map((e) => e.event_id)).toEqual(["a-w-after"]);
   });
 
   it("carries an open step over the approval so it continues in the new turn", () => {
@@ -1421,7 +2036,7 @@ describe("permission resolutions", () => {
   });
 
   it("attaches each verdict to its own card by request id, even when resolved out of order", () => {
-    // Regression for the verdict-swap bug: request A (Gmail) is created first,
+    // Request A (Gmail) is created first,
     // B (Slack) second, but B's verdict lands FIRST -- deny is fire-and-forget
     // on the frontend while grant can block on a real OAuth browser flow, so
     // denying the newer request while the older one's grant is still working
@@ -1458,9 +2073,8 @@ describe("permission resolutions", () => {
   });
 
   it("hides an id-less notification instead of guessing which card it resolves", () => {
-    // A notice recorded before minds embedded ids attributes nothing: the
-    // arrival-order guess is what used to swap verdicts, and an embedded page
-    // recovers the verdict from the response log via the card's hydration
+    // A notice recorded before Imbue Studio embedded ids attributes nothing; an
+    // embedded page recovers the verdict from the response log via the card's hydration
     // query. The notice still acts as the turn boundary it is, with no bubble.
     const events = [
       userMsg("2026-05-01T01:00:00Z", "go"),
@@ -1478,7 +2092,7 @@ describe("permission resolutions", () => {
   });
 });
 
-// --- Agent switches -------------------------------------------------------------------
+// Agent switches
 
 function agentSwitch(
   ts: string,
@@ -1630,6 +2244,13 @@ describe("agent switches", () => {
       display_label: "Handoff prompt",
     });
     expect(hasUserTurn([welcome, prompt])).toBe(true);
+    // A seeded chat's first send is the user's own words behind the context block the chat app
+    // prefixed for the agent, so it counts even though the bubble shows only the words.
+    const seededFirstSend = userMsg("t7", "<chat-seed-context>...</chat-seed-context>\n1", "u-s", {
+      display: "prompt_with_context",
+      display_body: "1",
+    });
+    expect(hasUserTurn([seededFirstSend])).toBe(true);
     // And it belongs to the handoff node the switch closed, not to the successor's opening section,
     // which then holds only the successor's reply.
     const sections = buildSections(
@@ -1657,10 +2278,10 @@ describe("agent switches", () => {
     expect(switchOnly[1].items).toEqual([]);
     const replied = buildSections([agentSwitch("t4", "sw1"), assistantText("t5", "hi"), prompt], new Map(), true);
     expect(handoffNodeOf(replied[0].items[0]).prompt).toBeNull();
-    expect(replied[1].items.map((i) => i.kind)).toEqual(["chip"]);
+    expect(replied.map((s) => s.user_event?.event_id ?? null)).toEqual([null, null, "u-p"]);
     const other = buildSections([agentSwitch("t4", "sw1"), chip], new Map(), true);
     expect(handoffNodeOf(other[0].items[0]).prompt).toBeNull();
-    expect(other[1].items.map((i) => i.kind)).toEqual(["chip"]);
+    expect(other.map((s) => s.user_event?.event_id ?? null)).toEqual([null, null, "u-c"]);
   });
 
   it("opens the successor's section on the message the switch carries", () => {
@@ -1688,7 +2309,7 @@ describe("agent switches", () => {
   });
 
   it("marks nothing where the chat's first agent takes over from the seed segment", () => {
-    // The seed segment is the conversation the Mind app wrote before the workspace existed;
+    // The seed segment is the conversation the Imbue Studio app wrote before the workspace existed;
     // nothing was handed off to the first agent, so the switch after it is a turn boundary
     // with no handoff node, and the user's first message opens its own section.
     const events: TranscriptEvent[] = [
@@ -1729,5 +2350,162 @@ describe("agent switches", () => {
     // in the retiring agent's turn.
     expect(sections[1].items.map((i) => i.kind)).toEqual(["step"]);
     expect(sections[0].items.map((i) => i.kind)).toEqual(["step", "handoff"]);
+  });
+
+  // The successor answers the message the user switched with: a step the retiring agent left open
+  // does not take that answer as its caption, until the successor works in it.
+  it("keeps a step carried over a switch out of the successor's answer until it works in it", () => {
+    const events: TranscriptEvent[] = [
+      userMsg("t0", "free up disk"),
+      tkMsg("t1", "tk start s1", "k1"),
+      result("t1", "k1", startOut("s1", "Check overall disk usage")),
+      agentSwitch("t2", "sw1", "claude", "codex", ["m-trigger", "what's RAM?"]),
+      assistantText("t3", "RAM is short-term memory.", "ans"),
+    ];
+    const answering = run(events, /* idle */ false);
+    expect(answering[1].live_step_id).toBeNull();
+    expect(stepItems(answering[1].items)).toHaveLength(0);
+    expect(answering[1].trailing_reply.map((e) => e.event_id)).toEqual(["ans"]);
+
+    const working = run([...events, workMsg("t4", "Bash", "w1"), result("t4", "w1", "ok")], /* idle */ false);
+    expect(working[1].live_step_id).toBe("s1");
+    expect(stepItems(working[1].items)[0].events.map((e) => e.event_id)).toEqual(["a-w1"]);
+  });
+});
+
+describe("secret requests", () => {
+  // The secret card is the permission card's sibling: lifted out of any open step,
+  // resolved by its own request id when the chat app's notice lands, and the notice
+  // opens a fresh turn with no user bubble.
+
+  it("lifts a secret request out of the open step and marks it stored by id, carrying the step over", () => {
+    const events = [
+      userMsg("2026-05-01T01:00:00Z", "connect me to the widget API"),
+      tkMsg("2026-05-01T01:00:01Z", "tk start s1", "c-s1"),
+      result("2026-05-01T01:00:01Z", "c-s1", startOut("s1", "Connect to the widget API")),
+      secretMsg("2026-05-01T01:00:02Z", "sec"),
+      secretResult("2026-05-01T01:00:02Z", "sec", "secret-1", "svc"),
+      userMsg(
+        "2026-05-01T01:00:03Z",
+        "Secret stored: data/.secrets/svc.env (A) (secret: stored, request_id: secret-1)",
+        "u-res",
+        { display: "secret_resolution", resolution: "stored", request_id: "secret-1" },
+      ),
+      workMsg("2026-05-01T01:00:04Z", "Bash", "w-after"),
+      result("2026-05-01T01:00:04Z", "w-after", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections).toHaveLength(2);
+    expect(sections[0].items.map((i) => i.kind)).toEqual(["step", "permission"]);
+    expect(verdictFor(sections[0].items[1] as PermissionItem, "secret-1")).toBe("stored");
+    expect(sections[1].user_event).toBeNull();
+    expect(stepItems(sections[1].items)[0].is_carryover).toBe(true);
+  });
+
+  it("keeps a step the turn moved past off the timeline across a secret's notice", () => {
+    const events = [
+      userMsg("2026-05-01T01:00:00Z", "free up disk"),
+      tkMsg("2026-05-01T01:00:01Z", "tk start s1", "c-s1"),
+      result("2026-05-01T01:00:01Z", "c-s1", startOut("s1", "Check overall disk usage")),
+      userMsg("2026-05-01T01:00:02Z", "connect me to the widget API instead"),
+      tkMsg("2026-05-01T01:00:03Z", "tk start s2", "c-s2"),
+      result("2026-05-01T01:00:03Z", "c-s2", startOut("s2", "Connect to the widget API")),
+      secretMsg("2026-05-01T01:00:04Z", "sec"),
+      secretResult("2026-05-01T01:00:04Z", "sec", "secret-1", "svc"),
+      userMsg(
+        "2026-05-01T01:00:05Z",
+        "Secret stored: data/.secrets/svc.env (A) (secret: stored, request_id: secret-1)",
+        "u-res",
+        { display: "secret_resolution", resolution: "stored", request_id: "secret-1" },
+      ),
+      workMsg("2026-05-01T01:00:06Z", "Bash", "w-after"),
+      result("2026-05-01T01:00:06Z", "w-after", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections.map((s) => stepItems(s.items).map((step) => step.ticket_id))).toEqual([["s1"], ["s2"], ["s2"]]);
+    expect(sections[2].live_step_id).toBe("s2");
+  });
+
+  it("carries the decline note onto the card by id", () => {
+    const events = [
+      userMsg("2026-05-01T01:00:00Z", "go"),
+      secretMsg("2026-05-01T01:00:01Z", "sec"),
+      secretResult("2026-05-01T01:00:01Z", "sec", "secret-1", "svc"),
+      userMsg(
+        "2026-05-01T01:00:02Z",
+        "Secret declined: data/.secrets/svc.env (A) (secret: declined, request_id: secret-1) not this account",
+        "u-res",
+        { display: "secret_resolution", resolution: "declined", request_id: "secret-1" },
+      ),
+    ];
+    const sections = run(events);
+    const item = sections[0].items[0] as PermissionItem;
+    expect(verdictFor(item, "secret-1")).toBe("declined");
+    expect(item.secretNotesByRequestId.get("secret-1")).toBe("not this account");
+  });
+
+  it("marks an earlier pending request for the same file superseded when a later one appears", () => {
+    const events = [
+      userMsg("2026-05-01T01:00:00Z", "go"),
+      secretMsg("2026-05-01T01:00:01Z", "sec-1"),
+      secretResult("2026-05-01T01:00:01Z", "sec-1", "secret-1", "svc"),
+      secretMsg("2026-05-01T01:00:02Z", "sec-other"),
+      secretResult("2026-05-01T01:00:02Z", "sec-other", "secret-other", "other"),
+      secretMsg("2026-05-01T01:00:03Z", "sec-2"),
+      secretResult("2026-05-01T01:00:03Z", "sec-2", "secret-2", "svc"),
+    ];
+    const sections = run(events);
+    const item = sections[0].items[0] as PermissionItem;
+    expect(verdictFor(item, "secret-1")).toBe("superseded");
+    expect(verdictFor(item, "secret-other")).toBeNull();
+    expect(verdictFor(item, "secret-2")).toBeNull();
+  });
+
+  it("does not supersede a request that had already been answered", () => {
+    const events = [
+      userMsg("2026-05-01T01:00:00Z", "go"),
+      secretMsg("2026-05-01T01:00:01Z", "sec-1"),
+      secretResult("2026-05-01T01:00:01Z", "sec-1", "secret-1", "svc"),
+      userMsg(
+        "2026-05-01T01:00:02Z",
+        "Secret stored: data/.secrets/svc.env (A) (secret: stored, request_id: secret-1)",
+        "u-res",
+        { display: "secret_resolution", resolution: "stored", request_id: "secret-1" },
+      ),
+      secretMsg("2026-05-01T01:00:03Z", "sec-2"),
+      secretResult("2026-05-01T01:00:03Z", "sec-2", "secret-2", "svc"),
+    ];
+    const sections = run(events);
+    expect(verdictFor(sections[0].items[0] as PermissionItem, "secret-1")).toBe("stored");
+  });
+
+  // The agent is woken by the secret notice and a background task's notice together: the step
+  // shows once, under the notice, not also as an empty node in the verdict's section.
+  it("carries an open step past a secret notice and a notice that follows it without an empty node", () => {
+    const events = [
+      userMsg("2026-05-01T01:00:00Z", "connect me to the widget API", "u1"),
+      tkMsg("2026-05-01T01:00:01Z", "tk start s1", "c-s1"),
+      result("2026-05-01T01:00:01Z", "c-s1", startOut("s1", "Connect to the widget API")),
+      secretMsg("2026-05-01T01:00:02Z", "sec"),
+      secretResult("2026-05-01T01:00:02Z", "sec", "secret-1", "svc"),
+      userMsg(
+        "2026-05-01T01:00:03Z",
+        "Secret stored: data/.secrets/svc.env (A) (secret: stored, request_id: secret-1)",
+        "u-res",
+        { display: "secret_resolution", resolution: "stored", request_id: "secret-1" },
+      ),
+      notice("2026-05-01T01:00:04Z", "n1"),
+      workMsg("2026-05-01T01:00:05Z", "Bash", "w-after"),
+      result("2026-05-01T01:00:05Z", "w-after", "ok"),
+    ];
+    const sections = run(events, /* idle */ false);
+    expect(sections.map((s) => s.user_event?.event_id ?? null)).toEqual(["u1", null, "n1"]);
+    expect(verdictFor(sections[0].items[1] as PermissionItem, "secret-1")).toBe("stored");
+    expect(sections[1].items).toEqual([]);
+    const live = stepItems(sections[2].items);
+    expect(live.map((s) => s.ticket_id)).toEqual(["s1"]);
+    expect(live[0].is_carryover).toBe(true);
+    expect(live[0].is_frontier).toBe(true);
+    expect(live[0].events.map((e) => e.event_id)).toEqual(["a-w-after"]);
   });
 });

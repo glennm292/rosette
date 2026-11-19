@@ -1,0 +1,116 @@
+"""The request helpers the shell's route modules share: status codes, the loopback gate, error bodies, the requester's
+identity, and how an op settles on the one client it targets (desktop contracts.md section 8)."""
+
+from typing import Final
+
+from app_schema.routes import error_response
+from flask import request
+from flask.typing import ResponseReturnValue
+from workspace_layout.identity import IDENTITY_HEADER
+from workspace_layout.identity import RequestIdentity
+from workspace_layout.identity import is_loopback_address
+from workspace_layout.identity import parse_identity_header
+from workspace_layout.ops import OpRequester
+from workspace_layout.primitives import ClientId
+
+from imbue.system_interface.shell.client_activity import find_client_id_for_page
+from imbue.system_interface.shell.errors import ClientNotFoundError
+from imbue.system_interface.shell.errors import NoTargetClientError
+from imbue.system_interface.shell.state import ShellState
+
+HTTP_OK: Final[int] = 200
+HTTP_CREATED: Final[int] = 201
+HTTP_ACCEPTED: Final[int] = 202
+HTTP_NO_CONTENT: Final[int] = 204
+HTTP_BAD_REQUEST: Final[int] = 400
+HTTP_FORBIDDEN: Final[int] = 403
+HTTP_NOT_FOUND: Final[int] = 404
+HTTP_CONFLICT: Final[int] = 409
+HTTP_PRECONDITION_FAILED: Final[int] = 412
+HTTP_INTERNAL_ERROR: Final[int] = 500
+HTTP_BAD_GATEWAY: Final[int] = 502
+HTTP_SERVICE_UNAVAILABLE: Final[int] = 503
+
+# What an image the shell serves is sent under beside its type: never sniffed into another type, and, since an svg
+# can carry script, a document that runs nothing and loads nothing but its own inline styles on a direct visit.
+IMAGE_CONTENT_SECURITY_POLICY: Final[str] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+
+
+def detail_response(message: str, status_code: int) -> ResponseReturnValue:
+    """A refusal or a failure as the ``ErrorResponse`` every route answers them with."""
+    return error_response(message, status_code)
+
+
+def request_identity() -> RequestIdentity:
+    """The requester the current request's ``X-Imbue-Identity`` header vouches for; the anonymous owner without one."""
+    return parse_identity_header(request.headers.get(IDENTITY_HEADER))
+
+
+def require_loopback() -> ResponseReturnValue | None:
+    if not is_loopback_address(request.remote_addr):
+        return detail_response("this route is only callable from loopback", HTTP_FORBIDDEN)
+    return None
+
+
+def is_known_client(shell: ShellState, client_id: str) -> bool:
+    return shell.clients.get_client(client_id) is not None or client_id in shell.broadcaster.connected_client_ids()
+
+
+def _is_same_user(shell: ShellState, client_id: str, other_client_id: str) -> bool:
+    """Whether two recorded clients last arrived as the same user (the owner arrives as none)."""
+    record = shell.clients.get_client(client_id)
+    other_record = shell.clients.get_client(other_client_id)
+    return record is not None and other_record is not None and record.user_id == other_record.user_id
+
+
+def resolve_client(shell: ShellState, explicit: ClientId | None, requester: OpRequester | None) -> ClientId | None:
+    """The client an op addresses: the one it names, else the client that last messaged the requester's chat while
+    it is connected, else the one connected client (when a client messaged, only if it is the same user's), else
+    that messaging client though it is not connected; None when nothing settles it.
+
+    A messaging client that has gone yields to the one connected client because the user carried on there: a
+    phone's browser tab and its home-screen app are two clients, and the window belongs where the user is looking.
+    Another user's client (a visitor's, while the owner messaged) is not where they are looking, so it never takes
+    over from theirs.
+    """
+    if explicit is not None:
+        if not is_known_client(shell, explicit):
+            raise ClientNotFoundError(f"No client {explicit!r}: see `workspace-layout context` for the known clients")
+        return explicit
+    attributed: str | None = None
+    # Only a requester with a marker has a client that last messaged it; a bare app names none.
+    if requester is not None and requester.marker:
+        attributed = find_client_id_for_page(shell.activity.read_events(), str(requester.app), requester.marker)
+        if attributed is not None and not is_known_client(shell, attributed):
+            attributed = None
+    connected = shell.broadcaster.connected_client_ids()
+    if attributed is not None and attributed in connected:
+        return ClientId(attributed)
+    if len(connected) == 1:
+        only_connected = next(iter(connected))
+        if attributed is None or _is_same_user(shell, attributed, only_connected):
+            return ClientId(only_connected)
+    if attributed is not None:
+        return ClientId(attributed)
+    return None
+
+
+def require_client(shell: ShellState, explicit: ClientId | None, requester: OpRequester | None) -> ClientId:
+    """Exactly one client, or a 412 that lists the connected ones: an op is never applied to a guessed client."""
+    client_id = resolve_client(shell, explicit, requester)
+    if client_id is not None:
+        return client_id
+    connected_clients = shell.broadcaster.get_connected_client_infos()
+    client_summary = (
+        ", ".join(
+            f"{info.client_id} (a pop-out)" if info.is_pop_out else f"{info.client_id} (desktop={info.active_desktop})"
+            for info in connected_clients
+        )
+        or "none"
+    )
+    connected_client_count = len({info.client_id for info in connected_clients})
+    raise NoTargetClientError(
+        "Could not tell which client this op is for: no client has messaged the requesting agent and "
+        f"{connected_client_count} client(s) are connected. Pass --client <id> (see `workspace-layout context`). "
+        f"Connected clients: {client_summary}."
+    )

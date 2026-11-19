@@ -6,9 +6,14 @@ clock, a dict of process-start times, and a capturing ``set_adj`` so the exact
 ``oom_score_adj`` written per pid is asserted against the band policy.
 """
 
+import threading
+import time
+from collections.abc import Sequence
+
 from oom_priority import bands
 
 from imbue.chat.oom_prioritizer import ChatOomPrioritizer
+from imbue.chat.presence import PresenceReport
 from imbue.chat.presence import PresenceState
 from imbue.chat.presence import PresenceTracker
 from imbue.chat.primitives import ChatId
@@ -20,7 +25,13 @@ _HOUR = 3600.0
 class _Harness:
     """Wires a prioritizer to in-memory fakes and records every band write."""
 
-    def __init__(self, chat_ids: list[str], pids: dict[str, int], sweep_interval_seconds: float = 3600.0) -> None:
+    def __init__(
+        self,
+        chat_ids: list[str],
+        pids: dict[str, int | list[int]],
+        sweep_interval_seconds: float = 3600.0,
+        min_pass_interval_seconds: float = 0.0,
+    ) -> None:
         self.chat_ids = [ChatId(chat_id) for chat_id in chat_ids]
         self.pids = pids
         self.writes: list[tuple[int, int]] = []
@@ -28,20 +39,53 @@ class _Harness:
         # plausible epoch rather than 0 so idle arithmetic never goes negative.
         self.now = 1_700_000_000.0
         self.process_started_at: dict[ChatId, float] = {}
+        self.reports_sent = 0
+        self.registry_reads = 0
+        # While set, every registry read raises it, as an unreadable registry directory would.
+        self.registry_error: OSError | None = None
+        # ``time.monotonic()`` at each pass's registry read, for asserting how far apart passes are.
+        self.pass_started_at: list[float] = []
+        # A band write blocks here while a test holds the gate closed, so the test can act mid-pass.
+        self.write_gate = threading.Event()
+        self.write_gate.set()
         self.prioritizer = ChatOomPrioritizer(
             list_chat_ids=lambda: list(self.chat_ids),
-            resolve_pid=lambda cid: self.pids.get(cid),
+            resolve_pids_by_chat_id=self._resolve_pids_by_chat_id,
             set_adj=self._set_adj,
             resolve_process_started_at=self.process_started_at.get,
             clock=lambda: self.now,
             sweep_interval_seconds=sweep_interval_seconds,
+            # Tests drive passes by hand or wait for them with ``poll_until``; pacing would only slow them.
+            min_pass_interval_seconds=min_pass_interval_seconds,
             presence=PresenceTracker(clock=lambda: self.now),
         )
 
-    def report(self, chat_id: str, state: PresenceState, client_id: str = "client-1") -> None:
-        self.prioritizer.record_presence(ChatId(chat_id), client_id, state)
+    def report(self, chat_id: str, state: PresenceState, instance_id: str = "page-1") -> None:
+        self.reports_sent += 1
+        self.prioritizer.record_presence(
+            ChatId(chat_id),
+            PresenceReport(
+                instance_id=instance_id,
+                client_id="client-1",
+                state=state,
+                is_focused=False,
+                sequence=self.reports_sent,
+            ),
+        )
+
+    def _resolve_pids_by_chat_id(self, chat_ids: Sequence[ChatId]) -> dict[ChatId, list[int]]:
+        self.registry_reads += 1
+        self.pass_started_at.append(time.monotonic())
+        if self.registry_error is not None:
+            raise self.registry_error
+        return {chat_id: self._pids_of(chat_id) for chat_id in chat_ids}
+
+    def _pids_of(self, chat_id: ChatId) -> list[int]:
+        pids = self.pids.get(chat_id, [])
+        return [pids] if isinstance(pids, int) else pids
 
     def _set_adj(self, pid: int, adj: int) -> bool:
+        self.write_gate.wait(timeout=5.0)
         self.writes.append((pid, adj))
         return True
 
@@ -96,11 +140,11 @@ def test_a_hidden_page_counts_as_open_but_not_visible() -> None:
 
 def test_visible_in_any_client_makes_the_chat_visible() -> None:
     h = _Harness(chat_ids=["a"], pids={"a": 10})
-    h.report("a", PresenceState.HIDDEN, client_id="desktop")
-    h.report("a", PresenceState.VISIBLE, client_id="phone")
+    h.report("a", PresenceState.HIDDEN, instance_id="desktop")
+    h.report("a", PresenceState.VISIBLE, instance_id="phone")
     assert h.latest_adj_by_pid()[10] == _fresh(is_open=True, is_visible=True, recency_rank=None)
     # The phone puts it away; the desktop still has it open.
-    h.report("a", PresenceState.CLOSED, client_id="phone")
+    h.report("a", PresenceState.CLOSED, instance_id="phone")
     assert h.latest_adj_by_pid()[10] == _fresh(is_open=True, is_visible=False, recency_rank=None)
 
 
@@ -122,6 +166,16 @@ def test_a_heartbeat_keeps_the_report_alive() -> None:
         h.report("a", PresenceState.VISIBLE)
     h.prioritizer.reapply()
     assert h.latest_adj_by_pid()[10] == _fresh(is_open=True, is_visible=True, recency_rank=None)
+
+
+def test_every_process_of_a_chat_gets_its_band() -> None:
+    # A codex chat runs a TUI and an app-server daemon; a shed picks either, so both must
+    # carry the chat's current band rather than one keeping its launch band.
+    h = _Harness(chat_ids=["a", "b"], pids={"a": [10, 11], "b": 20})
+    h.report("a", PresenceState.VISIBLE)
+    latest = h.latest_adj_by_pid()
+    assert latest[10] == latest[11] == _fresh(is_open=True, is_visible=True, recency_rank=None)
+    assert latest[20] == _fresh(is_open=False, is_visible=False, recency_rank=None)
 
 
 def test_dormant_chat_without_a_live_pid_is_skipped() -> None:
@@ -160,8 +214,8 @@ def test_a_closed_report_releases_the_chat() -> None:
     h = _Harness(chat_ids=["a"], pids={"a": 10})
     h.report("a", PresenceState.VISIBLE)
     protected = h.latest_adj_by_pid()[10]
-    # The tab is closed; the page's closed report drops the client's presence and ``a``
-    # becomes the most-expendable (base) chat again.
+    # The tab is closed; after the page's closed report ``a`` is neither open nor visible
+    # and becomes the most-expendable (base) chat again.
     h.report("a", PresenceState.CLOSED)
     reverted = h.latest_adj_by_pid()[10]
     assert reverted > protected
@@ -296,6 +350,8 @@ def test_a_visible_tab_is_only_stamped_when_it_becomes_visible() -> None:
     for _ in range(24 * 60):
         h.advance(60.0)
         h.report("a", PresenceState.VISIBLE)
+    # The heartbeats change nothing, so none re-tags; the sweep is what notices the day passing.
+    h.prioritizer.reapply()
     assert h.latest_adj_by_pid()[10] == bands.CHAT_AGENT_STALE_CEILING
 
     # Switching back to it does re-engage.
@@ -328,6 +384,133 @@ def test_the_sweep_re_tags_as_time_passes_and_stops_cleanly() -> None:
         h.prioritizer.stop()
     assert swept
 
-    # Stopped means stopped: no further writes land after ``stop`` returns.
+    # Stopped means stopped: no further writes land after ``stop`` returns, and a pass asked
+    # for now runs on the asking thread, as before ``start``.
     settled = len(h.writes)
     assert not poll_until(lambda: len(h.writes) != settled, timeout=0.2)
+    h.prioritizer.reapply()
+    assert len(h.writes) == settled + 1
+
+
+def test_a_prioritizer_with_no_writer_accepts_every_report_and_touches_no_process() -> None:
+    # A secondary chat keeps one of these: its reports arrive through the same routes
+    # as the live chat's, but they describe its own windows, so none may reach a process.
+    consulted: list[ChatId] = []
+    chat_id = ChatId("a")
+
+    def resolve_pids_by_chat_id(cids: Sequence[ChatId]) -> dict[ChatId, list[int]]:
+        consulted.extend(cids)
+        return {cid: [10] for cid in cids}
+
+    def resolve_process_started_at(cid: ChatId) -> float:
+        consulted.append(cid)
+        return 1_700_000_000.0
+
+    prioritizer = ChatOomPrioritizer(
+        list_chat_ids=lambda: [chat_id],
+        resolve_pids_by_chat_id=resolve_pids_by_chat_id,
+        set_adj=None,
+        resolve_process_started_at=resolve_process_started_at,
+        sweep_interval_seconds=0.01,
+    )
+    prioritizer.seed_last_message_times({chat_id: 1_700_000_000.0})
+    prioritizer.record_presence(
+        chat_id,
+        PresenceReport(
+            instance_id="page-1", client_id="client-1", state=PresenceState.VISIBLE, is_focused=False, sequence=1
+        ),
+    )
+    prioritizer.record_message(chat_id)
+    prioritizer.record_running_chats([chat_id])
+    prioritizer.reapply()
+    try:
+        prioritizer.start()
+        assert not poll_until(lambda: bool(consulted), timeout=0.2)
+    finally:
+        prioritizer.stop()
+
+
+def test_a_pass_reads_the_pid_registry_once_however_many_chats_it_manages() -> None:
+    # Reading the registry costs a read of /proc per registered process; once per chat
+    # made a pass cost chats times processes reads, seconds on a busy workspace.
+    h = _Harness(chat_ids=["a", "b", "c", "d", "e"], pids={"a": 10, "b": 20, "c": 30, "d": 40, "e": 50})
+    h.prioritizer.reapply()
+    assert h.registry_reads == 1
+    assert {pid for pid, _adj in h.writes} == {10, 20, 30, 40, 50}
+
+
+def test_a_heartbeat_that_changes_nothing_asks_for_no_pass() -> None:
+    # Every open page heartbeats every thirty seconds; with dozens of chats that is the
+    # bulk of the reports, and each used to cost a full pass over /proc.
+    h = _Harness(chat_ids=["a"], pids={"a": 10})
+    h.report("a", PresenceState.VISIBLE)
+    passes_after_opening = h.registry_reads
+    h.report("a", PresenceState.VISIBLE)
+    h.report("a", PresenceState.VISIBLE)
+    assert h.registry_reads == passes_after_opening
+    # A report that changes whether the chat is open or visible still re-tags it at once.
+    h.report("a", PresenceState.HIDDEN)
+    assert h.registry_reads == passes_after_opening + 1
+    assert h.latest_adj_by_pid()[10] == _fresh(is_open=True, is_visible=False, recency_rank=None)
+    h.report("a", PresenceState.CLOSED)
+    assert h.registry_reads == passes_after_opening + 2
+    assert h.latest_adj_by_pid()[10] == _fresh(is_open=False, is_visible=False, recency_rank=None)
+
+
+def test_once_started_a_report_returns_without_waiting_on_the_pass_that_writes_its_band() -> None:
+    h = _Harness(chat_ids=["a", "b"], pids={"a": 10, "b": 20})
+    try:
+        h.prioritizer.start()
+        writes_at_start = len(h.writes)
+        # Hold the pass thread inside its next write, then make requests while it is stuck there.
+        h.write_gate.clear()
+        h.prioritizer.record_message(ChatId("a"))
+        assert poll_until(lambda: h.registry_reads == 2)
+        h.advance(1.0)
+        h.prioritizer.record_message(ChatId("b"))
+        h.advance(1.0)
+        h.prioritizer.record_message(ChatId("a"))
+        assert len(h.writes) == writes_at_start
+        # Released, the stuck pass finishes and one more pass covers the requests made meanwhile.
+        h.write_gate.set()
+        assert poll_until(lambda: h.registry_reads == 3)
+        # ``b``'s band is that pass's last write; the stuck pass already wrote ``a`` the same rank-0 band.
+        assert poll_until(lambda: h.latest_adj_by_pid()[20] == _fresh(is_open=False, is_visible=False, recency_rank=1))
+        assert h.latest_adj_by_pid()[10] == _fresh(is_open=False, is_visible=False, recency_rank=0)
+    finally:
+        h.prioritizer.stop()
+
+
+def test_passes_asked_for_in_quick_succession_are_at_least_the_minimum_interval_apart() -> None:
+    h = _Harness(chat_ids=["a"], pids={"a": 10}, min_pass_interval_seconds=0.3)
+    try:
+        h.prioritizer.start()
+        # Hold the pass thread inside its next write, so the second request is made while the
+        # pass serving the first is still running; the pacing wait only begins once it finishes.
+        h.write_gate.clear()
+        h.prioritizer.record_message(ChatId("a"))
+        assert poll_until(lambda: h.registry_reads == 2)
+        h.prioritizer.record_message(ChatId("a"))
+        released_at = time.monotonic()
+        h.write_gate.set()
+        assert poll_until(lambda: h.registry_reads == 3, timeout=5.0)
+        assert h.pass_started_at[2] - released_at >= 0.3
+    finally:
+        h.prioritizer.stop()
+
+
+def test_a_pass_that_cannot_read_the_registry_is_retried_by_the_next_one() -> None:
+    h = _Harness(chat_ids=["a"], pids={"a": 10})
+    try:
+        # ``start`` runs its first pass on this thread; the failure is made to land on the pass thread.
+        h.prioritizer.start()
+        h.registry_error = OSError("registry unreadable")
+        h.prioritizer.record_message(ChatId("a"))
+        assert poll_until(lambda: h.registry_reads == 2)
+        assert len(h.writes) == 1
+        h.registry_error = None
+        h.prioritizer.record_message(ChatId("a"))
+        assert poll_until(lambda: len(h.writes) == 2)
+        assert h.writes[-1] == (10, _fresh(is_open=False, is_visible=False, recency_rank=0))
+    finally:
+        h.prioritizer.stop()

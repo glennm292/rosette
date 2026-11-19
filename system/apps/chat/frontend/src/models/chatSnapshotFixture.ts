@@ -1,6 +1,6 @@
 /** A whole chat snapshot for tests, as the chat app pushes one, with every field overridable. */
 
-import type { ActiveAgent, ChatSnapshot, HandoffState } from "./Chats";
+import type { ActiveAgent, ChatSnapshot, HandoffState, ProvisionalChat } from "./Chats";
 
 export function chatSnapshotFixture(
   chatId: string,
@@ -9,6 +9,7 @@ export function chatSnapshotFixture(
   const { active_agent: agentOverrides, ...chatOverrides } = overrides;
   return {
     chat_id: chatId,
+    kind: "agent",
     title: chatId,
     name: chatId,
     project: null,
@@ -16,6 +17,8 @@ export function chatSnapshotFixture(
     labels: {},
     agent_ids: [chatId],
     handoff: null,
+    last_messaged_at: null,
+    awaiting_chat_ids: [],
     ...chatOverrides,
     active_agent: {
       agent_id: chatId,
@@ -24,9 +27,14 @@ export function chatSnapshotFixture(
       account_id: null,
       state: "RUNNING",
       activity_state: null,
+      compaction_cause: null,
       model_choice: null,
       queued_messages: [],
       shoulder_tap_available: false,
+      is_connecting: false,
+      is_resending_after_sign_in: false,
+      is_busy: false,
+      background_tasks: [],
       ...agentOverrides,
     },
   };
@@ -44,8 +52,10 @@ export function handoffStateFixture(overrides: Partial<HandoffState> = {}): Hand
     target_harness: "codex",
     target_label: "Codex",
     held_sends: [{ message_id: "trigger-1", text: "Carry on in Codex" }],
+    model_pick: null,
     error: null,
     failed_step: null,
+    is_fresh_start: false,
     ...overrides,
   };
 }
@@ -62,8 +72,27 @@ export function rebindStateFixture(overrides: Partial<HandoffState> = {}): Hando
     target_harness: "claude",
     target_label: "Anthropic 2 (Claude Code)",
     held_sends: [{ message_id: "trigger-1", text: "Carry on on the other account" }],
+    model_pick: null,
     error: null,
     failed_step: null,
+    is_fresh_start: false,
+    ...overrides,
+  };
+}
+
+/** A chat still being created (the backend's ``ProvisionalChat`` as the pages are sent it), for tests: an agent chat on
+ *  an Anthropic account with nothing held yet, every field overridable. */
+export function provisionalChatFixture(chatId: string, overrides: Partial<ProvisionalChat> = {}): ProvisionalChat {
+  return {
+    chat_id: chatId,
+    name: "Chat 1",
+    account_id: "acct-1",
+    kind: "agent",
+    phase: "creating",
+    error: null,
+    is_seeded: false,
+    held_sends: [],
+    model_pick: null,
     ...overrides,
   };
 }

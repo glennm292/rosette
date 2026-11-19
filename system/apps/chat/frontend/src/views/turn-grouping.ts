@@ -29,21 +29,28 @@
  * of the step rather than buried in it. The turn's wrap-up reply is simply the
  * final run of ungrouped prose, rendered below the timeline.
  *
- * A system chip (Stop-hook feedback, a background-task notice, a fleet nudge)
- * splits a step into *stints*, and that ejection runs per stint. Prose closing a
- * stint is a delivered reply, and the chip's POSITION is what proves it: a chip
- * is a user-side line, so it only arrives at a request boundary, which leaves it
- * two possible spots. Either it follows a tool result -- the stint ends in work
- * and ejection has nothing to take -- or it follows prose, which can only happen
- * when that response ended with text and no tool call, i.e. the agent stopped
- * there. Work it does once woken must not retroactively bury that reply inside
- * the step that happened to still be open.
- *
  * A step still open when the next user message arrives carries over: it
  * re-renders at the top of the new turn, while the prior turn's node freezes at
- * its last-known state.
+ * its last-known state. It belongs to the earlier request, so the new turn's
+ * prose does not join it until the agent works while it is open or moves a
+ * step, and a turn that never works in it or closes it does not draw it at all;
+ * the same holds for a step carried over a switch to another agent, whose
+ * successor starts on the message the user switched with. A turn the agent did
+ * nothing in (two boundaries back to back) keeps no copy either, so the step is
+ * drawn again at most once, under the later boundary.
  *
- * One message is never grouped under a step: an agent permission request. It
+ * A system chip or notice (Stop-hook feedback, a browser-fleet nudge, a finished
+ * background task, a bash-mode command and its output) breaks the timeline the
+ * same way, though it is not a turn the user took: it lands between two of the
+ * agent's requests, so whatever the agent does next happens after it. The
+ * section closes there, any open step carries over (a step the turn before it
+ * never took up stays out of it and off its timeline), and the chip heads the
+ * next section. The reply the agent gave before it stays above it, and the work
+ * it does after renders below it. The one exception is a chip landing inside an
+ * open handoff node, which stays in the handoff's turn.
+ *
+ * One message is never grouped under a step: an agent permission request, or a
+ * secret request (the same shape, answered on the card itself). It
  * is lifted out into a dedicated inline break (the `permission` timeline item)
  * so the user always sees it and can respond without expanding a step. The step
  * it interrupted stays open, so work resumed afterwards keeps grouping under it.
@@ -51,15 +58,24 @@
  * notification user message. The walk reads its verdict onto the request's card
  * and treats the notification as a turn boundary (the agent blocked on the
  * request and is now resuming), so any open step carries over and continues in
- * the new turn rather than the same node resuming beneath the card. The raw text
- * isn't shown (its verdict is on the card). The notification carries the
+ * the new turn rather than the same node resuming beneath the card (as after a
+ * chip, a step the turn before it never took up stays off its timeline). The
+ * raw text isn't shown (its verdict is on the card). The notification carries the
  * resolved request's own id (see message-classification's resolutionRequestIdOf),
  * so a card looks up its verdict by that id rather than by arrival order: two
  * requests resolved out of the order they were created never swap their
  * cards' verdicts, and a message that batches more than one permission request
  * resolves each of its cards independently. A notification with no id (recorded
- * before minds embedded ids) attributes nothing here -- an embedded page
+ * before Imbue Studio embedded ids) attributes nothing here -- an embedded page
  * recovers such verdicts from the response log via the card's hydration query.
+ *
+ * A compaction ("Context was compacted") breaks nothing. It joins the inline
+ * stream at its transcript position, where its chips share a chip row with the
+ * tool calls beside it, or follows the wrap-up reply when it landed after one
+ * (`trailing_status`). While the agent compacts, the compaction running now is
+ * placed the same way, at the end of the transcript, until its event lands.
+ * The `/compact` the idle sweep sends a Claude agent breaks nothing either: it
+ * shows on its compaction's start chip, not as a bubble.
  *
  * This module reads no timestamps. Pending placeholders are ordered by
  * transcript position; grouping and the positioning of any transitioned step
@@ -73,18 +89,31 @@ import type {
   UserMessageEvent,
   ToolResultEvent,
   ToolCall,
+  CompactionCause,
 } from "../models/Response";
 import type { HandoffState } from "../models/Chats";
+import { landedCompaction, runningCompaction, type CompactionPart } from "./compaction-chips";
+import type { RunPart } from "./message-renderers";
+import { COMPACTING_STATE } from "../models/activityState";
 import { SEED_HARNESS } from "../models/Response";
 import { isHandoffPromptChip } from "../models/handoffPrompt";
-import type { PermissionResolution } from "./message-classification";
+import type { RequestResolution } from "./message-classification";
 import { isFiledPermissionRequest } from "./permission-card";
+import { isFiledSecretRequest, parseSecretRequest } from "./secret-card";
 import {
   isHandoffSummaryRequest,
   isNonBoundaryUserMessage,
+  isNoticeUserMessage,
+  isPromptWithContext,
+  isStatusUserMessage,
   isSystemChipUserMessage,
   resolutionOf,
   resolutionRequestIdOf,
+  secretResolutionNoteOf,
+  secretResolutionOf,
+  secretResolutionRequestIdOf,
+  sweepCompactCommandIds,
+  sweepCompactCommands,
 } from "./message-classification";
 
 export type StepStatus = "pending" | "active" | "done";
@@ -142,10 +171,11 @@ export function isFreshStartNode(node: HandoffNode): boolean {
 export type TimelineItem =
   | { kind: "step"; step: StepNode }
   /** Real work and/or prose with no step open: pre-step work, or a step's
-   *  ejected closing prose. Rendered inline, exactly like a no-steps turn. */
-  | { kind: "ungrouped"; key: string; events: AssistantMessageEvent[] }
+   *  ejected closing prose, and any compaction among it. Rendered inline,
+   *  exactly like a no-steps turn. */
+  | { kind: "ungrouped"; key: string; events: RunPart[] }
   /** An agent permission request, lifted out of any open step so it always
-   *  renders inline as a thread-breaking block. The user must be able to see and
+   *  renders inline, on the stretch's line between the steps. The user must be able to see and
    *  act on it without expanding a step. `event` may carry more than one
    *  permission-request tool call (a batched request); each card resolves its
    *  own verdict by looking up its own request id in `resolutionsByRequestId`
@@ -154,9 +184,12 @@ export type TimelineItem =
   | {
       kind: "permission";
       event: AssistantMessageEvent;
-      resolutionsByRequestId: ReadonlyMap<string, PermissionResolution>;
+      resolutionsByRequestId: ReadonlyMap<string, RequestResolution>;
+      /** The user's note on a declined secret request, by request id (shared like the verdicts). */
+      secretNotesByRequestId: ReadonlyMap<string, string>;
     }
-  /** A non-boundary user message shown inline (e.g. a stop-hook chip). */
+  /** A system chip or notice that landed inside an open handoff node, shown inline after it.
+   *  Anywhere else a chip heads a section of its own (SectionView.user_event). */
   | { kind: "chip"; event: UserMessageEvent }
   /** The chat's handoff to another agent, at the point its summary was asked for (or, with no
    *  request in the window, at the switch itself, when its prompt reached it). */
@@ -164,14 +197,23 @@ export type TimelineItem =
 
 /** A turn: the user message, its timeline, and the wrap-up reply below it. */
 export interface SectionView {
-  /** The boundary user message that opened this section, or null for content
-   *  that precedes the first user message. */
+  /** The user message that opened this section -- a human turn, or a system chip
+   *  or notice the agent resumed after -- or null for content that precedes the
+   *  first user message or follows a permission or secret verdict or an agent
+   *  switch that carries no message. */
   user_event: UserMessageEvent | null;
   key: string;
+  /** Whether the section opens on an agent switch: what follows is another agent's. */
+  is_after_switch: boolean;
   items: TimelineItem[];
   /** The final run of ungrouped prose: the user-facing reply, rendered below
    *  the timeline. */
   trailing_reply: AssistantMessageEvent[];
+  /** Compactions that landed after the trailing reply, rendered below the timeline and reply. */
+  trailing_status: CompactionPart[];
+  /** The step the agent's next words join, where a reply it is still writing shows: the live
+   *  frontier step, while no handoff node is taking its words. Null on every other section. */
+  live_step_id: string | null;
 }
 
 /** A status transition line printed by tk on every state change:
@@ -221,7 +263,31 @@ function isTkLifecycleCall(tc: ToolCall): boolean {
  *  neither breaks out of its step nor takes a place in the queue a later verdict
  *  is matched against. */
 function hasPermissionRequest(e: AssistantMessageEvent, toolResults: Map<string, ToolResultEvent>): boolean {
-  return e.tool_calls.some((tc) => isFiledPermissionRequest(tc, toolResults.get(tc.tool_call_id) ?? null));
+  return e.tool_calls.some((tc) => {
+    const toolResult = toolResults.get(tc.tool_call_id) ?? null;
+    return isFiledPermissionRequest(tc, toolResult) || isFiledSecretRequest(tc, toolResult);
+  });
+}
+
+/** Supersede the pending secret cards this message's own secret requests replace: a
+ *  newer request for the same file closes the older card in this transcript, exactly
+ *  as the backend closes the older request. `pendingByFile` is the walk's running
+ *  memory of the newest unresolved request per file. */
+function supersedeOlderSecretRequests(
+  e: AssistantMessageEvent,
+  toolResults: Map<string, ToolResultEvent>,
+  pendingByFile: Map<string, string>,
+  resolutionsByRequestId: Map<string, RequestResolution>,
+): void {
+  for (const tc of e.tool_calls) {
+    const details = parseSecretRequest(tc, toolResults.get(tc.tool_call_id) ?? null);
+    if (details === null) continue;
+    const older = pendingByFile.get(details.file);
+    if (older !== undefined && older !== details.requestId && !resolutionsByRequestId.has(older)) {
+      resolutionsByRequestId.set(older, "superseded");
+    }
+    pendingByFile.set(details.file, details.requestId);
+  }
 }
 
 /** The tk lifecycle command a tool call ran, or null. The backend stamps `tk_command`
@@ -359,8 +425,8 @@ function parseMessage(e: AssistantMessageEvent, toolResults: Map<string, ToolRes
   }
 
   // Only a recognised, pure tk lifecycle call is hidden from the rendered
-  // output. Anything else -- including a command that merely mentions a tk verb
-  // -- renders as normal work, so real work is never silently dropped.
+  // output. Anything else (including a command that merely mentions a tk verb)
+  // renders as normal work, so real work is never silently dropped.
   const realCalls = e.tool_calls.filter((tc) => !isTkLifecycleCall(tc));
   if (realCalls.length === e.tool_calls.length) {
     return { transitions, render: e };
@@ -383,7 +449,7 @@ function isProse(e: AssistantMessageEvent): boolean {
   return !!e.text && e.tool_calls.length === 0;
 }
 
-// --- Section assembly ---
+// Section assembly
 
 /** An ordered skeleton entry recorded as the transcript is walked. A `step`
  *  entry marks where a step node first appears -- its first transition (an
@@ -396,17 +462,23 @@ type SectionEntry =
   /** A permission request, lifted out of any open step to render inline as a
    *  visible break (see hasPermissionRequest / the `permission` TimelineItem). */
   | { kind: "permission"; event: AssistantMessageEvent }
-  /** A collapsed system chip. It sits in the skeleton because its POSITION is
-   *  what lets the ejection pass tell a delivered reply from mid-step narration
-   *  (see collectEjectedProse). */
+  /** A system chip or notice that landed inside an open handoff node. */
   | { kind: "chip"; event: UserMessageEvent }
+  /** A compaction, landed or running. */
+  | { kind: "status"; part: CompactionPart }
   /** The handoff node, at the summary request that opened it or at a switch with no request. */
   | { kind: "handoff"; node: HandoffNode }
   | { kind: "event"; event: AssistantMessageEvent; step_id: string | null };
 
+/** Returns true if an entry represents conversation progress or work rather than a trailing status. */
+function isSubsequentTurnActivity(entry: SectionEntry): boolean {
+  return entry.kind !== "status";
+}
+
 interface SectionBuilder {
   user_event: UserMessageEvent | null;
   key: string;
+  is_after_switch: boolean;
   /** Step nodes in first-appearance (transcript) order. */
   steps: Map<string, StepNode>;
   step_order: string[];
@@ -414,31 +486,43 @@ interface SectionBuilder {
    *  SectionEntry), used to assemble timeline items in transcript order. */
   entries: SectionEntry[];
   current_step_id: string | null;
+  /** A step carried over into a turn the user started (a message, or a switch to another
+   *  agent), which the agent has not taken up again in it: nothing the agent says joins it until
+   *  the agent works while it is open or moves a step. */
+  dormant_step_id: string | null;
+  /** Carried-over steps left off this section's timeline unless the agent takes them up in it
+   *  (they still show, frozen, in the turn they came from): all of them in a turn the user started,
+   *  and after a chip those the turn before it never took up. */
+  untaken_carryover_ids: Set<string>;
   /** The handoff node open in this section: every assistant message from the summary request
    *  on belongs to it, until the switch closes it. */
   open_handoff: HandoffNode | null;
 }
 
-function newSection(user_event: UserMessageEvent | null, key: string): SectionBuilder {
+function newSection(user_event: UserMessageEvent | null, key: string, is_after_switch: boolean): SectionBuilder {
   return {
     user_event,
     key,
+    is_after_switch,
     steps: new Map(),
     step_order: [],
     entries: [],
     current_step_id: null,
+    dormant_step_id: null,
+    untaken_carryover_ids: new Set(),
     open_handoff: null,
   };
 }
 
 /** True for a transcript event that carries the user's own words: a ``user_message`` with no display
- *  decision, or the handoff prompt a successor started with (a chip that holds the message the user
- *  switched with). The backend's rule for whether a handoff has anything to summarize
- *  (``has_user_turn``), read here so the page can tell a fresh chat, whose switch needs no dialog,
- *  from one with context. */
+ *  decision, one sent with machine context stripped for display (a seeded chat's first send, or a
+ *  turn a harness flushed together with background-task reports), or the
+ *  handoff prompt a successor started with (a chip that holds the message the user switched with).
+ *  The backend's rule for whether a handoff has anything to summarize (``has_user_turn``), read
+ *  here so the page can tell a fresh chat, whose switch needs no dialog, from one with context. */
 export function isGenuineUserTurn(event: TranscriptEvent): boolean {
   if (event.type !== "user_message") return false;
-  return event.display === undefined || isHandoffPromptChip(event);
+  return event.display === undefined || isPromptWithContext(event) || isHandoffPromptChip(event);
 }
 
 export function hasUserTurn(events: readonly TranscriptEvent[]): boolean {
@@ -483,16 +567,65 @@ export function hasOpenHandoffRequest(events: readonly TranscriptEvent[], handof
   return false;
 }
 
+/** Whether the tail turn renders as settled (no frontier spinner, closing prose as the reply) for
+ *  an agent in this activity state. A compaction counts as settled: an idle compaction runs with no
+ *  turn open, and one inside a running turn only hides that turn's frontier until it resumes. */
+export function isTailTurnSettled(activityState: string | null | undefined): boolean {
+  return activityState === "IDLE" || activityState === COMPACTING_STATE;
+}
+
+/** A compaction the agent is running now, by who started it. */
+export interface LiveCompaction {
+  cause: CompactionCause | null;
+}
+
+/** The compaction an agent in this activity state is running, or null when it is not compacting. */
+export function liveCompactionOf(
+  activityState: string | null | undefined,
+  cause: CompactionCause | null | undefined,
+): LiveCompaction | null {
+  return activityState === COMPACTING_STATE ? { cause: cause ?? null } : null;
+}
+
+/** Whether the transcript ends on a compaction that landed: nothing after it but lines that
+ *  render nowhere. The running compaction's event is then on the transcript already, so the
+ *  walk places no running one beside it. */
+function endsOnLandedCompaction(events: readonly TranscriptEvent[]): boolean {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type !== "user_message") return false;
+    if (isStatusUserMessage(event)) return true;
+    if (!isNonBoundaryUserMessage(event)) return false;
+  }
+  return false;
+}
+
+/** The latest idle compaction's event id, which the one-time Auto-compact notice sits under. */
+function autocompactNoticeAnchorId(events: readonly TranscriptEvent[]): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type === "user_message" && isStatusUserMessage(event) && event.compaction_cause === "idle") {
+      return event.event_id;
+    }
+  }
+  return null;
+}
+
 /** Walk the visible transcript into ordered sections. `toolResults` resolves tk
- *  command outputs (and is reused by the renderer). `agentIsIdle` settles the
- *  spinner on the tail section. All decoration is derived from the transcript;
- *  there is no enrichment argument. */
+ *  command outputs (and is reused by the renderer). `isTailSettled` (see
+ *  `isTailTurnSettled`) settles the spinner on the tail section. `liveCompaction` (see
+ *  `liveCompactionOf`) places the compaction running now where its event will land.
+ *  All decoration is derived from the transcript; there is no enrichment argument. */
 export function buildSections(
   events: TranscriptEvent[],
   toolResults: Map<string, ToolResultEvent>,
-  agentIsIdle: boolean,
+  isTailSettled: boolean,
+  liveCompaction: LiveCompaction | null = null,
 ): SectionView[] {
   const { deco, knownSteps, createdOrder } = buildDecorationMap(events, toolResults);
+  const noticeAnchorId = autocompactNoticeAnchorId(events);
+  const compactCommands = sweepCompactCommands(events, liveCompaction?.cause ?? null);
+  const compactCommandIds = sweepCompactCommandIds(compactCommands);
 
   const builders: SectionBuilder[] = [];
   let current: SectionBuilder | null = null;
@@ -503,9 +636,17 @@ export function buildSections(
   // whole transcript and looked up per-card at render time, so it is immune to
   // requests being resolved out of the order they were created, and to more
   // than one permission request being batched into one message.
-  const resolutionsByRequestId = new Map<string, PermissionResolution>();
-  const ensureSection = (user_event: UserMessageEvent | null, key: string): SectionBuilder => {
-    const section = newSection(user_event, key);
+  const resolutionsByRequestId = new Map<string, RequestResolution>();
+  // The newest secret request per file that has not resolved yet, so a later request
+  // for the same file can mark the earlier card superseded.
+  const pendingSecretRequestByFile = new Map<string, string>();
+  const secretNotesByRequestId = new Map<string, string>();
+  const ensureSection = (
+    user_event: UserMessageEvent | null,
+    key: string,
+    is_after_switch = false,
+  ): SectionBuilder => {
+    const section = newSection(user_event, key, is_after_switch);
     // Re-open carried-over steps at the top of the new section.
     for (const id of carryover) {
       openStep(section, id, /* is_carryover */ true);
@@ -514,6 +655,21 @@ export function buildSections(
     builders.push(section);
     return section;
   };
+  // Close the current section, carrying its open steps over, and open the next. A turn the user
+  // started is a new request, so the carried-over steps wait until the agent takes them up again;
+  // any other break continues the request the closed section was answering.
+  const breakSection = (
+    user_event: UserMessageEvent | null,
+    key: string,
+    isNewRequest: boolean,
+    isAfterSwitch = false,
+  ): void => {
+    const previous = current;
+    carryover = previous === null ? [] : openStepsAtEnd(previous);
+    current = ensureSection(user_event, key, isAfterSwitch);
+    if (isNewRequest) setCarryoverDormant(current);
+    else continueCarryover(previous, current);
+  };
 
   // The node a switch just closed, until the successor's first turn-making event: the handoff
   // prompt lands on it rather than in the successor's section. Hidden lines the successor's
@@ -521,10 +677,10 @@ export function buildSections(
   let lastSwitched: HandoffNode | null = null;
   for (const e of events) {
     if (e.type === "agent_switch" && e.from_harness === SEED_HARNESS) {
-      // The chat's first agent taking over from the seed segment the Mind app wrote: nothing
+      // The chat's first agent taking over from the seed segment, which no agent wrote: nothing
       // was handed off, so no node marks it; the agent's first turn simply opens a section.
       if (current !== null) carryover = openStepsAtEnd(current);
-      current = ensureSection(openingTurnOf(e), `section-switch-${e.event_id}`);
+      current = ensureSection(openingTurnOf(e), `section-switch-${e.event_id}`, true);
       continue;
     }
     if (e.type === "agent_switch") {
@@ -543,8 +699,14 @@ export function buildSections(
         lastSwitched = { key: e.event_id, request: null, events: [], switch: e, prompt: null };
         current.entries.push({ kind: "handoff", node: lastSwitched });
       }
-      carryover = openStepsAtEnd(current);
-      current = ensureSection(openingTurnOf(e), `section-switch-${e.event_id}`);
+      // The successor starts on the message the user switched with, so a step the retiring
+      // agent left open does not take its answer unless it takes the step up.
+      breakSection(
+        openingTurnOf(e),
+        `section-switch-${e.event_id}`,
+        /* isNewRequest */ true,
+        /* isAfterSwitch */ true,
+      );
       continue;
     }
     if (e.type === "user_message") {
@@ -575,7 +737,7 @@ export function buildSections(
       // is on the card), so the new section has no user bubble.
       //
       // The notification's own request id is the correlation key. A
-      // notification with NO id (recorded before minds embedded ids)
+      // notification with NO id (recorded before Imbue Studio embedded ids)
       // attributes nothing -- guessing by arrival order is what swapped
       // verdicts between cards, and an embedded page recovers the verdict
       // from the response log instead (the card's hydration query). The
@@ -585,32 +747,50 @@ export function buildSections(
         lastSwitched = null;
         const requestId = resolutionRequestIdOf(e);
         if (requestId !== null) resolutionsByRequestId.set(requestId, resolution);
-        carryover = current === null ? [] : openStepsAtEnd(current);
-        current = ensureSection(null, `section-after-${e.event_id}`);
+        breakSection(null, `section-after-${e.event_id}`, /* isNewRequest */ false);
         continue;
       }
-      if (isNonBoundaryUserMessage(e)) {
-        // Collapsed system chips (Stop-hook feedback, browser-fleet nudges,
-        // background task-notifications) fold into the current section as a chip
-        // rather than opening a new turn. The backend's display decision says
-        // which is which; nothing is re-derived here. A chip goes into the skeleton
-        // so it both renders at its chronological spot and marks the turn end that
-        // ends a step's stint (see collectEjectedProse).
-        if (isSystemChipUserMessage(e)) {
-          if (current === null) current = ensureSection(null, "section-pre");
-          current.entries.push({ kind: "chip", event: e });
-        }
-        // The other non-boundary messages -- skill expansions and hidden
-        // framework injections (/welcome, image notes, resume markers) -- render
-        // nowhere on the user rail, so they are dropped here.
+      // The chat app's notice that a secret card was answered: the same break as a
+      // permission verdict, keyed by the request's own id (a secret notice always
+      // carries one).
+      const secretResolution = secretResolutionOf(e);
+      if (secretResolution !== null) {
+        lastSwitched = null;
+        const requestId = secretResolutionRequestIdOf(e);
+        if (requestId !== null) resolutionsByRequestId.set(requestId, secretResolution);
+        const note = secretResolutionNoteOf(e);
+        if (requestId !== null && note !== null) secretNotesByRequestId.set(requestId, note);
+        breakSection(null, `section-after-${e.event_id}`, /* isNewRequest */ false);
+        continue;
+      }
+      if (
+        current !== null &&
+        current.open_handoff !== null &&
+        (isSystemChipUserMessage(e) || isNoticeUserMessage(e))
+      ) {
+        // The handoff node takes the retiring agent's whole summary turn, so a chip landing
+        // inside it stays in that turn, at its spot after the node.
+        current.entries.push({ kind: "chip", event: e });
+        continue;
+      }
+      if (isStatusUserMessage(e)) {
+        if (current === null) current = ensureSection(null, "section-pre");
+        const command = compactCommands.byCompactionId.get(e.event_id) ?? null;
+        current.entries.push({ kind: "status", part: landedCompaction(e, e.event_id === noticeAnchorId, command) });
+        continue;
+      }
+      if (isNonBoundaryUserMessage(e) || compactCommandIds.has(e.event_id)) {
+        // Skill expansions and hidden framework injections (/welcome, image notes, resume
+        // markers) render nowhere on the user rail, so they are dropped here, as is the idle
+        // sweep's /compact, which its compaction's start chip shows.
         continue;
       }
 
-      // Real user turn: close the prior section (carrying open steps) and open
-      // a new one.
+      // A boundary -- a real user turn, or a system chip or notice (see the
+      // module docstring): close the prior section (carrying open steps) and open a new one
+      // headed by the message.
       lastSwitched = null;
-      carryover = current === null ? [] : openStepsAtEnd(current);
-      current = ensureSection(e, `section-${e.event_id}`);
+      breakSection(e, `section-${e.event_id}`, isGenuineUserTurn(e));
       continue;
     }
     if (e.type === "assistant_message") {
@@ -622,6 +802,20 @@ export function buildSections(
         continue;
       }
       const parsed = parseMessage(e, toolResults);
+      // Only step records render in the timeline. A `tk start`/`tk close` on a
+      // regular ticket the agent picked up prints the same
+      // `Updated <id> -> <status>` line as a step does; skip it (it is neither
+      // a `-step-` id nor a known step) rather than mint a phantom node titled
+      // with the raw ticket id. Any work batched with that command stays in
+      // the step that was already open (or renders inline if none was).
+      const stepTransitions = parsed.transitions.filter((t) => isStepId(t.id) || knownSteps.has(t.id));
+      if (
+        current.dormant_step_id !== null &&
+        ((parsed.render !== null && isWork(parsed.render)) || stepTransitions.length > 0)
+      ) {
+        current.current_step_id = current.dormant_step_id;
+        current.dormant_step_id = null;
+      }
       // Apply transitions in transcript order so each step node lands at its
       // real position -- a batched `tk close a && tk start b` must keep a's node
       // before b's. Then route this message's content to the step it belongs
@@ -630,23 +824,18 @@ export function buildSections(
       // message with a `tk close` -- it stays in the closing step).
       const stepBefore = current.current_step_id;
       let lastOpened: string | null = null;
-      for (const t of parsed.transitions) {
-        // Only step records render in the timeline. A `tk start`/`tk close` on a
-        // regular ticket the agent picked up prints the same
-        // `Updated <id> -> <status>` line as a step does; skip it (it is neither
-        // a `-step-` id nor a known step) rather than mint a phantom node titled
-        // with the raw ticket id. Any work batched with that command stays in
-        // the step that was already open (or renders inline if none was).
-        if (!isStepId(t.id) && !knownSteps.has(t.id)) continue;
+      for (const t of stepTransitions) {
         applyTransition(current, t);
         if (t.status === "in_progress") lastOpened = t.id;
       }
-      if (parsed.render !== null && (parsed.render.text || parsed.render.tool_calls.length > 0)) {
+      // Whitespace-only text draws nothing, so it counts as no text.
+      if (parsed.render !== null && (parsed.render.text.trim() || parsed.render.tool_calls.length > 0)) {
         if (hasPermissionRequest(parsed.render, toolResults)) {
-          // A permission request breaks out of any open step: it must always be
-          // directly visible, never collapsed inside a step node. The step stays
-          // open (current_step_id is untouched), so work resumed after the user
+          // A permission or secret request breaks out of any open step: it must
+          // always be directly visible, never collapsed inside a step node. The step
+          // stays open (current_step_id is untouched), so work resumed after the user
           // responds keeps grouping under it.
+          supersedeOlderSecretRequests(parsed.render, toolResults, pendingSecretRequestByFile, resolutionsByRequestId);
           current.entries.push({ kind: "permission", event: parsed.render });
         } else {
           routeMessage(current, parsed.render, lastOpened ?? stepBefore);
@@ -655,6 +844,12 @@ export function buildSections(
       continue;
     }
     // tool_result events are resolved by id via toolResults; no routing needed.
+  }
+
+  // The compaction running now goes where its event will land: at the end of the transcript.
+  if (liveCompaction !== null && !endsOnLandedCompaction(events)) {
+    if (current === null) current = ensureSection(null, "section-pre");
+    current.entries.push({ kind: "status", part: runningCompaction(liveCompaction.cause, compactCommands.running) });
   }
 
   // Pending roster: created steps that never transitioned anywhere, in
@@ -667,7 +862,15 @@ export function buildSections(
 
   const lastBuilder = builders[builders.length - 1];
   return builders.map((b) =>
-    finalizeSection(b, deco, resolutionsByRequestId, b === lastBuilder ? pending : [], agentIsIdle, b === lastBuilder),
+    finalizeSection(
+      b,
+      deco,
+      resolutionsByRequestId,
+      secretNotesByRequestId,
+      b === lastBuilder ? pending : [],
+      isTailSettled,
+      b === lastBuilder,
+    ),
   );
 }
 
@@ -694,6 +897,42 @@ function openStep(section: SectionBuilder, id: string, is_carryover: boolean): v
     existing.summary = null;
   }
   section.current_step_id = id;
+}
+
+/** Keep the step carried over into a new turn out of it until the agent takes it up again
+ *  (see SectionBuilder.dormant_step_id). */
+function setCarryoverDormant(section: SectionBuilder): void {
+  section.dormant_step_id = section.current_step_id;
+  section.current_step_id = null;
+  section.untaken_carryover_ids = new Set(section.step_order);
+}
+
+/** Open `next` on the same request `previous` was answering (after a chip, a notice, or a request's
+ *  verdict), which does not change what the agent is answering: a dormant step stays dormant, and
+ *  the carried-over steps `previous` never took up stay off `next`'s timeline. */
+function continueCarryover(previous: SectionBuilder | null, next: SectionBuilder): void {
+  if (previous === null) return;
+  if (previous.dormant_step_id !== null) {
+    setCarryoverDormant(next);
+    return;
+  }
+  next.untaken_carryover_ids = new Set(untakenCarryoverIds(previous));
+  if (next.current_step_id !== null && next.untaken_carryover_ids.has(next.current_step_id)) {
+    next.current_step_id = previous.current_step_id;
+  }
+}
+
+/** The steps in untaken_carryover_ids the agent has not taken up in the section so far. */
+function untakenCarryoverIds(section: SectionBuilder): string[] {
+  return section.step_order.filter((id) => {
+    const node = section.steps.get(id)!;
+    return (
+      section.untaken_carryover_ids.has(id) &&
+      node.status === "active" &&
+      node.events.length === 0 &&
+      id !== section.current_step_id
+    );
+  });
 }
 
 function applyTransition(section: SectionBuilder, t: { id: string; status: "in_progress" | "closed" }): void {
@@ -737,51 +976,18 @@ function openStepsAtEnd(section: SectionBuilder): string[] {
   return section.step_order.filter((id) => section.steps.get(id)!.status === "active");
 }
 
-/** Collect the in-step prose to eject as closing remarks, working stint by
- *  stint.
- *
- *  A *stint* is a run of one step's events uninterrupted by a system chip.
- *  Prose at the end of a stint is a delivered reply, proven by where the chip
- *  sits rather than by what kind of chip it is: an injected user-side line only
- *  arrives at a request boundary, so it either follows a tool result (the stint
- *  ends in work, and there is nothing to eject) or follows prose, which happens
- *  only when that response ended with text and no tool call -- the agent
- *  stopped there. Both halves are visible in any transcript: a text block never
- *  follows a tool_use inside one response, and an injected line never lands
- *  directly after a text-only one. That makes the rule independent of WHEN the
- *  harness delivers a chip, including one it queued while the agent was busy.
- *
- *  Without the split, work the agent does after being woken would retroactively
- *  turn that reply into mid-step narration and bury it inside the collapsed
- *  step -- the step happened to still be open, so the prose stopped being
- *  "after the step's last work".
- *
- *  The live frontier step's LAST stint is exempt: nothing has ended it, so its
- *  trailing prose is in-flight narration shown as a caption (see step 3). Its
- *  earlier stints are not exempt -- a chip ended each of those.
- */
+/** Collect each step's closing remarks: the prose it spoke after its last work
+ *  in this section. The live frontier step is exempt: nothing has ended it, so
+ *  its trailing prose is in-flight narration shown as a caption (see step 3). */
 function collectEjectedProse(section: SectionBuilder, frontierId: string | null): Set<string> {
-  const stintsByStep = new Map<string, AssistantMessageEvent[][]>();
-  for (const id of section.step_order) stintsByStep.set(id, [[]]);
-  for (const entry of section.entries) {
-    if (entry.kind === "chip") {
-      for (const stints of stintsByStep.values()) stints.push([]);
-    } else if (entry.kind === "event" && entry.step_id !== null) {
-      const stints = stintsByStep.get(entry.step_id);
-      if (stints !== undefined) stints[stints.length - 1].push(entry.event);
-    }
-  }
-
   const ejected = new Set<string>();
-  for (const [id, stints] of stintsByStep) {
-    for (let s = 0; s < stints.length; s++) {
-      if (id === frontierId && s === stints.length - 1) continue;
-      const stint = stints[s];
-      let lastWorkIdx = -1;
-      for (let i = 0; i < stint.length; i++) if (isWork(stint[i])) lastWorkIdx = i;
-      for (let i = lastWorkIdx + 1; i < stint.length; i++) {
-        if (isProse(stint[i])) ejected.add(stint[i].event_id);
-      }
+  for (const id of section.step_order) {
+    if (id === frontierId) continue;
+    const events = section.steps.get(id)!.events;
+    let lastWorkIdx = -1;
+    for (let i = 0; i < events.length; i++) if (isWork(events[i])) lastWorkIdx = i;
+    for (let i = lastWorkIdx + 1; i < events.length; i++) {
+      if (isProse(events[i])) ejected.add(events[i].event_id);
     }
   }
   return ejected;
@@ -793,23 +999,46 @@ function collectEjectedProse(section: SectionBuilder, frontierId: string | null)
 function finalizeSection(
   section: SectionBuilder,
   deco: Map<string, Decoration>,
-  resolutionsByRequestId: ReadonlyMap<string, PermissionResolution>,
+  resolutionsByRequestId: ReadonlyMap<string, RequestResolution>,
+  secretNotesByRequestId: ReadonlyMap<string, string>,
   pending: { id: string; title: string }[],
-  agentIsIdle: boolean,
+  isTailSettled: boolean,
   is_tail: boolean,
 ): SectionView {
   // The live frontier step (the open step the agent is actively on) -- the only
   // one that may show a spinner. Computed up front because the live step is
   // treated specially below: prose it just spoke is in-flight narration, not a
   // closing remark, since the step has not closed.
-  const frontierId = is_tail && !agentIsIdle ? section.current_step_id : null;
+  const frontierId = is_tail && !isTailSettled ? section.current_step_id : null;
 
   // A fresh start asked for no summary and delivered no prompt: there was no handoff to show, so
   // its node comes off the timeline rather than standing as an empty line.
   section.entries = section.entries.filter((entry) => entry.kind !== "handoff" || !isFreshStartNode(entry.node));
 
-  // 1. Ejection: prose spoken inside a step at the end of a stint (so it is NOT
-  //    narration, which is prose *followed* by more work in the same stint). It
+  // A section the agent did nothing in (two boundaries back to back) holds only the steps it
+  // carried over, which the next section shows again: drop them rather than show each twice.
+  const isUntouched = section.entries.every((entry) => {
+    if (entry.kind !== "step") return false;
+    const node = section.steps.get(entry.id)!;
+    return node.is_carryover && node.status === "active" && node.events.length === 0;
+  });
+  if (!is_tail && isUntouched) {
+    section.entries = [];
+    section.steps.clear();
+    section.step_order = [];
+  }
+
+  // A step left open by an earlier request that the agent never took up in this turn is not part
+  // of it: showing it again here would read as the agent going back to it.
+  const untakenIds = new Set(untakenCarryoverIds(section));
+  if (untakenIds.size > 0) {
+    section.entries = section.entries.filter((entry) => entry.kind !== "step" || !untakenIds.has(entry.id));
+    section.step_order = section.step_order.filter((id) => !untakenIds.has(id));
+    for (const id of untakenIds) section.steps.delete(id);
+  }
+
+  // 1. Ejection: prose spoken inside a step AFTER its last work (so it is NOT
+  //    narration, which is prose *followed* by more work in the same step). It
   //    is the step's closing remark -- ejected from the step so it renders in
   //    the ungrouped inline stream right after the step node, rather than buried
   //    inside it. (If it is the last thing in the section it becomes the
@@ -837,22 +1066,39 @@ function finalizeSection(
     else if (en.kind === "event" && isWork(en.event)) lastWorkEntryIdx = i;
     // A handoff node bounds the reply too: what the agent said before the switch stays above it.
     else if (en.kind === "step" || en.kind === "handoff") lastStepEntryIdx = i;
+    else if (en.kind === "status") {
+      const hasLaterContent = section.entries.slice(i + 1).some(isSubsequentTurnActivity);
+      if (hasLaterContent) {
+        lastWorkEntryIdx = i;
+      }
+    }
   }
   const replyBoundary = Math.max(lastWorkEntryIdx, lastStepEntryIdx);
   const trailingIds = new Set<string>();
   const trailing_reply: AssistantMessageEvent[] = [];
+  let lastTrailingReplyEntryIdx = replyBoundary;
   for (let i = replyBoundary + 1; i < section.entries.length; i++) {
     const en = section.entries[i];
     if (en.kind !== "event" || !isProse(en.event)) continue;
     // Prose the agent just spoke inside the live frontier step is that step's
     // in-flight narration (a caption under the still-spinning step), not the
     // turn's wrap-up reply -- the step has not closed, so there is no reply yet.
-    // Prose step 1 already ejected is exempt from that: a chip ended the stint
-    // it closed, so it is a delivered reply and belongs below the timeline even
-    // though the step it came from is still the frontier.
-    if (en.step_id !== null && en.step_id === frontierId && !ejectedIds.has(en.event.event_id)) continue;
+    if (en.step_id !== null && en.step_id === frontierId) continue;
     trailing_reply.push(en.event);
     trailingIds.add(en.event.event_id);
+    lastTrailingReplyEntryIdx = i;
+  }
+
+  // A compaction after the reply follows it below the timeline. With no reply to follow, it
+  // stays in the inline stream, where its chips join the turn's last chip row.
+  const trailing_status: CompactionPart[] = [];
+  const trailingStatusIndices = new Set<number>();
+  for (let i = lastTrailingReplyEntryIdx + 1; i < section.entries.length && trailing_reply.length > 0; i++) {
+    const en = section.entries[i];
+    if (en.kind === "status") {
+      trailing_status.push(en.part);
+      trailingStatusIndices.add(i);
+    }
   }
 
   // 3. Narration: the latest in-step prose -- the live caption under the step.
@@ -890,7 +1136,7 @@ function finalizeSection(
   //    lead the timeline.
   const items: TimelineItem[] = [];
   const emittedSteps = new Set<string>();
-  let ungrouped: AssistantMessageEvent[] = [];
+  let ungrouped: RunPart[] = [];
   let ungroupedKey = 0;
   const flushUngrouped = (): void => {
     if (ungrouped.length > 0) {
@@ -899,7 +1145,8 @@ function finalizeSection(
     }
   };
 
-  for (const entry of section.entries) {
+  for (let i = 0; i < section.entries.length; i++) {
+    const entry = section.entries[i];
     if (entry.kind === "step") {
       flushUngrouped();
       if (!emittedSteps.has(entry.id)) {
@@ -911,12 +1158,15 @@ function finalizeSection(
       // own always-visible item at its transcript position. Each card looks up
       // its own verdict in resolutionsByRequestId by its own request id.
       flushUngrouped();
-      items.push({ kind: "permission", event: entry.event, resolutionsByRequestId });
+      items.push({ kind: "permission", event: entry.event, resolutionsByRequestId, secretNotesByRequestId });
     } else if (entry.kind === "chip") {
       // Likewise a chip: it ends any in-flight ungrouped run and stands at its
       // own transcript position.
       flushUngrouped();
       items.push({ kind: "chip", event: entry.event });
+    } else if (entry.kind === "status") {
+      // A compaction joins the inline run, so its chips share a row with the calls beside it.
+      if (!trailingStatusIndices.has(i)) ungrouped.push(entry.part);
     } else if (entry.kind === "handoff") {
       flushUngrouped();
       items.push({ kind: "handoff", node: entry.node });
@@ -950,5 +1200,13 @@ function finalizeSection(
     }
   }
 
-  return { user_event: section.user_event, key: section.key, items, trailing_reply };
+  return {
+    user_event: section.user_event,
+    key: section.key,
+    is_after_switch: section.is_after_switch,
+    items,
+    trailing_reply,
+    trailing_status,
+    live_step_id: section.open_handoff === null ? frontierId : null,
+  };
 }

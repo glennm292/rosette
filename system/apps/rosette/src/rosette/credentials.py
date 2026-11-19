@@ -3,8 +3,7 @@ import stat
 from pathlib import Path
 from typing import Final
 
-from pydantic import BaseModel
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from rosette.tutor import RosetteError
 

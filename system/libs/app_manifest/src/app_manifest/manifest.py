@@ -1,3 +1,4 @@
+import re
 import tomllib
 from enum import auto
 from pathlib import Path
@@ -5,26 +6,38 @@ from typing import Any
 from typing import Final
 from typing import Self
 
-from imbue.imbue_common.enums import LowerCaseStrEnum
-from imbue.imbue_common.frozen_model import FrozenModel
-from imbue.imbue_common.primitives import NonEmptyStr
 from pydantic import Field
 from pydantic import ValidationError
+from pydantic import field_validator
 from pydantic import model_validator
 
 from app_manifest.errors import InvalidManifestValueError
 from app_manifest.errors import ManifestLoadError
-from app_manifest.primitives import ActionId
+from app_manifest.primitives import AppDescription
 from app_manifest.primitives import AppName
+from app_manifest.primitives import AppPartName
 from app_manifest.primitives import DisplayName
+from app_manifest.primitives import EnvVarName
 from app_manifest.primitives import ExcludeGlob
 from app_manifest.primitives import IconPath
-from app_manifest.primitives import InstancesUrl
+from app_manifest.primitives import KeybindingActionId
+from app_manifest.primitives import KeybindingActionLabel
+from app_manifest.primitives import LaunchParamName
+from app_manifest.primitives import LaunchPathId
+from app_manifest.primitives import LaunchPathValue
+from app_manifest.primitives import MessageType
+from app_manifest.primitives import PageTemplate
+from app_manifest.primitives import PreviewName
 from app_manifest.primitives import PriorityName
 from app_manifest.primitives import ProgramName
 from app_manifest.primitives import ReferenceNote
 from app_manifest.primitives import ReferencePath
+from app_manifest.primitives import SecretFileName
 from app_manifest.primitives import is_path_covered_by
+from imbue.imbue_common.enums import LowerCaseStrEnum
+from imbue.imbue_common.enums import UpperCaseStrEnum
+from imbue.imbue_common.frozen_model import FrozenModel
+from imbue.imbue_common.primitives import NonEmptyStr
 
 MANIFEST_FILENAME: Final[str] = "app.toml"
 
@@ -33,32 +46,236 @@ APPS_DIRECTORY_PARTS: Final[tuple[str, str]] = ("system", "apps")
 
 DEFAULT_PRIORITY: Final[PriorityName] = PriorityName("user")
 
-# The one action every single-instance app has; the shell synthesizes it, so a
+# The one launch path an app that declares none has, at its root; the shell synthesizes it, so a
 # manifest never declares it but may name it as its default shortcut.
-OPEN_ACTION_ID: Final[ActionId] = ActionId("open")
+OPEN_LAUNCH_PATH_ID: Final[LaunchPathId] = LaunchPathId("open")
+
+# The body fields the shell adds to every POST launch beside the params (the post-launch-paths plan,
+# section 3.2): the requesting client, its desktop, and the path of the window the launch is aimed at.
+# A manifest may declare neither a param nor a preset by these names.
+RESERVED_LAUNCH_PARAM_NAMES: Final[frozenset[str]] = frozenset({"client_id", "desktop_id", "window_path"})
+
+# The placeholders a preview table's command, args, and env values may carry
+# (desktop-interface contracts.md): ``{port:<name>}`` for a declared port,
+# ``{copy:<key>}`` for a declared copy, and the bare ``{host}``, ``{scratch}``, and
+# ``{registry}``. ``open_path`` alone may carry ``{key}``. The isolated-instance
+# script fills the port, copy, host, and scratch ones once it has allocated them,
+# so it mirrors this pattern; the preview script fills the registry.
+PREVIEW_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\{(?P<kind>[a-z_]+)(?::(?P<name>[a-z0-9_-]+))?\}")
+PREVIEW_PORT_PLACEHOLDER_KIND: Final[str] = "port"
+PREVIEW_COPY_PLACEHOLDER_KIND: Final[str] = "copy"
+PREVIEW_BARE_PLACEHOLDER_KINDS: Final[frozenset[str]] = frozenset({"host", "scratch", "registry"})
+PREVIEW_KEY_PLACEHOLDER: Final[str] = "{key}"
+MAIN_PORT_NAME: Final[PreviewName] = PreviewName("main")
+PREVIEW_DATA_COPY_KEY: Final[PreviewName] = PreviewName("data")
+DEFAULT_PREVIEW_HEALTH_PATH: Final[str] = "/health"
+DEFAULT_PREVIEW_OPEN_PATH: Final[str] = "/"
 
 
 class ShortcutMode(LowerCaseStrEnum):
-    """How a rail shortcut behaves: focus the app's most recent tab, or always create anew."""
+    """How a desktop shortcut behaves: focus the app's most recent window, or always open a new one."""
 
     FOCUS = auto()
     NEW = auto()
 
 
-class ActionParam(FrozenModel):
-    """One documented key of an action's create body."""
+class LaunchPathMethod(UpperCaseStrEnum):
+    """How the shell runs a launch path: opens a window at the path (GET), or posts to it and opens a window at the
+    path the app answers (POST)."""
 
-    name: NonEmptyStr = Field(description="The key in the create body's params")
+    GET = auto()
+    POST = auto()
+
+
+class PinStyle(LowerCaseStrEnum):
+    """How a pinned entry may be drawn: the plain icon-and-title entry, or the avatar the shell ships."""
+
+    PLAIN = auto()
+    AVATAR = auto()
+
+
+class LocationScope(LowerCaseStrEnum):
+    """Whether a window's path and title are followed by every client, or kept by each client for itself."""
+
+    LINKED = auto()
+    INDEPENDENT = auto()
+
+
+class EntryMode(LowerCaseStrEnum):
+    """Where one client shows a pinned entry: in the taskbar, or floating above the windows."""
+
+    BAR = auto()
+    FLOATING = auto()
+
+
+class Pin(FrozenModel):
+    """An app's pinned taskbar entry (pinned-taskbar-entries plan section 3.1): one window of the app on every
+    desktop, never closed, drawn in the bar or floating."""
+
+    path: LaunchPathValue = Field(
+        description="The home path: where the pinned window opens, a page safe to open any number of times"
+    )
+    style: PinStyle = Field(
+        default=PinStyle.PLAIN, description="How the entry is drawn by a client that chose nothing"
+    )
+    scope: LocationScope = Field(
+        default=LocationScope.LINKED,
+        description="Whether the pinned window keeps a path per client",
+    )
+    default_mode: EntryMode = Field(
+        default=EntryMode.BAR,
+        description="Where a client that chose nothing shows the entry",
+    )
+
+
+class LaunchParam(FrozenModel):
+    """One documented parameter of a launch path: a GET launch path's query parameter, a POST launch path's body field."""
+
+    name: LaunchParamName = Field(description="The parameter's name")
     label: NonEmptyStr = Field(description="What the parameter is called in prose")
-    required: bool = Field(default=False, description="Whether the create refuses a body without it")
+    required: bool = Field(default=False, description="Whether the launch path refuses a request without it")
 
 
-class AppAction(FrozenModel):
-    """A way of creating an instance that an app declares in its manifest."""
+class AppParams(FrozenModel):
+    """The declared params of a launch path about an app (the multiplayer spec, section 9.2): the shell fills them
+    with the name and the display name of the app whose window's "Chat about this app" button was pressed."""
 
-    id: ActionId = Field(description="The id shortcuts and layout.py refer to")
-    label: NonEmptyStr = Field(description="The action's user-facing label")
-    params: tuple[ActionParam, ...] = Field(default=(), description="The create body's documented params")
+    name: LaunchParamName = Field(description="The param that takes the app's registered name")
+    display_name: LaunchParamName = Field(description="The param that takes the app's display name")
+
+    @model_validator(mode="after")
+    def _check_the_two_params_differ(self) -> Self:
+        if self.name == self.display_name:
+            raise InvalidManifestValueError(
+                f"app_params names one param {str(self.name)!r} for both the name and the display name"
+            )
+        return self
+
+
+class LaunchPath(FrozenModel):
+    """A way of starting something the desktop offers (desktop-interface contracts.md section 2): a page path the
+    shell opens a window at (GET), or a route the shell posts to for the path of the page to open (POST)."""
+
+    id: LaunchPathId = Field(description="The id shortcuts and workspace-layout refer to")
+    label: NonEmptyStr = Field(description="The launch path's user-facing label")
+    path: LaunchPathValue = Field(description="The path under the app origin, without a query string")
+    method: LaunchPathMethod = Field(
+        default=LaunchPathMethod.GET,
+        description="GET opens a window at the path with the params as its query; POST posts the params to the path "
+        "and opens a window at the path the app answers (post-launch-paths plan section 3.1)",
+    )
+    params: tuple[LaunchParam, ...] = Field(
+        default=(),
+        description="The parameters a caller may supply (the query for a GET, the body for a POST), documented",
+    )
+    presets: dict[LaunchParamName, str] = Field(
+        default_factory=dict,
+        description="Fixed name-value pairs the shell sends with every launch of the path, beside the caller's params",
+    )
+    text_param: LaunchParamName | None = Field(
+        default=None,
+        description="The declared param the launcher fills with typed text; a launch path with one is a free-text "
+        "row of the launcher (launcher-and-getting-started plan section 3.1)",
+    )
+    draft_param: LaunchParamName | None = Field(
+        default=None,
+        description="The declared param the shell fills with text to be drafted rather than sent: a free-text row of "
+        "the launcher too, and what the avatar dialog's draft goes through (post-launch-paths plan section 3.1)",
+    )
+    mention_param: LaunchParamName | None = Field(
+        default=None,
+        description="The declared param the shell fills with a mention of a person (``@<handle> ``) when their tray "
+        "entry is clicked (the multiplayer spec, section 7.5); never a launcher row",
+    )
+    app_params: AppParams | None = Field(
+        default=None,
+        description="The declared params the shell fills with the name and display name of the app whose window's "
+        '"Chat about this app" button was pressed (the multiplayer spec, section 9.2); never a launcher row',
+    )
+
+    @model_validator(mode="after")
+    def _check_params_presets_and_text_params(self) -> Self:
+        param_names = [str(param.name) for param in self.params]
+        chosen_params = (
+            ("text_param", self.text_param),
+            ("draft_param", self.draft_param),
+            ("mention_param", self.mention_param),
+            (
+                "app_params.name",
+                None if self.app_params is None else self.app_params.name,
+            ),
+            (
+                "app_params.display_name",
+                None if self.app_params is None else self.app_params.display_name,
+            ),
+        )
+        for field_name, chosen in chosen_params:
+            if chosen is not None and chosen not in param_names:
+                raise InvalidManifestValueError(
+                    f"{field_name} {str(chosen)!r} is not one of the launch path's params {param_names}"
+                )
+        chosen_fields = (
+            self.text_param,
+            self.draft_param,
+            self.mention_param,
+            self.app_params,
+        )
+        if sum(chosen is not None for chosen in chosen_fields) > 1:
+            raise InvalidManifestValueError(
+                "a launch path declares at most one of text_param, draft_param, mention_param, and app_params"
+            )
+        for preset_name in self.presets:
+            if preset_name in param_names:
+                raise InvalidManifestValueError(
+                    f"preset {str(preset_name)!r} is also one of the launch path's params; a name is one or the other"
+                )
+        reserved = sorted(RESERVED_LAUNCH_PARAM_NAMES.intersection([*param_names, *map(str, self.presets)]))
+        if reserved:
+            raise InvalidManifestValueError(
+                f"{reserved[0]!r} is reserved for the shell's launch envelope and cannot be a param or a preset"
+            )
+        return self
+
+
+class MessageHandler(FrozenModel):
+    """A message an app takes, and how the shell delivers it (desktop-interface contracts.md section 2): posted to a
+    route under the app's origin (``path``), or as a page of the app the shell puts on screen (``show``)."""
+
+    type: MessageType = Field(description="The message type the app handles")
+    path: LaunchPathValue | None = Field(
+        default=None,
+        description="The route under the app origin the shell POSTs the message to",
+    )
+    show: PageTemplate | None = Field(
+        default=None,
+        description="The page of the app the shell shows for the message, built from its fields",
+    )
+    showing: tuple[PageTemplate, ...] = Field(
+        default=(),
+        description="The app's other pages, built the same way, that count as already showing it",
+    )
+
+    @model_validator(mode="after")
+    def _check_one_delivery(self) -> Self:
+        if (self.path is None) == (self.show is None):
+            raise InvalidManifestValueError(
+                f"message handler {str(self.type)!r} gives exactly one of 'path' (a route to post to) or 'show' "
+                "(a page to show)"
+            )
+        if self.showing and self.show is None:
+            raise InvalidManifestValueError(f"message handler {str(self.type)!r} gives 'showing' only beside 'show'")
+        return self
+
+
+class KeybindingAction(FrozenModel):
+    """An action the keyboard can trigger in an app, and the chords that do so out of the box (desktop-interface
+    contracts.md section 2). The chord spelling is the ``workspace_profile`` grammar, checked where chords are read."""
+
+    id: KeybindingActionId = Field(description="The action id, stable across releases")
+    label: KeybindingActionLabel = Field(description="What the action does, as the Keyboard shortcuts dialog shows it")
+    default_chords: tuple[NonEmptyStr, ...] = Field(
+        default=(), description="The canonical chords that trigger it by default; none leaves it unbound"
+    )
 
 
 class AppReference(FrozenModel):
@@ -66,7 +283,8 @@ class AppReference(FrozenModel):
 
     path: ReferencePath = Field(description="The literal repo-root-relative file or directory")
     note: ReferenceNote | None = Field(
-        default=None, description="One line: why it belongs to the app and which surface it uses"
+        default=None,
+        description="One line: why it belongs to the app and which surface it uses",
     )
 
 
@@ -74,7 +292,8 @@ class ScopeRules(FrozenModel):
     """What an app's footprint leaves out on top of the built-in exclusions."""
 
     exclude: tuple[ExcludeGlob, ...] = Field(
-        default=(), description="Repo-root-relative gitignore-style globs no pass ever considers"
+        default=(),
+        description="Repo-root-relative gitignore-style globs no pass ever considers",
     )
 
 
@@ -88,43 +307,273 @@ class WiringRules(FrozenModel):
     )
 
 
-class DefaultShortcut(FrozenModel):
-    """The rail row a new project is seeded with for this app."""
+class SecretDeclaration(FrozenModel):
+    """One data/.secrets/<file>.env the app runs under (through with_secrets.py), so a
+    published template can ask an adopter for exactly those variables."""
 
-    action: ActionId = Field(description="A declared action id, or 'open' for a single-instance app")
+    file: SecretFileName = Field(description="The <file> of data/.secrets/<file>.env")
+    variables: tuple[EnvVarName, ...] = Field(description="The variables the file must set; at least one")
+    note: ReferenceNote | None = Field(
+        default=None,
+        description="One line for the adopter: what the value is and where to get it",
+    )
+
+    @model_validator(mode="after")
+    def _check_variables(self) -> Self:
+        if not self.variables:
+            raise InvalidManifestValueError(f"secret {str(self.file)!r} must list at least one variable")
+        if len(set(self.variables)) != len(self.variables):
+            raise InvalidManifestValueError(f"secret {str(self.file)!r} lists a variable twice")
+        return self
+
+
+class ThemingMode(LowerCaseStrEnum):
+    """How far an app takes part in workspace themes (the workspace-themes plan, section 7)."""
+
+    # Built only from the shared components and the design tokens: every theme styles it.
+    TOKENS = auto()
+    # Also marks elements with a look of its own as declared parts, which a theme may style.
+    PARTS = auto()
+    # Shows content whose look is not the workspace's; only the window around it is themed.
+    NONE = auto()
+    # Has a look of its own, written on the design tokens with that look as their fallbacks, and loads the page kit; the
+    # user turns its theming on and off from its window menu (docs/system/themeable-apps.md).
+    OUTSIDE = auto()
+
+
+class AppPart(FrozenModel):
+    """An element of the app a theme may style, marked ``data-part="<app>.<name>"`` in its pages."""
+
+    name: AppPartName = Field(description="The part's name within the app")
+    description: NonEmptyStr = Field(description="One line: what the element is")
+
+    @model_validator(mode="after")
+    def _check_description_is_one_line(self) -> Self:
+        if len(self.description.splitlines()) > 1:
+            raise InvalidManifestValueError(f"theming part {str(self.name)!r} must be described in one line")
+        return self
+
+
+class AppTheming(FrozenModel):
+    """The manifest's ``[theming]`` table."""
+
+    mode: ThemingMode = Field(default=ThemingMode.TOKENS, description="How far the app takes part in themes")
+    parts: tuple[AppPart, ...] = Field(default=(), description="The elements a theme may style, for mode parts")
+
+    @model_validator(mode="after")
+    def _check_parts_match_mode(self) -> Self:
+        names = [part.name for part in self.parts]
+        if len(set(names)) != len(names):
+            raise InvalidManifestValueError(f"theming part names must be unique, got {names}")
+        if self.parts and self.mode != ThemingMode.PARTS:
+            raise InvalidManifestValueError(
+                f'theming parts are declared only with mode = "parts", not {str(self.mode)!r}'
+            )
+        return self
+
+
+class DefaultShortcut(FrozenModel):
+    """One shortcut a new desktop is seeded with for this app."""
+
+    launch: LaunchPathId = Field(description="A declared launch path id, or 'open' when the app declares none")
     mode: ShortcutMode = Field(description="focus or new")
 
 
+def as_default_shortcut_list(value: object) -> object:
+    """A ``default_shortcut`` value as the list it stands for: one table is a list of one; anything else is left for
+    validation to judge."""
+    return [value] if isinstance(value, dict) else value
+
+
+def _preview_placeholders(text: str) -> list[tuple[str, str | None]]:
+    return [(match.group("kind"), match.group("name")) for match in PREVIEW_PLACEHOLDER_PATTERN.finditer(text)]
+
+
+class PreviewSpec(FrozenModel):
+    """How a throwaway instance of the app boots for a preview: the manifest's ``[preview]`` table."""
+
+    command: tuple[NonEmptyStr, ...] = Field(
+        default=(), description="The launch argv; empty runs the app's program as its console script"
+    )
+    ports: tuple[PreviewName, ...] = Field(
+        default=(MAIN_PORT_NAME,), description="The named free ports the instance is given; main is always one"
+    )
+    env: dict[str, str] = Field(
+        default_factory=dict, description="Environment for the instance; values may carry placeholders"
+    )
+    args: tuple[str, ...] = Field(default=(), description="Arguments appended to the command; may carry placeholders")
+    copies: dict[PreviewName, str] = Field(
+        default_factory=dict, description="Repo-relative directories copied into the instance's scratch space, by key"
+    )
+    health_path: str = Field(default=DEFAULT_PREVIEW_HEALTH_PATH, description="The path probed for a 200 once booted")
+    open_path: str = Field(default=DEFAULT_PREVIEW_OPEN_PATH, description="The path the preview window opens on")
+    open_path_takes_key: bool = Field(default=False, description="Whether open_path carries {key}, an instance key")
+
+    @model_validator(mode="after")
+    def _check_placeholders_and_names(self) -> Self:
+        if MAIN_PORT_NAME not in self.ports:
+            raise InvalidManifestValueError(f"preview.ports must include {str(MAIN_PORT_NAME)!r}")
+        if len(set(self.ports)) != len(self.ports):
+            raise InvalidManifestValueError(f"preview.ports must be unique, got {list(self.ports)}")
+        for key, source in self.copies.items():
+            path = Path(source)
+            if not source or path.is_absolute() or ".." in path.parts:
+                raise InvalidManifestValueError(
+                    f"preview.copies[{str(key)!r}] must be a repo-relative directory, got {source!r}"
+                )
+        for field_name, text in self._placeholder_bearing_texts():
+            for kind, name in _preview_placeholders(text):
+                self._check_placeholder(field_name, kind, name)
+        if not self.health_path.startswith("/") or not self.open_path.startswith("/"):
+            raise InvalidManifestValueError("preview.health_path and preview.open_path must start with '/'")
+        if _preview_placeholders(self.health_path):
+            raise InvalidManifestValueError("preview.health_path takes no placeholders")
+        open_path_without_key = self.open_path.replace(PREVIEW_KEY_PLACEHOLDER, "")
+        if _preview_placeholders(open_path_without_key):
+            raise InvalidManifestValueError(f"preview.open_path may carry only {PREVIEW_KEY_PLACEHOLDER}")
+        has_key = PREVIEW_KEY_PLACEHOLDER in self.open_path
+        if has_key != self.open_path_takes_key:
+            raise InvalidManifestValueError(
+                f"preview.open_path carries {PREVIEW_KEY_PLACEHOLDER} exactly when open_path_takes_key is true"
+            )
+        return self
+
+    def _placeholder_bearing_texts(self) -> list[tuple[str, str]]:
+        texts = [("command", part) for part in self.command] + [("args", part) for part in self.args]
+        texts.extend(("env", value) for value in self.env.values())
+        return texts
+
+    def _check_placeholder(self, field_name: str, kind: str, name: str | None) -> None:
+        if kind == PREVIEW_PORT_PLACEHOLDER_KIND:
+            if name is None or name not in self.ports:
+                raise InvalidManifestValueError(
+                    f"preview.{field_name} refers to port {name!r}, which preview.ports does not declare"
+                )
+        elif kind == PREVIEW_COPY_PLACEHOLDER_KIND:
+            if name is None or name not in self.copies:
+                raise InvalidManifestValueError(
+                    f"preview.{field_name} refers to copy {name!r}, which preview.copies does not declare"
+                )
+        elif kind in PREVIEW_BARE_PLACEHOLDER_KINDS:
+            if name is not None:
+                raise InvalidManifestValueError(f"preview.{field_name}: {{{kind}}} takes no name, got {name!r}")
+        else:
+            raise InvalidManifestValueError(f"preview.{field_name} carries an unknown placeholder {{{kind}}}")
+
+
+def scaffold_env_prefix(name: AppName) -> str:
+    """The ``<PACKAGE_UPPER>`` prefix the build-app scaffold gives an app's env vars."""
+    return name.replace("-", "_").upper()
+
+
+def scaffold_preview_spec(name: AppName) -> PreviewSpec:
+    """The preview table an app gets by saying nothing: the build-app scaffold's convention.
+
+    The scaffold binds ``<PACKAGE_UPPER>_PORT`` and ``<PACKAGE_UPPER>_HOST`` and reads its
+    store from ``<PACKAGE_UPPER>_DATA_DIR``, so a scaffolded app previews by construction
+    over a scratch copy of its data.
+    """
+    prefix = scaffold_env_prefix(name)
+    return PreviewSpec(
+        env={
+            f"{prefix}_PORT": f"{{{PREVIEW_PORT_PLACEHOLDER_KIND}:{MAIN_PORT_NAME}}}",
+            f"{prefix}_HOST": "{host}",
+            f"{prefix}_DATA_DIR": f"{{{PREVIEW_COPY_PLACEHOLDER_KIND}:{PREVIEW_DATA_COPY_KEY}}}",
+        },
+        copies={PREVIEW_DATA_COPY_KEY: f"data/.apps/{name}"},
+    )
+
+
 class AppManifest(FrozenModel):
-    """An app's static declarations, read from its app.toml (contracts.md section 2)."""
+    """An app's static declarations, read from its app.toml (desktop-interface contracts.md section 2)."""
 
     name: AppName = Field(description="The registered app name")
     display_name: DisplayName = Field(description="What users see")
-    icon: IconPath | None = Field(default=None, description="The icon file, relative to the manifest; required unless internal")
-    instances: bool = Field(default=False, description="Whether the app serves the instances API")
-    instances_url: InstancesUrl | None = Field(default=None, description="Where the instances API is served when not at the app URL")
-    critical: bool = Field(default=False, description="No Stop verb; snapshot-and-rollback target in the update apply")
+    description: AppDescription | None = Field(
+        default=None,
+        description="One line saying what the app is for, shown wherever the app is described to an agent",
+    )
+    api_schema_path: LaunchPathValue | None = Field(
+        default=None,
+        description="The path under the app's origin that answers an OpenAPI document describing its HTTP API; "
+        "absent when the app describes none",
+    )
+    icon: IconPath | None = Field(
+        default=None, description="The icon file, relative to the manifest; required unless internal"
+    )
+    critical: bool = Field(
+        default=False,
+        description="No Quit verb; never stopped or parked by the shell; snapshot-and-rollback target in the "
+        "update apply",
+    )
+    stop_when_no_windows: bool = Field(
+        default=False,
+        description="Whether the shell may stop the app's program once no window on any desktop shows it "
+        "(docs/system/specs/stop-when-no-windows.md); a critical app never is",
+    )
+    uses_microphone: bool = Field(
+        default=False,
+        description="Whether the app's pages listen to the microphone; the shell delegates it to the frames of "
+        "an app that declares this, and to no other",
+    )
     priority: PriorityName = Field(default=DEFAULT_PRIORITY, description="The memory-shedding band name")
     program: ProgramName = Field(description="The supervisord program that runs the app (defaults to the name)")
     internal: bool = Field(default=False, description="Hidden from every open surface")
-    default_shortcut: DefaultShortcut | None = Field(default=None, description="The rail row a new project is seeded with")
-    actions: tuple[AppAction, ...] = Field(default=(), description="The declared create actions")
+    system: bool = Field(
+        default=False,
+        description="Part of the workspace itself rather than an app built on it: the minds Share tab lists it under "
+        "its System group instead of offering it up front",
+    )
+    default_shortcuts: tuple[DefaultShortcut, ...] = Field(
+        default=(),
+        validation_alias="default_shortcut",
+        description="The shortcuts a new desktop is seeded with, in order: the ``default_shortcut`` table, or an "
+        "array of them; none declared leaves the choice to the shell",
+    )
+    launch_paths: tuple[LaunchPath, ...] = Field(
+        default=(),
+        description="The paths the desktop interface opens windows at, with their labels and params",
+    )
     launcher_rank: int | None = Field(
         default=None,
         ge=1,
-        description="The app's place among the New Tab page's leading tiles (lower first); "
+        description="The app's place among the launcher's leading tiles (lower first); "
         "an app without one follows every ranked app",
     )
+    pin: Pin | None = Field(default=None, description="The app's pinned taskbar entry, when it declares one")
+    window_closed_path: LaunchPathValue | None = Field(
+        default=None,
+        description="The path under the app's origin the shell posts to when a window of the app closes; "
+        "an app whose resources live as long as their windows sweeps on it",
+    )
+    message_handlers: tuple[MessageHandler, ...] = Field(
+        default=(),
+        description="The messages the app takes, each posted by the shell to a route under the app's origin",
+    )
+    keybindings: tuple[KeybindingAction, ...] = Field(
+        default=(),
+        description="The actions a person may re-bind in the Keyboard shortcuts dialog, in display order",
+    )
     references: tuple[AppReference, ...] = Field(
-        default=(), description="The artifacts outside the app's directory that belong to it"
+        default=(),
+        description="The artifacts outside the app's directory that belong to it",
     )
-    scope: ScopeRules = Field(
-        default_factory=ScopeRules, description="The app's own exclusions from its footprint"
+    scope: ScopeRules = Field(default_factory=ScopeRules, description="The app's own exclusions from its footprint")
+    wiring: WiringRules = Field(default_factory=WiringRules, description="The extra supervisord programs the app owns")
+    secrets: tuple[SecretDeclaration, ...] = Field(
+        default=(),
+        description="The secret files the app runs under, for publish-template to aggregate",
     )
-    wiring: WiringRules = Field(
-        default_factory=WiringRules, description="The extra supervisord programs the app owns"
+    preview: PreviewSpec = Field(
+        description="How a throwaway instance boots for a preview (the scaffold convention by default)"
     )
-    handles: dict[str, Any] = Field(default_factory=dict, description="Reserved; must be absent or empty")
+    theming: AppTheming = Field(
+        default_factory=AppTheming,
+        description="How far the app takes part in workspace themes",
+    )
+    preview: PreviewSpec = Field(
+        description="How a throwaway instance boots for a preview (the scaffold convention by default)"
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -133,21 +582,38 @@ class AppManifest(FrozenModel):
             return {**data, "program": data["name"]}
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _default_preview_to_scaffold_convention(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "preview" not in data and isinstance(data.get("name"), str):
+            try:
+                name = AppName(data["name"])
+            except InvalidManifestValueError:
+                return data
+            return {**data, "preview": scaffold_preview_spec(name)}
+        return data
+
+    @field_validator("default_shortcuts", mode="before")
+    @classmethod
+    def _read_one_default_shortcut_as_a_list(cls, value: object) -> object:
+        listed = as_default_shortcut_list(value)
+        if isinstance(listed, list) and not listed:
+            raise InvalidManifestValueError("default_shortcut, when declared, names at least one shortcut")
+        return listed
+
     @model_validator(mode="after")
     def _check_cross_field_rules(self) -> Self:
         if self.icon is None and not self.internal:
             raise InvalidManifestValueError("icon is required unless internal = true")
-        if self.instances_url is not None and not self.instances:
-            raise InvalidManifestValueError("instances_url is only allowed with instances = true")
-        if self.actions and not self.instances:
-            raise InvalidManifestValueError("actions are only allowed with instances = true")
-        if self.handles:
-            raise InvalidManifestValueError("handles must be absent or empty in this release")
+        if self.critical and self.stop_when_no_windows:
+            raise InvalidManifestValueError("a critical app cannot declare stop_when_no_windows = true")
+        if self.api_schema_path is not None and self.description is None:
+            raise InvalidManifestValueError(
+                "an app that declares api_schema_path also declares description: the API document carries it"
+            )
         reference_paths = [reference.path for reference in self.references]
         if len(set(reference_paths)) != len(reference_paths):
-            raise InvalidManifestValueError(
-                f"reference paths must be unique, got {reference_paths}"
-            )
+            raise InvalidManifestValueError(f"reference paths must be unique, got {reference_paths}")
         wiring_programs = list(self.wiring.programs)
         if len(set(wiring_programs)) != len(wiring_programs):
             raise InvalidManifestValueError(f"wiring programs must be unique, got {wiring_programs}")
@@ -155,15 +621,31 @@ class AppManifest(FrozenModel):
             raise InvalidManifestValueError(
                 f"wiring programs must not repeat the app's own program {str(self.program)!r}"
             )
-        action_ids = [action.id for action in self.actions]
-        if len(set(action_ids)) != len(action_ids):
-            raise InvalidManifestValueError(f"action ids must be unique, got {action_ids}")
-        if self.default_shortcut is not None:
-            allowed_ids = set(action_ids) if self.instances else {OPEN_ACTION_ID}
-            if self.default_shortcut.action not in allowed_ids:
+        message_types = [handler.type for handler in self.message_handlers]
+        if len(set(message_types)) != len(message_types):
+            raise InvalidManifestValueError(f"message handler types must be unique, got {message_types}")
+        keybinding_ids = [action.id for action in self.keybindings]
+        if len(set(keybinding_ids)) != len(keybinding_ids):
+            raise InvalidManifestValueError(f"keybinding action ids must be unique, got {keybinding_ids}")
+        launch_path_ids = [launch_path.id for launch_path in self.launch_paths]
+        if len(set(launch_path_ids)) != len(launch_path_ids):
+            raise InvalidManifestValueError(f"launch path ids must be unique, got {launch_path_ids}")
+        if OPEN_LAUNCH_PATH_ID in launch_path_ids:
+            raise InvalidManifestValueError(
+                f"launch path id {str(OPEN_LAUNCH_PATH_ID)!r} is reserved for the synthesized root launch path"
+            )
+        secret_files = [secret.file for secret in self.secrets]
+        if len(set(secret_files)) != len(secret_files):
+            raise InvalidManifestValueError(f"secret files must be unique, got {secret_files}")
+        allowed_launch_ids = set(launch_path_ids) if launch_path_ids else {OPEN_LAUNCH_PATH_ID}
+        for shortcut in self.default_shortcuts:
+            if shortcut.launch not in allowed_launch_ids:
                 raise InvalidManifestValueError(
-                    f"default_shortcut.action {self.default_shortcut.action!r} is not one of {sorted(allowed_ids)}"
+                    f"default_shortcut.launch {shortcut.launch!r} is not one of {sorted(allowed_launch_ids)}"
                 )
+        shortcut_launch_ids = [shortcut.launch for shortcut in self.default_shortcuts]
+        if len(set(shortcut_launch_ids)) != len(shortcut_launch_ids):
+            raise InvalidManifestValueError(f"default_shortcut launches must be unique, got {shortcut_launch_ids}")
         return self
 
 
@@ -222,9 +704,7 @@ def _find_symlinked_component(repo_root: Path, reference_path: ReferencePath) ->
     return None
 
 
-def _check_references_against_repo_root(
-    path: Path, manifest: AppManifest, repo_root: Path
-) -> None:
+def _check_references_against_repo_root(path: Path, manifest: AppManifest, repo_root: Path) -> None:
     """Raises ManifestLoadError when a reference sits where it may not, or names nothing that exists."""
     own_app_directory = app_package_directory(repo_root, path)
     for reference in manifest.references:
@@ -263,7 +743,7 @@ def load_manifest(path: Path, *, repo_root: Path | None = None) -> AppManifest:
     """
     try:
         raw_text = path.read_text(encoding="utf-8")
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         raise ManifestLoadError(f"cannot read manifest {path}: {e}") from e
     try:
         data = tomllib.loads(raw_text)
@@ -286,4 +766,3 @@ def manifest_icon_path(manifest_path: Path, manifest: AppManifest) -> Path | Non
     if manifest.icon is None:
         return None
     return manifest_path.parent / manifest.icon
-

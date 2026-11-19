@@ -1,0 +1,669 @@
+/**
+ * A fake shell for the store and page tests: the desktop routes over in-memory desktops and
+ * layouts (with the shell's stamp rule, so a stale save is refused), and a socket whose events a
+ * test delivers by hand. Every call is recorded so a test can assert what reached the shell.
+ */
+
+import type { DesktopApi } from "../store/DesktopStore";
+import type {
+  LaunchOutcome,
+  LaunchRequest,
+  PageShowOutcome,
+  PageShowRequest,
+  PlacementsSaveRequest,
+  WindowOpenOutcome,
+  WindowOpenRequest,
+} from "../model/api";
+import { StalePlacementsSaveError } from "../model/api";
+import type {
+  AppRecord,
+  AvatarCatalog,
+  ClientArrival,
+  ClientRecord,
+  Desktop,
+  DesktopShortcut,
+  EntryPresentation,
+  GridCell,
+  Inventory,
+  Layout,
+  MessageDelivery,
+  MessageRelay,
+  OwnerLayout,
+  StoredWindowPath,
+  Viewport,
+  Wallpaper,
+  WindowRecord,
+} from "../model/records";
+import {
+  placementOf,
+  withWindowMinimized,
+  withWindowPlacedOnOpen,
+  withWindowRaised,
+  withWindowState,
+  withoutPlacement,
+} from "../geometry/stack";
+import { SHOWN_HOME } from "../model/records";
+import { withShownRecorded } from "../reducers/desktopState";
+import type { ClientStateReport, DesktopSocket, SocketHandlers } from "../store/socket";
+import { clientRecord } from "./records";
+import { EMPTY_THEME_CATALOG, type ThemeCatalog } from "../model/themes";
+
+/** The frame the shell answers for a pinned window a client has never placed (the shell's own constant). */
+export const PINNED_WINDOW_FRAME = { x: 0.05, y: 0.05, width: 0.9, height: 0.9 };
+
+export class FakeDesktopApi implements DesktopApi {
+  desktops: Desktop[] = [];
+  /** The apps the inventory answers; the socket's ``apps_updated`` is delivered by hand. */
+  apps: AppRecord[] = [];
+  clients: ClientRecord[] = [];
+  /** Whose desktops a create makes and the order route moves: the shell reads the requester's identity; the fake
+   *  is told (null for the workspace owner's). */
+  participant: string | null = null;
+  workspaceName = "Test workspace";
+  /** What the next arrival answers beyond the client's recorded desktop: a desktop seeded for the user (added to
+   *  the desktops as the shell would), and the name of the one it replaced. */
+  arrival: Pick<ClientArrival, "created_desktop" | "replaced_desktop_name"> = {
+    created_desktop: null,
+    replaced_desktop_name: null,
+  };
+  /** ``<desktop>/<client>`` -> the stored placements and their stamp. */
+  readonly layouts = new Map<string, Pick<Layout, "updated_at" | "placements">>();
+  /** ``<client>/<window>`` -> the client's own path and title for an independent window. */
+  readonly windowPaths = new Map<string, StoredWindowPath>();
+  readonly calls: string[] = [];
+  /** Every message relayed, from the Imbue Studio chrome or an app's page, with its sender, in order. */
+  readonly relayedMessages: {
+    type: string;
+    clientId: string;
+    payload: Readonly<Record<string, unknown>>;
+    sender: string;
+  }[] = [];
+  /** What the relay answers each app did with a message it took. */
+  relayDeliveries: MessageDelivery[] = [];
+  /** What every window open answers of whether the client has only pop-outs open. */
+  hasNoDesktopWindow = false;
+  /** A refusal every route raises while set. */
+  refusal: string | null = null;
+  /** The page a POST launch path answers (as the app would); a GET launch path's page is built from its path. */
+  postLaunchAnswer = "/launched";
+  /** While set, the inventory, the client records, a layout, and the avatar and theme catalogs answer only once
+   *  this settles: a test holds those reads open. */
+  readGate: Promise<void> | null = null;
+
+  /** Hold the reads open until the answered function is called. */
+  holdReads(): () => void {
+    let answer: () => void = () => undefined;
+    this.readGate = new Promise((resolve) => {
+      answer = resolve;
+    });
+    return answer;
+  }
+  /** While set, a placements save is recorded at once but answers only once this settles: a test holds a save
+   *  open to see what happens before it lands. */
+  writeGate: Promise<void> | null = null;
+
+  /** Hold the saves open until the answered function is called. */
+  holdWrites(): () => void {
+    let answer: () => void = () => undefined;
+    this.writeGate = new Promise((resolve) => {
+      answer = resolve;
+    });
+    return answer;
+  }
+  avatars: AvatarCatalog = {
+    designs: [
+      { id: "gummy-seal", label: "Gummy seal", source_path: null },
+      { id: "jelly-cat", label: "Jelly cat", source_path: null },
+    ],
+    selected: "gummy-seal",
+    default: "gummy-seal",
+  };
+  private stampCounter = 0;
+  private windowCounter = 0;
+
+  private refuse(): void {
+    if (this.refusal !== null) throw new Error(this.refusal);
+  }
+
+  private stamp(): string {
+    this.stampCounter += 1;
+    return `2026-09-19T00:00:${String(this.stampCounter).padStart(2, "0")}Z`;
+  }
+
+  private desktop(desktopId: string): Desktop {
+    const desktop = this.desktops.find((candidate) => candidate.id === desktopId);
+    if (desktop === undefined) throw new Error(`No desktop ${desktopId}`);
+    return desktop;
+  }
+
+  private replace(desktop: Desktop): Desktop {
+    this.desktops = this.desktops.map((candidate) => (candidate.id === desktop.id ? desktop : candidate));
+    return desktop;
+  }
+
+  /** The client's stored layout of the desktop, with its paths for the desktop's independent windows, and, as the
+   *  shell answers it, every pinned window the client never placed at the pinned frame, minimized, below the stack. */
+  layoutOf(desktopId: string, clientId: string): Layout {
+    const stored = this.layouts.get(`${desktopId}/${clientId}`) ?? { updated_at: null, placements: [] };
+    const windows = this.desktops.find((desktop) => desktop.id === desktopId)?.windows ?? [];
+    const window_paths: Record<string, StoredWindowPath> = {};
+    for (const window of windows) {
+      const path = this.windowPaths.get(`${clientId}/${window.id}`);
+      if (window.scope === "independent" && path !== undefined) window_paths[window.id] = path;
+    }
+    const placed = new Set(stored.placements.map((placement) => placement.window_id));
+    const pinned = windows
+      .filter((window) => window.is_pinned && !placed.has(window.id))
+      .map((window) => ({
+        window_id: window.id,
+        frame: PINNED_WINDOW_FRAME,
+        state: "NORMAL" as const,
+        is_minimized: true,
+        is_detached: false,
+      }));
+    return { ...stored, placements: [...pinned, ...stored.placements], window_paths };
+  }
+
+  writeLayout(desktopId: string, clientId: string, layout: Pick<Layout, "updated_at" | "placements">): Layout {
+    const stamped = { ...layout, updated_at: this.stamp() };
+    this.layouts.set(`${desktopId}/${clientId}`, stamped);
+    return this.layoutOf(desktopId, clientId);
+  }
+
+  async fetchInventory(): Promise<Inventory> {
+    this.calls.push("fetchInventory");
+    this.refuse();
+    if (this.readGate !== null) await this.readGate;
+    return {
+      desktops: [...this.desktops],
+      apps: [...this.apps],
+      clients: [...this.clients],
+      workspace_name: this.workspaceName,
+    };
+  }
+
+  async createDesktop(name: string): Promise<Desktop> {
+    this.calls.push(`createDesktop:${name}`);
+    this.refuse();
+    const created: Desktop = {
+      id: name.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+      name,
+      color: "#2f6b4f",
+      glyph: 0,
+      wallpaper: null,
+      theme: null,
+      shortcuts: [],
+      windows: [],
+      owner: this.participant,
+    };
+    this.desktops = [...this.desktops, created];
+    return created;
+  }
+
+  async renameDesktop(desktopId: string, name: string): Promise<Desktop> {
+    this.calls.push(`renameDesktop:${desktopId}:${name}`);
+    this.refuse();
+    return this.replace({ ...this.desktop(desktopId), name });
+  }
+
+  /** As the shell does: the requester's own desktops take the order given in the places their desktops held;
+   *  an order that is not exactly their own is refused. */
+  async reorderDesktops(desktopIds: readonly string[]): Promise<Desktop[]> {
+    this.calls.push(`reorderDesktops:${desktopIds.join(",")}`);
+    this.refuse();
+    const own = this.desktops.filter((desktop) => desktop.owner === this.participant);
+    const ownIds = own.map((desktop) => desktop.id);
+    if (
+      [...desktopIds].sort().join() !== [...ownIds].sort().join() ||
+      new Set(desktopIds).size !== desktopIds.length
+    ) {
+      throw new Error(`The order must name each of your desktops once (${ownIds.join(", ")})`);
+    }
+    const ordered = desktopIds.map((desktopId) => this.desktop(desktopId));
+    let next = 0;
+    this.desktops = this.desktops.map((desktop) => (desktop.owner === this.participant ? ordered[next++] : desktop));
+    return [...this.desktops];
+  }
+
+  async setDesktopTheme(desktopId: string, theme: string | null): Promise<Desktop> {
+    this.calls.push(`setDesktopTheme:${desktopId}:${theme ?? "null"}`);
+    this.refuse();
+    return this.replace({ ...this.desktop(desktopId), theme });
+  }
+
+  /** The workspace's themes, as a test sets them. */
+  themeCatalog: ThemeCatalog = EMPTY_THEME_CATALOG;
+  /** How many of the next theme catalog reads fail. */
+  themeReadFailures = 0;
+
+  async fetchThemes(): Promise<ThemeCatalog> {
+    this.calls.push("fetchThemes");
+    if (this.themeReadFailures > 0) {
+      this.themeReadFailures -= 1;
+      throw new Error("the themes could not be read");
+    }
+    if (this.readGate !== null) await this.readGate;
+    return this.themeCatalog;
+  }
+
+  async setDefaultTheme(theme: string | null): Promise<void> {
+    this.calls.push(`setDefaultTheme:${theme ?? "null"}`);
+    this.refuse();
+    this.themeCatalog = { ...this.themeCatalog, default: theme };
+  }
+
+  async setAppTheming(app: string, isOn: boolean): Promise<void> {
+    this.calls.push(`setAppTheming:${app}:${isOn ? "on" : "off"}`);
+    this.refuse();
+  }
+
+  async setDesktopWallpaper(desktopId: string, wallpaper: Wallpaper | null): Promise<Desktop> {
+    this.calls.push(`setDesktopWallpaper:${desktopId}:${wallpaper?.name ?? "null"}`);
+    this.refuse();
+    return this.replace({ ...this.desktop(desktopId), wallpaper });
+  }
+
+  async deleteDesktop(desktopId: string): Promise<string> {
+    this.calls.push(`deleteDesktop:${desktopId}`);
+    this.refuse();
+    this.desktop(desktopId);
+    // The shell's own refusal: the last desktop stays.
+    if (this.desktops.length === 1) throw new Error("the last desktop cannot be deleted");
+    this.desktops = this.desktops.filter((candidate) => candidate.id !== desktopId);
+    return this.desktops[0].id;
+  }
+
+  async setDesktopShortcut(desktopId: string, shortcut: DesktopShortcut): Promise<Desktop> {
+    this.calls.push(
+      `setDesktopShortcut:${desktopId}:${shortcut.target.app}:${shortcut.target.launch}:${shortcut.cell.column},${shortcut.cell.row}`,
+    );
+    this.refuse();
+    const desktop = this.desktop(desktopId);
+    const others = desktop.shortcuts.filter(
+      (candidate) =>
+        candidate.target.app !== shortcut.target.app || candidate.target.launch !== shortcut.target.launch,
+    );
+    return this.replace({ ...desktop, shortcuts: [...others, shortcut] });
+  }
+
+  async moveDesktopShortcut(desktopId: string, app: string, launch: string, cell: GridCell): Promise<Desktop> {
+    this.calls.push(`moveDesktopShortcut:${desktopId}:${app}:${launch}:${cell.column},${cell.row}`);
+    this.refuse();
+    const desktop = this.desktop(desktopId);
+    return this.replace({
+      ...desktop,
+      shortcuts: desktop.shortcuts.map((candidate) =>
+        candidate.target.app === app && candidate.target.launch === launch ? { ...candidate, cell } : candidate,
+      ),
+    });
+  }
+
+  async removeDesktopShortcut(desktopId: string, app: string, launch: string): Promise<Desktop> {
+    this.calls.push(`removeDesktopShortcut:${desktopId}:${app}:${launch}`);
+    this.refuse();
+    const desktop = this.desktop(desktopId);
+    return this.replace({
+      ...desktop,
+      shortcuts: desktop.shortcuts.filter(
+        (candidate) => candidate.target.app !== app || candidate.target.launch !== launch,
+      ),
+    });
+  }
+
+  async openWindow(desktopId: string, request: WindowOpenRequest): Promise<WindowOpenOutcome> {
+    this.calls.push(
+      `openWindow:${desktopId}:${request.app}:${request.path}:${request.ifPresent}` +
+        (request.isMinimized ? ":minimized" : ""),
+    );
+    this.refuse();
+    const desktop = this.desktop(desktopId);
+    const existing = desktop.windows.find(
+      (candidate) => candidate.app === request.app && candidate.path === request.path,
+    );
+    if (request.ifPresent === "focus" && existing !== undefined) {
+      this.writeLayout(
+        desktopId,
+        request.clientId,
+        withWindowRaised(this.layoutOf(desktopId, request.clientId), existing.id),
+      );
+      return { window: existing, isNew: false, hasNoDesktopWindow: this.hasNoDesktopWindow && !request.isMinimized };
+    }
+    this.windowCounter += 1;
+    const window: WindowRecord = {
+      id: `win-${String(this.windowCounter).padStart(16, "0")}`,
+      app: request.app,
+      path: request.path,
+      title: "",
+      opened_at: this.stamp(),
+      is_pinned: false,
+      scope: "linked",
+    };
+    this.replace({ ...desktop, windows: [...desktop.windows, window] });
+    const placed = withWindowPlacedOnOpen(this.layoutOf(desktopId, request.clientId), window.id);
+    this.writeLayout(
+      desktopId,
+      request.clientId,
+      request.isMinimized ? withWindowMinimized(placed, window.id) : placed,
+    );
+    return { window, isNew: true, hasNoDesktopWindow: this.hasNoDesktopWindow && !request.isMinimized };
+  }
+
+  /** As the shell does: a GET launch path's page is its path with the presets and params as the query, a POST one's
+   *  is ``postLaunchAnswer``; then an open (``new``, ``focus``) or a location write (``window``). */
+  async launch(desktopId: string, request: LaunchRequest): Promise<LaunchOutcome> {
+    const targetSpelling =
+      request.target.kind === "window"
+        ? `window:${request.target.windowId}` + (request.target.sendsWindowPath === false ? ":without-page" : "")
+        : request.target.kind === "show" && request.target.besideWindowId !== undefined
+          ? `show:beside:${request.target.besideWindowId}`
+          : request.target.kind;
+    this.calls.push(
+      `launch:${desktopId}:${request.app}:${request.launch}:${JSON.stringify(request.params)}:${targetSpelling}` +
+        (request.isMinimized ? ":minimized" : ""),
+    );
+    this.refuse();
+    const app = this.apps.find((candidate) => candidate.name === request.app);
+    const launchPath = app?.launch_paths.find((candidate) => candidate.id === request.launch);
+    if (app === undefined || launchPath === undefined) {
+      throw new Error(`App '${request.app}' declares no launch path '${request.launch}'`);
+    }
+    let path = this.postLaunchAnswer;
+    if (launchPath.method === "GET") {
+      const query = new URLSearchParams({ ...launchPath.presets, ...request.params }).toString();
+      path = query === "" ? launchPath.path : `${launchPath.path}?${query}`;
+    }
+    const target = request.target;
+    if (target.kind === "window") {
+      const desktop = this.desktop(desktopId);
+      const window = desktop.windows.find((candidate) => candidate.id === target.windowId);
+      if (window === undefined) throw new Error(`No window ${target.windowId}`);
+      // As the shell does (a 400): the launch lands only in a window of its own app.
+      if (window.app !== request.app) throw new Error(`Window ${target.windowId} is not a window of ${request.app}`);
+      const title =
+        window.scope === "independent"
+          ? (this.windowPaths.get(`${request.clientId}/${window.id}`)?.title ?? "")
+          : window.title;
+      const navigated = await this.reportWindowLocation(desktopId, window.id, request.clientId, path, title);
+      return { window: navigated, path, isNew: false };
+    }
+    if (target.kind === "show") return this.showLaunched(desktopId, request, path, target.besideWindowId);
+    const opened = await this.openWindow(desktopId, {
+      app: request.app,
+      path,
+      clientId: request.clientId,
+      ifPresent: target.kind,
+      isMinimized: request.isMinimized,
+    });
+    return { window: opened.window, path, isNew: opened.isNew };
+  }
+
+  /** Records the ask; which window the shell chooses is the shell's own tests' to check. */
+  async showPage(clientId: string, request: PageShowRequest): Promise<PageShowOutcome> {
+    this.calls.push(`showPage:${clientId}:${request.app}:${request.path}:${request.repoint.join(",")}`);
+    this.refuse();
+    return { hasNoDesktopWindow: this.hasNoDesktopWindow };
+  }
+
+  /** The show rule as the shell's ``show`` launch target applies it: a window of the app already at the path is
+   *  raised, else the app's pinned window is pointed at it for this client, else a window is opened; then, beside a
+   *  window other than the shown one, neither of them pulled out, the two are snapped to the halves (the shown one on
+   *  the half its centre is on, the right when it is minimized or never placed), the shown one on top. */
+  private async showLaunched(
+    desktopId: string,
+    request: LaunchRequest,
+    path: string,
+    besideWindowId: string | undefined,
+  ): Promise<LaunchOutcome> {
+    const desktop = this.desktop(desktopId);
+    const already = desktop.windows.find((candidate) => candidate.app === request.app && candidate.path === path);
+    const pinned = desktop.windows.find((candidate) => candidate.app === request.app && candidate.is_pinned);
+    let shown: WindowRecord;
+    let isNew = false;
+    if (already === undefined && pinned !== undefined) {
+      shown = await this.reportWindowLocation(desktopId, pinned.id, request.clientId, path, "");
+      this.writeLayout(
+        desktopId,
+        request.clientId,
+        withWindowRaised(this.layoutOf(desktopId, request.clientId), pinned.id),
+      );
+    } else {
+      const opened = await this.openWindow(desktopId, {
+        app: request.app,
+        path,
+        clientId: request.clientId,
+        ifPresent: "focus",
+        isMinimized: request.isMinimized,
+      });
+      shown = opened.window;
+      isNew = opened.isNew;
+    }
+    const layout = this.layoutOf(desktopId, request.clientId);
+    const placement = placementOf(layout, shown.id);
+    if (
+      besideWindowId !== undefined &&
+      besideWindowId !== shown.id &&
+      !placement.is_detached &&
+      !placementOf(layout, besideWindowId).is_detached
+    ) {
+      const isPlaced = layout.placements.some((candidate) => candidate.window_id === shown.id);
+      const isRight = !isPlaced || placement.is_minimized || placement.frame.x + placement.frame.width / 2 >= 0.5;
+      const beside = withWindowState(layout, besideWindowId, isRight ? "SNAPPED_LEFT" : "SNAPPED_RIGHT");
+      this.writeLayout(
+        desktopId,
+        request.clientId,
+        withWindowState(beside, shown.id, isRight ? "SNAPPED_RIGHT" : "SNAPPED_LEFT"),
+      );
+    }
+    return { window: shown, path, isNew };
+  }
+
+  async closeWindow(desktopId: string, windowId: string): Promise<void> {
+    this.calls.push(`closeWindow:${desktopId}:${windowId}`);
+    this.refuse();
+    const desktop = this.desktop(desktopId);
+    // As the shell does (a 409): a pinned window is never closed.
+    if (desktop.windows.some((candidate) => candidate.id === windowId && candidate.is_pinned)) {
+      throw new Error(`Window ${windowId} is pinned and cannot be closed; minimize it instead`);
+    }
+    this.replace({ ...desktop, windows: desktop.windows.filter((candidate) => candidate.id !== windowId) });
+    // As the shell does: the window leaves every client's layout of the desktop, each rewrite stamped.
+    for (const [key, layout] of [...this.layouts]) {
+      const [layoutDesktopId, clientId] = key.split("/");
+      const before = { ...layout, window_paths: {} };
+      const dropped = withoutPlacement(before, windowId);
+      if (layoutDesktopId === desktopId && dropped !== before) this.writeLayout(desktopId, clientId, dropped);
+    }
+  }
+
+  async reportWindowLocation(
+    desktopId: string,
+    windowId: string,
+    clientId: string,
+    path: string,
+    title: string,
+  ): Promise<WindowRecord> {
+    this.calls.push(`reportWindowLocation:${desktopId}:${windowId}:${clientId}:${path}:${title}`);
+    this.refuse();
+    const desktop = this.desktop(desktopId);
+    const window = desktop.windows.find((candidate) => candidate.id === windowId);
+    if (window === undefined) throw new Error(`No window ${windowId}`);
+    // As the shell does: an independent window's report is the reporting client's alone; the record keeps its home path.
+    if (window.scope === "independent") {
+      this.windowPaths.set(`${clientId}/${windowId}`, { path, title });
+      return { ...window, path, title };
+    }
+    const updated = { ...window, path, title };
+    this.replace({
+      ...desktop,
+      windows: desktop.windows.map((candidate) => (candidate.id === windowId ? updated : candidate)),
+    });
+    return updated;
+  }
+
+  async fetchPlacements(desktopId: string, clientId: string): Promise<Layout> {
+    this.calls.push(`fetchPlacements:${desktopId}`);
+    this.refuse();
+    if (this.readGate !== null) await this.readGate;
+    return this.layoutOf(desktopId, clientId);
+  }
+
+  /** The client whose layout the owner view answers (``?of=owner``); a client with none stored answers defaults. */
+  ownerLayoutClientId = "owner-client";
+
+  /** The backdrop size the owner-layout read answers beside the layout: what the owner's client reported. */
+  ownerViewport: Viewport | null = null;
+
+  async fetchOwnerPlacements(desktopId: string): Promise<OwnerLayout> {
+    this.calls.push(`fetchOwnerPlacements:${desktopId}`);
+    this.refuse();
+    if (this.readGate !== null) await this.readGate;
+    return { layout: this.layoutOf(desktopId, this.ownerLayoutClientId), viewport: this.ownerViewport };
+  }
+
+  async savePlacements(desktopId: string, request: PlacementsSaveRequest): Promise<string | null> {
+    this.calls.push(`savePlacements:${desktopId}:${request.saveId}`);
+    if (this.writeGate !== null) await this.writeGate;
+    this.refuse();
+    const stored = this.layouts.get(`${desktopId}/${request.clientId}`);
+    if (
+      stored !== undefined &&
+      stored.updated_at !== null &&
+      (request.baseUpdatedAt === null || stored.updated_at > request.baseUpdatedAt)
+    ) {
+      throw new StalePlacementsSaveError("the stored layout is newer than the one this save was based on");
+    }
+    return this.writeLayout(desktopId, request.clientId, { updated_at: null, placements: request.placements })
+      .updated_at;
+  }
+
+  async arriveClient(clientId: string): Promise<ClientArrival> {
+    this.calls.push(`arriveClient:${clientId}`);
+    this.refuse();
+    const created = this.arrival.created_desktop;
+    if (created !== null && !this.desktops.some((desktop) => desktop.id === created.id)) {
+      this.desktops = [...this.desktops, created];
+    }
+    const recorded = this.clients.find((client) => client.id === clientId)?.active_desktop ?? null;
+    return {
+      desktop_id: created?.id ?? recorded ?? this.desktops[0]?.id ?? null,
+      created_desktop: created,
+      replaced_desktop_name: this.arrival.replaced_desktop_name,
+    };
+  }
+
+  /** As the shell does: the entry goes to the end of the client's history, and a window no desktop holds is
+   *  refused. */
+  async recordShown(clientId: string, windowId: string | null): Promise<ClientRecord> {
+    this.calls.push(`recordShown:${clientId}:${windowId ?? SHOWN_HOME}`);
+    this.refuse();
+    if (
+      windowId !== null &&
+      !this.desktops.some((desktop) => desktop.windows.some((window) => window.id === windowId))
+    ) {
+      throw new Error(`No window ${windowId}`);
+    }
+    const existing = this.clients.find((client) => client.id === clientId) ?? clientRecord(clientId);
+    const recorded = { ...existing, shown_history: withShownRecorded(existing.shown_history, windowId ?? SHOWN_HOME) };
+    this.clients = [...this.clients.filter((client) => client.id !== clientId), recorded];
+    return recorded;
+  }
+
+  /** The backdrop size each client last reported, by client id. */
+  readonly viewports = new Map<string, Viewport>();
+
+  /** As the shell does: the size goes on the client's record; a client the listing does not carry is only noted. */
+  async reportViewport(clientId: string, viewport: Viewport): Promise<ClientRecord> {
+    this.calls.push(`reportViewport:${clientId}:${viewport.width}x${viewport.height}`);
+    this.refuse();
+    this.viewports.set(clientId, viewport);
+    const existing = this.clients.find((client) => client.id === clientId);
+    const recorded = { ...(existing ?? clientRecord(clientId)), viewport };
+    if (existing !== undefined)
+      this.clients = this.clients.map((client) => (client.id === clientId ? recorded : client));
+    return recorded;
+  }
+
+  async fetchClients(): Promise<ClientRecord[]> {
+    this.calls.push("fetchClients");
+    this.refuse();
+    if (this.readGate !== null) await this.readGate;
+    return [...this.clients];
+  }
+
+  async quitApp(appName: string): Promise<void> {
+    this.calls.push(`quitApp:${appName}`);
+    this.refuse();
+  }
+
+  async setEntryPresentation(clientId: string, app: string, presentation: EntryPresentation): Promise<ClientRecord> {
+    const position = presentation.position === null ? "-" : `${presentation.position.x},${presentation.position.y}`;
+    this.calls.push(`setEntryPresentation:${clientId}:${app}:${presentation.mode}:${presentation.style}:${position}`);
+    this.refuse();
+    const existing = this.clients.find((client) => client.id === clientId) ?? clientRecord(clientId);
+    const updated = { ...existing, entries: { ...existing.entries, [app]: presentation } };
+    this.clients = [...this.clients.filter((client) => client.id !== clientId), updated];
+    return updated;
+  }
+
+  async fetchAvatars(): Promise<AvatarCatalog> {
+    this.calls.push("fetchAvatars");
+    this.refuse();
+    if (this.readGate !== null) await this.readGate;
+    return this.avatars;
+  }
+
+  async selectAvatar(design: string): Promise<void> {
+    this.calls.push(`selectAvatar:${design}`);
+    this.refuse();
+    if (!this.avatars.designs.some((candidate) => candidate.id === design)) throw new Error(`No design ${design}`);
+    this.avatars = { ...this.avatars, selected: design };
+  }
+
+  async relayEmbedderMessage(
+    type: string,
+    clientId: string,
+    payload: Readonly<Record<string, unknown>>,
+    sender: string,
+  ): Promise<MessageRelay> {
+    this.calls.push(`relayEmbedderMessage:${type}:${clientId}:${sender}`);
+    this.refuse();
+    this.relayedMessages.push({ type, clientId, payload, sender });
+    return { deliveries: this.relayDeliveries };
+  }
+}
+
+export class FakeDesktopSocket implements DesktopSocket {
+  handlers: SocketHandlers | null = null;
+  readonly reports: ClientStateReport[] = [];
+  /** How many times the store registered the socket as a pop-out's. */
+  popOutReports = 0;
+
+  connect(handlers: SocketHandlers): void {
+    this.handlers = handlers;
+  }
+
+  reportClientState(report: ClientStateReport): void {
+    this.reports.push(report);
+  }
+
+  reportPopOut(): void {
+    this.popOutReports += 1;
+  }
+
+  /** The handlers the store registered; a test delivers events through them. */
+  deliver(): SocketHandlers {
+    if (this.handlers === null) throw new Error("the store has not connected");
+    return this.handlers;
+  }
+}
+
+/** Offer ``apps`` as the shell's inventory would: to the store over the socket, and to the fake shell itself. */
+export function offerApps(api: FakeDesktopApi, socket: FakeDesktopSocket, apps: AppRecord[]): void {
+  api.apps = apps;
+  socket.deliver().onAppsUpdated(apps);
+}
+
+/** Resolve every promise queued so far (the store's awaits run in microtasks). */
+export async function settle(): Promise<void> {
+  for (let round = 0; round < 10; round += 1) await Promise.resolve();
+}

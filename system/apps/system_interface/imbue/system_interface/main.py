@@ -1,21 +1,38 @@
 import argparse
 import atexit
+import os
 import signal
 from collections.abc import Sequence
 from pathlib import Path
 from types import FrameType
 
-from app_manifest.registry import registry_path
+from app_manifest.registry_location import registry_path
 from flask import Flask
+from loguru import logger
+from share_grants.agent_grants import AGENT_LAST_SEEN_FILE
 
+from imbue.system_interface.app_announcements import AppAnnouncementWriter
+from imbue.system_interface.app_announcements import announcements_path_from_environment
 from imbue.system_interface.app_context import SystemInterfaceState
 from imbue.system_interface.app_context import get_state
 from imbue.system_interface.config import Config
 from imbue.system_interface.config import load_config
+from imbue.system_interface.presence import DEFAULT_PRESENCE_DIRECTORY
+from imbue.system_interface.presence import PresenceStore
+from imbue.system_interface.presence import build_presence_sweep
+from imbue.system_interface.presence import utc_now
+from imbue.system_interface.profiles import DEFAULT_SHARE_ENV_PATH
+from imbue.system_interface.profiles import PROFILES_DIRECTORY_NAME
+from imbue.system_interface.profiles import ProfileResolver
+from imbue.system_interface.roster import RosterSource
+from imbue.system_interface.roster import RosterWatch
+from imbue.system_interface.roster import build_roster_announcer
 from imbue.system_interface.server import create_application
+from imbue.system_interface.shell.resource_gauge import GatewayResourceNotifier
 from imbue.system_interface.shell.state import build_shell_state
 from imbue.system_interface.shell.state_files import DEFAULT_STATE_DIRECTORY
-from imbue.system_interface.template_catalog import build_template_catalog_store
+from imbue.system_interface.update_staleness import WORKSPACE_ROOT_DIRECTORY
+from imbue.system_interface.workspace_name import workspace_name_source
 from imbue.system_interface.ws_broadcaster import WebSocketBroadcaster
 from imbue.system_interface.wsgi import make_threaded_server
 
@@ -23,7 +40,7 @@ from imbue.system_interface.wsgi import make_threaded_server
 def _exit_on_signal(signum: int, frame: FrameType | None) -> None:
     """Turn SIGTERM/SIGINT into a clean exit so the ``atexit`` teardown runs.
 
-    The shutdown itself (broadcaster, the inventory, the relay's http client) is registered
+    The shutdown itself (the broadcaster, and the shell's inventory and lifecycle manager) is registered
     via ``atexit`` in ``main``; raising ``SystemExit`` here ensures that interpreter-exit
     path runs instead of the default abrupt termination.
     """
@@ -36,32 +53,104 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--state-dir",
         type=Path,
         default=DEFAULT_STATE_DIRECTORY,
-        help="Where the shell keeps its projects, layouts, and client records (contracts.md section 7)",
+        help="Where the shell keeps its desktops, placements, and client records (desktop contracts.md section 4)",
+    )
+    parser.add_argument(
+        "--presence-dir",
+        type=Path,
+        default=DEFAULT_PRESENCE_DIRECTORY,
+        help="Where the shell keeps the per-user presence files and the profile cache",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help=(
+            "Boot as a preview of a proposed change: the real desktop over the state directory it is "
+            "given (a seeded copy) and the registry MINDS_APPS_FILE names, refusing only the verbs that "
+            "would reach the live workspace (an app's stop and start, the update notice's)"
+        ),
     )
     return parser.parse_args(argv)
 
 
-def build_production_state(config: Config, state_directory: Path) -> SystemInterfaceState:
+def build_production_state(
+    config: Config, state_directory: Path, presence_directory: Path, is_preview: bool = False
+) -> SystemInterfaceState:
     """Construct the real object graph -- the composition root.
 
     This is the single place the production collaborators are wired together. It builds but
     does not start the shell (``main`` does that once the app is assembled), so it watches
     nothing and fetches nothing by itself. Tests build a state via ``testing.build_test_state``.
     """
+    broadcaster = WebSocketBroadcaster()
+    profiles = ProfileResolver(
+        cache_directory=presence_directory / PROFILES_DIRECTORY_NAME, share_env_path=DEFAULT_SHARE_ENV_PATH
+    )
+    presence = PresenceStore(directory=presence_directory)
+    app_announcement_writer = None if is_preview else build_app_announcement_writer()
+    shell = build_shell_state(
+        state_directory=state_directory,
+        registry_path=registry_path(),
+        broadcaster=broadcaster,
+        profiles=profiles,
+        on_registry_read=app_announcement_writer.announce if app_announcement_writer is not None else None,
+        is_lifecycle_enabled=not is_preview,
+        resource_notifier=None if is_preview else GatewayResourceNotifier(environ=dict(os.environ)),
+    )
+    workspace_name = workspace_name_source(config.system_interface_workspace_name, os.environ)
+    roster = RosterSource(
+        presence=presence,
+        profiles=profiles,
+        users=shell.users,
+        share_grants=shell.share_grants,
+        share_identities=shell.share_identities,
+        agent_grants=shell.agent_grants,
+        agent_last_seen_path=WORKSPACE_ROOT_DIRECTORY / AGENT_LAST_SEEN_FILE,
+        workspace_name=workspace_name,
+        avatar_selection=shell.avatar_selection,
+    )
+    roster_announcer = build_roster_announcer(roster, broadcaster, utc_now)
+    presence_sweep = build_presence_sweep(presence, profiles, broadcaster, roster_announcer.announce)
+    profiles.add_refresh_listener(presence_sweep.announce_connected)
     return SystemInterfaceState(
         config=config,
-        shell=build_shell_state(
-            state_directory=state_directory, registry_path=registry_path(), broadcaster=WebSocketBroadcaster()
+        shell=shell,
+        presence=presence,
+        presence_sweep=presence_sweep,
+        profiles=profiles,
+        roster=roster,
+        roster_announcer=roster_announcer,
+        roster_watch=RosterWatch(
+            watched_paths=(
+                shell.share_grants.share_grants_path,
+                shell.share_identities.share_identities_path,
+                shell.agent_grants.agent_grants_path,
+                roster.agent_last_seen_path,
+            ),
+            announce=roster_announcer.announce,
         ),
-        template_catalog=build_template_catalog_store(
-            catalog_url=config.system_interface_template_catalog_url, state_directory=state_directory
-        ),
+        workspace_name=workspace_name,
+        is_preview=is_preview,
     )
+
+
+def build_app_announcement_writer() -> AppAnnouncementWriter | None:
+    """The writer of the services event stream the minds desktop discovers apps from, or None (warned once)
+    outside a workspace, where no agent state directory names the stream."""
+    events_path = announcements_path_from_environment()
+    if events_path is None:
+        logger.warning("MNGR_AGENT_STATE_DIR is not set; app registrations will not be announced to minds")
+        return None
+    return AppAnnouncementWriter(events_path=events_path)
 
 
 def build_application(config: Config, args: argparse.Namespace) -> Flask:
     """Build the Flask app from parsed CLI args: the state over the state directory, and the routes over it."""
-    return create_application(build_production_state(config, state_directory=args.state_dir))
+    return create_application(
+        build_production_state(
+            config, state_directory=args.state_dir, presence_directory=args.presence_dir, is_preview=args.preview
+        )
+    )
 
 
 def main() -> None:
@@ -72,14 +161,18 @@ def main() -> None:
     with application.app_context():
         state = get_state()
 
-    # Start the shell now that the app is assembled: the registry watch, the liveness sweep,
-    # and the instance fetches. This is the one place it is started; ``build_application``
-    # only constructs, so tests that build an app never start it.
+    # Start the shell now that the app is assembled: the stale-client prune, the registry
+    # watch, the liveness and lifecycle sweeps, and the presence sweep. This is the one place
+    # they are started; ``build_application`` only constructs, so tests that build an app never
+    # start them.
     state.shell.start()
+    state.presence_sweep.start()
+    state.roster_watch.start()
 
-    # Tear down the broadcaster and the inventory on exit. ``atexit`` covers a normal return;
-    # the signal handlers cover supervisord's SIGTERM and an interactive SIGINT (Ctrl-C), which
-    # ``serve_forever`` would otherwise turn into an abrupt exit.
+    # Tear down the broadcaster, the inventory, and the lifecycle manager (which lets go of
+    # every parked port) on exit. ``atexit`` covers a normal return; the signal handlers cover
+    # supervisord's SIGTERM and an interactive SIGINT (Ctrl-C), which ``serve_forever`` would
+    # otherwise turn into an abrupt exit.
     atexit.register(state.shutdown)
     signal.signal(signal.SIGTERM, _exit_on_signal)
     signal.signal(signal.SIGINT, _exit_on_signal)

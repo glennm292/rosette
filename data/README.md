@@ -9,11 +9,11 @@ delete it however you like. The dot-prefixed folders are workspace machinery.
 
 Visible folders (starters -- reshape them freely):
 
-- `documents/` - Documents your mind makes for you (reports, notes, exports).
+- `documents/` - Documents your agent makes for you (reports, notes, exports).
 - `my-project/` - An example per-project folder; make one per effort.
 - `uploads/` - Files you attach to chat messages (recreated on demand if you
   rename it).
-- `memories/` - Your mind's long-term memory notes.
+- `memories/` - Your agent's long-term memory notes.
 - `system/` - Workspace configuration written at runtime (backup settings,
   GitHub sync settings).
 
@@ -22,15 +22,15 @@ Hidden folders (dot-prefixed; workspace machinery, safe to ignore):
 - `.apps/` - Stored data belonging to each app in
   `/home/user/workspace/system/apps/`.
 - `.skills/` - Stored data a skill keeps for itself across runs.
-- `.tickets/` - The mind's internal task tracker records.
+- `.tickets/` - The agent's internal task tracker records.
 - `.tasks/` - Scratch space for work delegated between agents.
 - `.state/` - Machine state: service registries, markers, and ledgers.
-- `.secrets/` - Credentials injected by the minds app (backup and tunnel
+- `.secrets/` - Credentials injected by Imbue Studio (backup and tunnel
   tokens). Never committed, never synced to GitHub.
 - `.imbue/analytics/` - Appears only in imbue-hosted workspaces of
   explorer-plan accounts: the analytics collection script (injected on each
   run so you can always read what ran) and its run audit. See
   `docs/system/analytics-collection.md`.
-- `.imbue/plans/` - Plans written for offline analysis when an app is built.
-  Nothing in the workspace reads them back and no agent may use them; see
-  the `CLAUDE.md` in that folder.
+- `.imbue/plans/` - Plans a since-removed recorder wrote for offline analysis
+  when an app was built. Nothing in the workspace reads them back and no agent
+  may use them; see the `AGENTS.md` in that folder.

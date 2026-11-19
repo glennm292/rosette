@@ -5,30 +5,38 @@
  *
  * Two jobs, both over one `message` listener:
  *
- * - The embedder relay. The minds chrome accepts messages only from its direct child, the
+ * - The embedder relay. The Imbue Studio chrome accepts messages only from its direct child, the
  *   shell, so an app page cannot reach it. Any `minds:` message from a child frame in the
  *   workspace origin family is forwarded up to `window.parent`
  *   unchanged, and any message from `window.parent` is rebroadcast to every child frame the
- *   shell created. No payload is inspected.
+ *   shell created. A chrome message of a type the embed contract does not define (an app
+ *   message, such as a notification's destination) is also handed to the app-message handler,
+ *   since the contract's endpoint in `embed.ts` drops it before its observer; a contract type
+ *   reaches that observer instead, so neither is relayed twice. No payload is inspected.
  * - The shell side of the app contract. `shell:` messages from a child frame are dispatched
  *   to the handler registered for their type, with the frame that posted them; the shell's
  *   own messages to a frame (`shell:handshake`, `shell:shown`, ...) are sent through
  *   `sendToChildFrame`.
  *
  * Trust: a child frame's message counts only when `event.source` is the `contentWindow` of an
- * iframe in this document and `event.origin` shares this shell's workspace coordinate (the
- * origin family the minds chrome checks). The chrome's messages count only from
+ * iframe in this document and `event.origin` either shares this shell's workspace coordinate (the
+ * origin family the Imbue Studio chrome checks) or is the origin the shell itself pointed that frame at
+ * (an app on its own loopback port, outside the family). The chrome's messages count only from
  * `window.parent`, and only when this shell is framed at all.
  */
 
-import { workspaceHostCoordinate } from "@imbue/workspace-ui/src/origin";
+import { workspaceHostCoordinate } from "@imbue/workspace-ui/src/app_contract";
+import { isContractEmbedderMessageType } from "@imbue/workspace-ui/src/embed";
 
 export type ChildFrameMessageHandler = (frame: HTMLIFrameElement, payload: Record<string, unknown>) => void;
+/** Takes a chrome message of a type the embed contract does not define: its type beside its fields. */
+export type EmbedderAppMessageHandler = (message: { type: string } & Record<string, unknown>) => void;
 
 const MINDS_TYPE_PREFIX = "minds:";
 const SHELL_TYPE_PREFIX = "shell:";
 
 const handlerByType: Partial<Record<string, ChildFrameMessageHandler>> = {};
+let embedderAppMessageHandler: EmbedderAppMessageHandler | null = null;
 let isInitialized = false;
 
 /** Whether an origin belongs to this workspace's origin family: the same coordinate as the shell's own host. */
@@ -52,6 +60,15 @@ function frameForSource(source: MessageEventSource | null): HTMLIFrameElement | 
   return childFrames().find((frame) => frame.contentWindow === source) ?? null;
 }
 
+/** The origin the shell itself pointed the frame at (on loopback an app has its own port, outside the family). */
+function framedOrigin(frame: HTMLIFrameElement): string | null {
+  try {
+    return new URL(frame.src, window.location.href).origin;
+  } catch {
+    return null;
+  }
+}
+
 function handleMessage(event: MessageEvent): void {
   const data: unknown = event.data;
   if (data === null || typeof data !== "object") return;
@@ -64,11 +81,13 @@ function handleMessage(event: MessageEvent): void {
     for (const frame of childFrames()) {
       frame.contentWindow?.postMessage(data, "*");
     }
+    if (!isContractEmbedderMessageType(type)) embedderAppMessageHandler?.({ ...message, type });
     return;
   }
 
   const frame = frameForSource(event.source);
-  if (frame === null || !isWorkspaceFamilyOrigin(event.origin)) return;
+  if (frame === null) return;
+  if (!isWorkspaceFamilyOrigin(event.origin) && event.origin !== framedOrigin(frame)) return;
   if (type.startsWith(MINDS_TYPE_PREFIX)) {
     // Upward: unchanged, and only when there is a chrome to forward to.
     if (window.parent !== window) window.parent.postMessage(data, "*");
@@ -91,6 +110,12 @@ export function setChildFrameMessageHandler(type: string, handler: ChildFrameMes
   handlerByType[type] = handler;
 }
 
+/** Register the handler for the chrome's messages of types the embed contract does not define
+ * (replaces any prior one). */
+export function setEmbedderAppMessageHandler(handler: EmbedderAppMessageHandler): void {
+  embedderAppMessageHandler = handler;
+}
+
 /** Send one contract message to a frame the shell created. */
 export function sendToChildFrame(frame: HTMLIFrameElement, type: string, payload: Record<string, unknown> = {}): void {
   frame.contentWindow?.postMessage({ type, ...payload }, "*");
@@ -103,4 +128,5 @@ export function resetEmbedderRelayForTesting(): void {
     isInitialized = false;
   }
   for (const type of Object.keys(handlerByType)) delete handlerByType[type];
+  embedderAppMessageHandler = null;
 }

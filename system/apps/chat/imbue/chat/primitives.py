@@ -1,6 +1,6 @@
 """The chat app's own primitives: the chat id, and the shape every agent id shares with it.
 
-A chat is the user-facing conversation (one tab, one instance key, one transcript); an agent is
+A chat is the user-facing conversation (one window, one transcript); an agent is
 one mngr agent running one harness on one account. A chat's id is the id of its first agent, so
 the two strings keep the same ``agent-<hex>`` shape, but they are distinct types in code so the
 type checker finds every crossing between the two, and a successor agent's chat id is not its own
@@ -8,14 +8,53 @@ type checker finds every crossing between the two, and a successor agent's chat 
 """
 
 import re
+from enum import auto
 from typing import Final
 
+from app_manifest.primitives import AppName
+
+from imbue.imbue_common.enums import LowerCaseStrEnum
 from imbue.imbue_common.primitives import NonEmptyStr
 from imbue.imbue_common.pure import pure
 
-# An agent id: ``agent-<32 hex>`` as mngr mints it, with the instance-key alphabet so a test
-# fixture's id counts too. A chat id has the same shape (it is its first agent's id).
+# The chat app's registered name: the one app that may name itself to the shell (the client-activity
+# report, the manifest, the desktop's open op).
+CHAT_APP_NAME: Final[AppName] = AppName("chat")
+
+# An agent id: ``agent-<32 hex>`` as mngr mints it, loosened so a test fixture's id counts too. A chat's id has
+# the same shape (it is its first agent's id), whatever the chat's kind.
 AGENT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^agent-[A-Za-z0-9_-]{1,120}$")
+
+# A subagent view's key is the chat id, the agent id, and the session id joined by dots, which
+# no agent id carries; the chat serves the view at ``/<key>``.
+SUBAGENT_KEY_SEPARATOR: Final[str] = "."
+
+
+class ChatStatus(LowerCaseStrEnum):
+    """What a chat is doing, as its snapshot reports it and the chat root's rail draws it (a wire value).
+
+    A chat switching agents is ``working``, or ``error`` once the switch failed, whatever its agent
+    does. Otherwise the first that holds: ``stopped`` (the agent is dead), ``attention`` (a
+    permission request waits on the user), ``working`` (a turn is in flight), ``background`` (no
+    turn, but a pending background task will start one), ``idle``.
+    """
+
+    WORKING = auto()
+    BACKGROUND = auto()
+    IDLE = auto()
+    ATTENTION = auto()
+    STOPPED = auto()
+    ERROR = auto()
+
+
+class ChatKind(LowerCaseStrEnum):
+    """What a chat is (a wire value on its snapshot): a conversation with an agent, or a room, which is a message
+    log among the workspace's people whose agent is the room's reader rather than an AI (the multiplayer spec,
+    S3). The kind follows the harness the chat's active agent runs; a later kind adds a value here, never a
+    second id type."""
+
+    AGENT = auto()
+    ROOM = auto()
 
 
 class ChatId(NonEmptyStr):
@@ -32,7 +71,7 @@ class ChatId(NonEmptyStr):
 def parse_chat_ref(chat_ref: str) -> ChatId | None:
     """The chat id a caller's string names, or None for a blank one.
 
-    Routes and instance keys hand the manager whatever string they were given; a blank one
+    Routes and page keys hand the manager whatever string they were given; a blank one
     names no chat, and answering None lets the caller say "not found" instead of tripping over
     the primitive's own validation.
     """

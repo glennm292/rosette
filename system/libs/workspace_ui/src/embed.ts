@@ -1,14 +1,14 @@
 /**
- * The workspace's single connection to the embedding minds chrome.
+ * The workspace's single connection to the embedding Imbue Studio chrome.
  *
- * All postMessage traffic with the embedder flows through the vendored minds
- * embed contract (see `@minds/embed-contract` and minds'
+ * All postMessage traffic with the embedder flows through the vendored Imbue
+ * Studio embed contract (see `@minds/embed-contract` and Imbue Studio's
  * `docs/embed-contract.md`); this module owns the one workspace-side endpoint
  * and hands out narrow send/subscribe helpers. Raw `postMessage` /
  * `message`-listener usage anywhere else is forbidden by each frontend's embed
  * ratchets, so the whole boundary stays auditable here.
  *
- * The page behaves identically embedded (iframe under the minds chrome) and
+ * The page behaves identically embedded (iframe under the Imbue Studio chrome) and
  * top-level (a direct share visit): with no embedder, outbound sends simply
  * have no listener and no embedder message ever arrives.
  */
@@ -22,23 +22,141 @@ import {
 } from "@minds/embed-contract";
 import * as embedContract from "@minds/embed-contract";
 
-// A named import of an export the vendored embed_contract snapshot lacks fails
+// A named import of an export the embed_contract snapshot lacks fails
 // the rollup build (this repo does not edit system/vendor by hand; the snapshot
-// moves with the mngr release sync), so these probe the namespace and fall
+// moves with mngr), so these probe the namespace and fall
 // back to the literal. A snapshot without the export drops the type it does
 // not know at its validator.
 export const PERMISSION_RESOLUTIONS: "minds:permission-resolutions" =
   "PERMISSION_RESOLUTIONS" in embedContract ? embedContract.PERMISSION_RESOLUTIONS : "minds:permission-resolutions";
-// Workspace -> embedder: open the minds shell's Share tab focused on one app.
+// Workspace -> embedder: open the Imbue Studio shell's Share tab focused on one app.
 // Payload: { serviceName }.
 export const OPEN_SHARE_SETTINGS: "minds:open-share-settings" =
   "OPEN_SHARE_SETTINGS" in embedContract ? embedContract.OPEN_SHARE_SETTINGS : "minds:open-share-settings";
+// Embedder -> workspace: the user opened a chat's notification in the Imbue
+// Studio shell; show that chat. Payload: { chatId } (the chat's id, which is its
+// first agent's id). No page handles it here: the shell relays it to the app
+// whose manifest registers the type.
+const FOCUS_CHAT: "minds:focus-chat" = "FOCUS_CHAT" in embedContract ? embedContract.FOCUS_CHAT : "minds:focus-chat";
+// Workspace -> embedder: this page's endpoint is listening. Payload:
+// { opensLinks, opensCustomSchemeLinks, reportsChatOnScreen } (see ReadyAnnouncement). The
+// embedder holds a focus-chat ask until it arrives, rather than guessing when
+// a freshly-mounted frame's page is live.
+export const WORKSPACE_READY: "minds:workspace-ready" =
+  "WORKSPACE_READY" in embedContract ? embedContract.WORKSPACE_READY : "minds:workspace-ready";
+// Workspace -> embedder (contract v15): this chat's transcript is drawn in a window the user can see. Payload:
+// { chatId }. The Imbue Studio creation page keeps its wash over a new workspace until the welcome chat says this.
+export const CHAT_ON_SCREEN: "minds:chat-on-screen" =
+  "CHAT_ON_SCREEN" in embedContract ? embedContract.CHAT_ON_SCREEN : "minds:chat-on-screen";
+// The pull-out window set (contract v6, the pull-out-window spec), probed the same way.
+// Workspace -> embedder: show one pulled-out window in a desktop window of the chrome's own, opened
+// if it has none. Payload: { windowId, title, width, height } (the window's rendered size in CSS px).
+export const POP_OUT_WINDOW: "minds:pop-out-window" =
+  "POP_OUT_WINDOW" in embedContract ? embedContract.POP_OUT_WINDOW : "minds:pop-out-window";
+// Workspace -> embedder: a title-bar drag began; the chrome watches the cursor from here and pulls
+// the window out once it leaves the chrome's window. Payload: { windowId, title, width, height,
+// grabX, grabY } (the size the window renders at, and where inside it the pointer holds it).
+export const WINDOW_DRAG_STARTED: "minds:window-drag-started" =
+  "WINDOW_DRAG_STARTED" in embedContract ? embedContract.WINDOW_DRAG_STARTED : "minds:window-drag-started";
+// Workspace -> embedder: the shell's own end of a watched drag (a release it saw, or Escape).
+// Payload: { windowId, isDetached, isCancelled }.
+export const WINDOW_DRAG_ENDED: "minds:window-drag-ended" =
+  "WINDOW_DRAG_ENDED" in embedContract ? embedContract.WINDOW_DRAG_ENDED : "minds:window-drag-ended";
+// Workspace -> embedder: the pulled-out windows of this shell's active desktop, with their titles.
+// Payload: { windows: [{ windowId, title }] }.
+export const DETACHED_WINDOWS: "minds:detached-windows" =
+  "DETACHED_WINDOWS" in embedContract ? embedContract.DETACHED_WINDOWS : "minds:detached-windows";
+// Embedder -> workspace: what the chrome can do, right after WORKSPACE_READY. Payload: { canPopOut,
+// opensExternalLinks?, opensCustomSchemeLinks?, opensLocalFiles?, immersive? }: whether it takes
+// OPEN_EXTERNAL, custom-scheme links there, OPEN_LOCAL_FILES, and IMMERSIVE_REQUEST.
+export const EMBEDDER_CAPABILITIES: "minds:embedder-capabilities" =
+  "EMBEDDER_CAPABILITIES" in embedContract ? embedContract.EMBEDDER_CAPABILITIES : "minds:embedder-capabilities";
+// Embedder -> workspace: return a pulled-out window to the desktop. Payload: { windowId, frame? }.
+export const REATTACH_WINDOW: "minds:reattach-window" =
+  "REATTACH_WINDOW" in embedContract ? embedContract.REATTACH_WINDOW : "minds:reattach-window";
+// Embedder -> workspace: a step of a watched drag: the cursor left the chrome's window and its own
+// desktop window follows it, came back inside, or was released out there.
+// Payload: { windowId, phase: "out" | "in" | "released" }.
+export const TEAR_OUT: "minds:tear-out" = "TEAR_OUT" in embedContract ? embedContract.TEAR_OUT : "minds:tear-out";
+// The provider sign-in pair (contract v7), probed the same way.
+// Workspace -> embedder: relay a provider sign-in's loopback callback into this workspace's flow and
+// open its page. Payload: { url, flowId }.
+export const PROVIDER_SIGN_IN: "minds:provider-sign-in" =
+  "PROVIDER_SIGN_IN" in embedContract ? embedContract.PROVIDER_SIGN_IN : "minds:provider-sign-in";
+// Embedder -> workspace: whether the chrome is relaying that sign-in. Payload: { relay }.
+export const PROVIDER_SIGN_IN_ACK: "minds:provider-sign-in-ack" =
+  "PROVIDER_SIGN_IN_ACK" in embedContract ? embedContract.PROVIDER_SIGN_IN_ACK : "minds:provider-sign-in-ack";
+// Workspace -> embedder: that sign-in has ended, so the chrome can stop relaying it. Payload: { flowId }.
+export const PROVIDER_SIGN_IN_END: "minds:provider-sign-in-end" =
+  "PROVIDER_SIGN_IN_END" in embedContract ? embedContract.PROVIDER_SIGN_IN_END : "minds:provider-sign-in-end";
+// Embedder -> workspace (contract v8, the workspace link routing plan): a popup (or an external page replacing a
+// frame) a page of this workspace asked for, which Imbue Studio turned away from a window of its own; the workspace
+// opens it where it belongs. Payload: { url }. Sent only to a workspace that announced ``opensLinks`` with
+// WORKSPACE_READY, and a custom-scheme URL (contract v10) only to one that announced ``opensCustomSchemeLinks`` too.
+export const OPEN_LINK: "minds:open-link" = "OPEN_LINK" in embedContract ? embedContract.OPEN_LINK : "minds:open-link";
+// Workspace -> embedder (contract v8): open an external web, mailto, tel or (contract v10) custom-scheme link outside
+// the workspace, which no app of it takes. Payload: { url }. Sent only to an embedder that said ``opensExternalLinks``
+// with EMBEDDER_CAPABILITIES (and, for a custom-scheme link, ``opensCustomSchemeLinks``), or for an external link that
+// embedder handed over with OPEN_LINK.
+export const OPEN_EXTERNAL: "minds:open-external" =
+  "OPEN_EXTERNAL" in embedContract ? embedContract.OPEN_EXTERNAL : "minds:open-external";
+// Workspace -> embedder: ring one of the Imbue Studio chrome's own controls while the
+// workspace's tour talks about it, or clear the ring. Payload: { anchor }, one of the
+// chrome's anchor names ("share", "help", ...) or null. Fire-and-forget; a chrome that does
+// not know the type ignores it, and the tour's words never depend on the ring.
+export const HIGHLIGHT_CHROME: "minds:highlight-chrome" =
+  "HIGHLIGHT_CHROME" in embedContract ? embedContract.HIGHLIGHT_CHROME : "minds:highlight-chrome";
+
+// Workspace -> embedder (contract v11): open the chrome's settings for the files shared from the user's computer
+// (its Permissions pane, at Local files). Payload: {}. Sent only to an embedder that said ``opensLocalFiles`` with
+// EMBEDDER_CAPABILITIES.
+export const OPEN_LOCAL_FILES: "minds:open-local-files" =
+  "OPEN_LOCAL_FILES" in embedContract ? embedContract.OPEN_LOCAL_FILES : "minds:open-local-files";
+
+// The immersive-mode pair (contract v12, the Screen integration spec section 5), probed the same way.
+// Workspace -> embedder: take the app window Fullscreen-API fullscreen with the keyboard locked for this window
+// (``on: true``), or give it back. Payload: { windowId, on }. Sent only to an embedder that said ``immersive`` with
+// EMBEDDER_CAPABILITIES, and from a user gesture when entering.
+export const IMMERSIVE_REQUEST: "minds:immersive-request" =
+  "IMMERSIVE_REQUEST" in embedContract ? embedContract.IMMERSIVE_REQUEST : "minds:immersive-request";
+// Embedder -> workspace: immersive mode is now on or off, by a request or on the chrome's own (the user held
+// Escape, the OS left fullscreen). Payload: { on, keyboardLocked, error? }.
+export const IMMERSIVE_CHANGED: "minds:immersive-changed" =
+  "IMMERSIVE_CHANGED" in embedContract ? embedContract.IMMERSIVE_CHANGED : "minds:immersive-changed";
 
 type EmbedderMessageHandler = (message: ContractMessage) => void;
+
+// Every embedder->workspace type the contract defines: the endpoint dispatches
+// only the types it is handed a handler for, and each of these reaches its own
+// handler and then the observer. A type outside this list the endpoint drops
+// (the contract's tolerant policy), so an app message the chrome posts beside
+// the contract's own (a notification's destination, `minds:show-routine`, say)
+// never reaches the observer: the shell's relay.ts hands those on itself.
+const EMBEDDER_TO_WORKSPACE_TYPES: readonly string[] = [
+  CLOSE_ACTIVE_TAB,
+  OPEN_AI_KEYS_ACK,
+  PERMISSION_RESOLUTIONS,
+  FOCUS_CHAT,
+  EMBEDDER_CAPABILITIES,
+  REATTACH_WINDOW,
+  TEAR_OUT,
+  PROVIDER_SIGN_IN_ACK,
+  OPEN_LINK,
+  IMMERSIVE_CHANGED,
+];
 
 // One replaceable handler per embedder->workspace type, registered by the
 // feature that owns it.
 const handlerByType: Partial<Record<string, EmbedderMessageHandler>> = {};
+
+// One replaceable observer of every embedder->workspace message, whatever its
+// type: the shell's relay to the apps registered for it.
+let messageObserver: EmbedderMessageHandler | null = null;
+
+function dispatchEmbedderMessage(message: ContractMessage): void {
+  handlerByType[message.type]?.(message);
+  messageObserver?.(message);
+}
 
 // Created on first use rather than at import time so importing this module
 // never touches `window` (unit tests run under node and stub it per test).
@@ -55,11 +173,7 @@ function getEndpoint(): ContractEndpoint {
   if (endpoint === null) {
     if (typeof window === "undefined") return NULL_ENDPOINT;
     endpoint = createWorkspaceEndpoint({
-      handlers: {
-        [CLOSE_ACTIVE_TAB]: (message) => handlerByType[CLOSE_ACTIVE_TAB]?.(message),
-        [OPEN_AI_KEYS_ACK]: (message) => handlerByType[OPEN_AI_KEYS_ACK]?.(message),
-        [PERMISSION_RESOLUTIONS]: (message) => handlerByType[PERMISSION_RESOLUTIONS]?.(message),
-      },
+      handlers: Object.fromEntries(EMBEDDER_TO_WORKSPACE_TYPES.map((type) => [type, dispatchEmbedderMessage])),
     });
   }
   return endpoint;
@@ -76,6 +190,45 @@ export function setEmbedderMessageHandler(type: string, handler: EmbedderMessage
   handlerByType[type] = handler;
 }
 
+/** Observe every embedder->workspace message of a type the contract defines,
+ * after its type's own handler (replaces any prior observer). */
+export function setEmbedderMessageObserver(observer: EmbedderMessageHandler): void {
+  getEndpoint();
+  messageObserver = observer;
+}
+
+/** Whether `type` is an embedder->workspace type the contract defines, which the
+ * endpoint dispatches (and the observer sees); any other type from the chrome
+ * the endpoint drops. */
+export function isContractEmbedderMessageType(type: string): boolean {
+  return EMBEDDER_TO_WORKSPACE_TYPES.includes(type);
+}
+
+/** What a page says it handles when it announces itself ready. */
+export interface ReadyAnnouncement {
+  /** Whether it opens the links Imbue Studio hands it with OPEN_LINK. */
+  readonly opensLinks: boolean;
+  /** Whether it takes custom-scheme links (``slack:``, ``vscode:``) among them. */
+  readonly opensCustomSchemeLinks: boolean;
+  /** Whether a chat of this workspace reports itself with CHAT_ON_SCREEN once it is drawn. */
+  readonly reportsChatOnScreen: boolean;
+}
+
+/** Tell the embedder this page is listening, so it can send what it held, and what it handles.
+ * Called once per load, after the handlers that the held messages need. */
+export function announceReadyToEmbedder(announcement: ReadyAnnouncement): void {
+  sendToEmbedder(WORKSPACE_READY, {
+    opensLinks: announcement.opensLinks,
+    opensCustomSchemeLinks: announcement.opensCustomSchemeLinks,
+    reportsChatOnScreen: announcement.reportsChatOnScreen,
+  });
+}
+
+/** Tell the embedder this chat's transcript is drawn in a window the user can see. */
+export function reportChatOnScreen(chatId: string): void {
+  sendToEmbedder(CHAT_ON_SCREEN, { chatId });
+}
+
 /** Clear the handler for one embedder->workspace type. */
 export function clearEmbedderMessageHandler(type: string): void {
   delete handlerByType[type];
@@ -88,4 +241,5 @@ export function resetEmbedEndpointForTesting(): void {
     endpoint = null;
   }
   for (const type of Object.keys(handlerByType)) delete handlerByType[type];
+  messageObserver = null;
 }

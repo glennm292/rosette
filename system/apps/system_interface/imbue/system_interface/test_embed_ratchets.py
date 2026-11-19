@@ -1,10 +1,10 @@
 """Project-specific ratchets confining postMessage to the sanctioned boundaries.
 
 Cross-frame messaging flows through exactly four files, each owning one
-boundary: messaging with the embedding minds chrome goes through the
-vendored embed contract (imported via the library's ``embed.ts``; see minds'
+boundary: messaging with the embedding Imbue Studio chrome goes through the
+vendored embed contract (imported via the library's ``embed.ts``; see Imbue Studio's
 ``docs/embed-contract.md``), the shell's side of every message crossing to
-or from the frames it created (the minds relay of the workspace app model's
+or from the frames it created (the Imbue Studio relay of the workspace app model's
 contracts section 11 and the ``shell:`` messages of its section 10, the
 location beacons included) goes through ``src/relay.ts``, an app page's side
 of that contract goes through the library's ``app_contract.ts`` (the module
@@ -54,7 +54,7 @@ _PACKAGE_IMPORT = re.compile(
     + r""")[^"']+)["']"""
 )
 
-pytestmark = pytest.mark.xdist_group(name="ratchets")
+pytestmark = [pytest.mark.xdist_group(name="ratchets"), pytest.mark.frontend]
 
 _RAW_POST_MESSAGE_RULE = RatchetRuleInfo(
     rule_name="raw postMessage / message-listener usages outside the sanctioned boundaries",
@@ -64,7 +64,7 @@ _RAW_POST_MESSAGE_RULE = RatchetRuleInfo(
         "and shell<->framed page through src/relay.ts and src/app_contract.ts -- so the whole "
         "message surface stays in auditable, allowlisted files with each boundary's source checks "
         "and payload validation applied. Do not call postMessage or register 'message' listeners "
-        "anywhere else -- extend a boundary module instead (see minds' docs/embed-contract.md and "
+        "anywhere else -- extend a boundary module instead (see Imbue Studio's docs/embed-contract.md and "
         "relay.ts's own docstring)."
     ),
 )
@@ -83,20 +83,34 @@ _ALLOWED_FILES = (
 _SHELL_PACKAGE = Path(__file__).parent / "shell"
 
 _RETIRED_ADDRESS_RULE = RatchetRuleInfo(
-    rule_name="retired panel refs (chat:, terminal:, service:, url:, subagent:) in the shell",
+    rule_name="retired address spellings (app:, chat:, terminal:, service:, url:, subagent:) in the shell",
     rule_description=(
-        "The shell addresses everything as app:<name> or app:<name>?instance=<key> (contracts.md "
-        "section 1) and has no per-kind refs: it does not know what a chat or a terminal is. Do not "
-        "spell one in the shell package or the frontend -- resolve the address through the inventory "
-        "instead."
+        "The shell has no address strings: a window is an app name and a path under its origin "
+        "(desktop-interface contracts.md section 1), and the tabbed shell's app:<name>?instance=<key> "
+        "and the older per-kind refs are gone with it. Do not spell one in the shell package or the "
+        "frontend -- carry the app name and path as separate fields."
     ),
 )
 
-# A string literal that starts with a retired ref prefix. Anchored on the opening quote so
+# A string literal that starts with a retired address prefix. Anchored on the opening quote so
 # ordinary keys such as ``url: string`` and prose in comments do not count.
 _RETIRED_ADDRESS_PATTERN = RegexPattern(
-    r"""["'`](?:chat|chat-terminal|terminal|service|url|subagent):""", multiline=False
+    r"""["'`](?:app|chat|chat-terminal|terminal|service|url|subagent):""", multiline=False
 )
+
+_DOCK_VOCABULARY_RULE = RatchetRuleInfo(
+    rule_name="tabbed-shell vocabulary (dockview, dock) in the shell and the shared library",
+    rule_description=(
+        "The tabbed shell is gone: the workspace is desktops, windows, a taskbar and a launcher "
+        "(desktop-interface contracts.md). A mention of dockview, or of a dock, in the shell package, "
+        "its frontend, or the shared library is either dead code or a stale comment -- describe the "
+        "desktop instead."
+    ),
+)
+
+# CLEANUP: relax or delete this ratchet around late October 2026, once the dockview vocabulary is
+# long gone; "dock" is too generic a word to forbid for good.
+_DOCK_VOCABULARY_PATTERN = RegexPattern(r"""dockview|\bdock(?:ed|ing|s)?\b""", multiline=False)
 
 _SHELL_IMPORTS_CHAT_RULE = RatchetRuleInfo(
     rule_name="shell bundle files importing the chat frontend's sources",
@@ -168,3 +182,12 @@ def test_prevent_retired_address_spellings() -> None:
     shell_chunks = check_regex_ratchet(_SHELL_PACKAGE, FileExtension(".py"), _RETIRED_ADDRESS_PATTERN, test_files)
     chunks = (*frontend_chunks, *library_chunks, *shell_chunks)
     assert len(chunks) <= snapshot(0), _RETIRED_ADDRESS_RULE.format_failure(chunks)
+
+
+def test_prevent_tabbed_shell_vocabulary() -> None:
+    test_files = ("*.test.ts", "*_test.py", "test_*.py")
+    frontend_chunks = check_regex_ratchet(_FRONTEND_SRC, FileExtension(".ts"), _DOCK_VOCABULARY_PATTERN, test_files)
+    library_chunks = check_regex_ratchet(_LIBRARY_SRC, FileExtension(".ts"), _DOCK_VOCABULARY_PATTERN, test_files)
+    shell_chunks = check_regex_ratchet(_SHELL_PACKAGE, FileExtension(".py"), _DOCK_VOCABULARY_PATTERN, test_files)
+    chunks = (*frontend_chunks, *library_chunks, *shell_chunks)
+    assert len(chunks) <= snapshot(0), _DOCK_VOCABULARY_RULE.format_failure(chunks)

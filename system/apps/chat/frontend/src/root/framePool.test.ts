@@ -1,0 +1,201 @@
+// @vitest-environment jsdom
+/**
+ * The chat root's inner frame pool: one frame per chat shown, the selected one visible and
+ * the rest hidden, the frame shown longest ago destroyed past the bound (never the shown one),
+ * and the pages handed the shell's handshake and driven through their embed API with their shown
+ * and hidden states.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SHELL_HANDSHAKE, type ShellHandshake } from "@imbue/workspace-ui/src/app_contract";
+import type { ChatPageEmbedApi } from "../embedApi";
+import { InnerFramePool, MAX_HELD_FRAMES } from "./framePool";
+
+const HANDSHAKE: ShellHandshake = {
+  clientId: "client-1",
+  windowId: "win-1",
+  desktopId: "home",
+  app: "chat",
+  path: "/",
+  opensLocalFiles: false,
+  isViewing: false,
+};
+
+let container: HTMLElement;
+let pool: InnerFramePool;
+let now = 1_000;
+
+function frames(): HTMLIFrameElement[] {
+  return [...container.querySelectorAll("iframe")];
+}
+
+function frameOf(chatId: string): HTMLIFrameElement {
+  const frame = frames().find((candidate) => candidate.dataset.chatId === chatId);
+  if (frame === undefined) throw new Error(`no frame for ${chatId}`);
+  return frame;
+}
+
+function visibleChatIds(): string[] {
+  return frames()
+    .filter((frame) => !frame.hidden)
+    .map((frame) => frame.dataset.chatId ?? "");
+}
+
+/** Stand in for the page loading: install its embed API on the frame's window, then fire ``load``. ``posted`` is
+ *  what the root posts to the page. */
+function loadPage(chatId: string): { [K in keyof ChatPageEmbedApi | "posted"]: ReturnType<typeof vi.fn> } {
+  const api = {
+    shown: vi.fn(),
+    hidden: vi.fn(),
+    prependDraft: vi.fn(),
+    hintComposer: vi.fn(),
+    setCompact: vi.fn(),
+    focus: vi.fn(),
+  };
+  const frame = frameOf(chatId);
+  const contentWindow = frame.contentWindow;
+  if (contentWindow === null) throw new Error(`frame ${chatId} has no window`);
+  contentWindow.chatPageEmbed = api;
+  const posted = vi.fn();
+  vi.spyOn(contentWindow, "postMessage").mockImplementation(posted);
+  frame.dispatchEvent(new Event("load"));
+  return { ...api, posted };
+}
+
+const HANDSHAKE_MESSAGE = { type: SHELL_HANDSHAKE, ...HANDSHAKE };
+
+beforeEach(() => {
+  now = 1_000;
+  // Each show happens later than the last, so eviction has an order to go on.
+  vi.spyOn(Date, "now").mockImplementation(() => (now += 1));
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  pool = new InnerFramePool(container);
+});
+
+afterEach(() => {
+  container.remove();
+  vi.restoreAllMocks();
+});
+
+describe("InnerFramePool", () => {
+  it("makes one frame per chat at its page, shows the selected one and hides the rest", () => {
+    pool.show("agent-a");
+    pool.show("agent-b");
+
+    expect(pool.heldChatIds()).toEqual(["agent-a", "agent-b"]);
+    expect(frameOf("agent-a").getAttribute("src")).toBe("/agent-a");
+    expect(frameOf("agent-b").getAttribute("src")).toBe("/agent-b");
+    expect(visibleChatIds()).toEqual(["agent-b"]);
+
+    pool.show("agent-a");
+    expect(visibleChatIds()).toEqual(["agent-a"]);
+    expect(pool.heldChatIds()).toEqual(["agent-a", "agent-b"]);
+
+    pool.show(null);
+    expect(visibleChatIds()).toEqual([]);
+  });
+
+  it("destroys the frame shown longest ago past the bound, never the shown one", () => {
+    const chatIds = Array.from({ length: MAX_HELD_FRAMES + 1 }, (_, index) => `agent-${index}`);
+    for (const chatId of chatIds) pool.show(chatId);
+    expect(pool.heldChatIds()).toEqual(chatIds.slice(1));
+
+    // Showing the oldest survivor again makes it the newest, so the next one to go is the one after it.
+    pool.show(chatIds[1]);
+    pool.show("agent-fresh");
+    expect(pool.heldChatIds()).toEqual([chatIds[1], ...chatIds.slice(3), "agent-fresh"]);
+    expect(visibleChatIds()).toEqual(["agent-fresh"]);
+  });
+
+  it("hands the keyboard to a page it switches back to, not to one it already shows or one still loading", () => {
+    pool.setRootShown(true);
+    pool.show("agent-a");
+    const pageA = loadPage("agent-a");
+    pool.show("agent-b");
+    const pageB = loadPage("agent-b");
+    // New pages take the keyboard themselves as they load.
+    expect(pageA.focus).not.toHaveBeenCalled();
+    expect(pageB.focus).not.toHaveBeenCalled();
+
+    pool.show("agent-a");
+    expect(pageA.focus).toHaveBeenCalledTimes(1);
+
+    // Showing the shown chat again (a list refresh) leaves the keyboard where it is, a rename box say.
+    pool.show("agent-a");
+    expect(pageA.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("hands no keyboard while the root itself is off screen", () => {
+    pool.show("agent-a");
+    const pageA = loadPage("agent-a");
+    pool.show("agent-b");
+    loadPage("agent-b");
+
+    pool.show("agent-a");
+
+    expect(pageA.focus).not.toHaveBeenCalled();
+  });
+
+  it("drops a destroyed chat's frame and knows its frames' windows", () => {
+    pool.show("agent-a");
+    pool.show("agent-b");
+    const frameA = frameOf("agent-a");
+
+    expect(pool.isInnerWindow(frameA.contentWindow)).toBe(true);
+    expect(pool.isInnerWindow(window)).toBe(false);
+    expect(pool.isInnerWindow(null)).toBe(false);
+
+    pool.destroy("agent-a");
+    expect(pool.heldChatIds()).toEqual(["agent-b"]);
+    expect(frames().map((frame) => frame.dataset.chatId)).toEqual(["agent-b"]);
+    expect(pool.isInnerWindow(frameA.contentWindow)).toBe(false);
+  });
+
+  it("hands a loaded page the handshake, now or when it arrives, and tells it shown and hidden", () => {
+    pool.setRootShown(true);
+    pool.show("agent-a");
+    const pageA = loadPage("agent-a");
+    expect(pageA.posted).not.toHaveBeenCalled();
+    expect(pageA.shown).toHaveBeenCalledTimes(1);
+
+    pool.setHandshake(HANDSHAKE);
+    expect(pageA.posted.mock.calls).toEqual([[HANDSHAKE_MESSAGE, "*"]]);
+
+    pool.show("agent-b");
+    expect(pageA.hidden).toHaveBeenCalledTimes(1);
+    const pageB = loadPage("agent-b");
+    expect(pageB.posted.mock.calls).toEqual([[HANDSHAKE_MESSAGE, "*"]]);
+    expect(pageB.shown).toHaveBeenCalledTimes(1);
+
+    // The shell hiding the root hides the shown page; showing it again shows the page.
+    pool.setRootShown(false);
+    expect(pageB.hidden).toHaveBeenCalledTimes(1);
+    pool.setRootShown(true);
+    expect(pageB.shown).toHaveBeenCalledTimes(2);
+    expect(pageA.shown).toHaveBeenCalledTimes(1);
+  });
+
+  it("tells a page that loads while the root is hidden that it is hidden", () => {
+    pool.setRootShown(false);
+    pool.show("agent-a");
+    const pageA = loadPage("agent-a");
+
+    expect(pageA.hidden).toHaveBeenCalledTimes(1);
+    expect(pageA.shown).not.toHaveBeenCalled();
+  });
+
+  it("tells every page the root's layout, before it is shown on load and again whenever it changes", () => {
+    pool.setRootShown(true);
+    pool.setCompact(true);
+    pool.show("agent-a");
+    const pageA = loadPage("agent-a");
+    expect(pageA.setCompact).toHaveBeenCalledWith(true);
+    expect(pageA.setCompact.mock.invocationCallOrder[0]).toBeLessThan(pageA.shown.mock.invocationCallOrder[0]);
+
+    pool.show("agent-b");
+    const pageB = loadPage("agent-b");
+    pool.setCompact(false);
+    expect(pageA.setCompact).toHaveBeenLastCalledWith(false);
+    expect(pageB.setCompact).toHaveBeenLastCalledWith(false);
+  });
+});

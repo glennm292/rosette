@@ -6,7 +6,6 @@ repo root, which is what checks that its declared references still exist where i
 """
 
 import ast
-import configparser
 import re
 import tomllib
 from pathlib import Path
@@ -14,9 +13,16 @@ from pathlib import Path
 import pytest
 from app_manifest.manifest import MANIFEST_FILENAME, load_manifest
 from app_manifest.primitives import RESERVED_APP_NAMES
-from app_manifest.scope import APP_CONVENTIONS
-from app_manifest.scope import SKILL_CONVENTIONS
+from app_manifest.scope import (
+    APP_CONVENTIONS,
+    SERVICE_CONVENTIONS,
+    SKILL_CONVENTIONS,
+    compute_app_scope,
+)
 from oom_priority import bands
+from oom_priority.supervisord_testing import supervisord_commands
+from workspace_bare_scripts import user_packages
+from workspace_profile.manifest import find_off_grammar_default_chords
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _APPS_DIR = _REPO_ROOT / "system" / "apps"
@@ -24,11 +30,26 @@ _SUPERVISORD_CONF = _REPO_ROOT / "system" / "supervisord.conf"
 
 _MANIFEST_FLAG = re.compile(r"--manifest\s+(\S+)")
 
+# Where every app's console scripts are installed: the workspace venv, which
+# ``uv sync --all-packages`` writes and every app's program runs its entry point from.
+_VENV_BIN_PREFIX = ".venv/bin/"
 
-# The apps the template ships. Only these are checked: a workspace built from the
-# template may carry user-built apps (with a manifest whose priority is ``user``,
-# or with no manifest at all), and this suite runs there too.
-_BUILT_IN_APP_PACKAGES = ("browser", "chat", "files", "system_interface", "terminal")
+
+# The apps the template ships: the root workspace members under system/apps, plus the
+# manifest-only app the terminal runs. Only these are checked: a workspace built from the
+# template may carry user-built apps, standalone projects the root members do not name,
+# and this suite runs there too.
+_MANIFEST_ONLY_BUILT_IN_APPS = ("terminal_pty",)
+_BUILT_IN_APP_PACKAGES = tuple(
+    sorted(
+        {
+            member.removeprefix("system/apps/")
+            for member in user_packages.built_in_members(_REPO_ROOT)
+            if member.startswith("system/apps/") and "*" not in member
+        }
+        | set(_MANIFEST_ONLY_BUILT_IN_APPS)
+    )
+)
 
 
 def _built_in_manifest_paths() -> list[Path]:
@@ -42,25 +63,13 @@ def _every_manifest_path() -> list[Path]:
     return sorted(_APPS_DIR.glob(f"*/{MANIFEST_FILENAME}"))
 
 
-def _command_by_program() -> dict[str, str]:
-    """Every program the config declares: the main file, plus the drop-ins beside it.
+def _program_commands() -> dict[str, str]:
+    return supervisord_commands(_SUPERVISORD_CONF, ("program",))
 
-    ``configparser`` does not follow supervisord's ``[include]``, and the template declares its
-    programs one per file under ``system/supervisord.conf.d/``, so a bare read of the main config
-    finds none of them. The drop-ins are read after the main config, which reproduces
-    supervisord's precedence; ``test_supervisord_layout.py`` pins that directory as the one the
-    include glob names.
-    """
-    parser = configparser.ConfigParser(interpolation=None)
-    parser.read(_SUPERVISORD_CONF)
-    parser.read(
-        sorted((_SUPERVISORD_CONF.parent / "supervisord.conf.d").glob("*.conf"))
-    )
-    return {
-        section.partition(":")[2]: parser[section].get("command", "")
-        for section in parser.sections()
-        if section.startswith("program:")
-    }
+
+def _program_or_listener_commands() -> dict[str, str]:
+    """Every program and event listener the config declares: what a manifest's wiring may name."""
+    return supervisord_commands(_SUPERVISORD_CONF, ("program", "eventlistener"))
 
 
 def _manifest_path_constant(module_file: Path) -> str | None:
@@ -72,40 +81,98 @@ def _manifest_path_constant(module_file: Path) -> str | None:
     for node in ast.walk(ast.parse(module_file.read_text())):
         if isinstance(node, ast.AnnAssign) and node.value is not None:
             target: ast.expr = node.target
+            value: ast.expr = node.value
         elif isinstance(node, ast.Assign) and len(node.targets) == 1:
             target = node.targets[0]
+            value = node.value
         else:
             continue
         if not (isinstance(target, ast.Name) and target.id == "MANIFEST_PATH"):
             continue
-        for literal in ast.walk(node.value):
+        for literal in ast.walk(value):
             if isinstance(literal, ast.Constant) and isinstance(literal.value, str):
                 return literal.value
     return None
 
 
-def _entry_point_manifest_paths(command: str) -> list[str]:
-    """The manifest an app's own entry point registers with, when the program's command ends in one.
-
-    A Python app runs its tool's console script and registers from inside it (the terminal calls
-    the sidecar launcher with its manifest), so the manifest path is a constant the script's
-    module exports as ``MANIFEST_PATH`` rather than a flag on the command line.
-    """
-    script_name = command.split()[-1]
-    manifest_paths: list[str] = []
-    for pyproject_path in _APPS_DIR.glob("*/pyproject.toml"):
-        scripts = (
+def _scripts_by_package() -> dict[Path, dict[str, str]]:
+    """Every app package's ``[project.scripts]`` table, keyed by the package directory."""
+    return {
+        pyproject_path.parent: (
             tomllib.loads(pyproject_path.read_text())
             .get("project", {})
             .get("scripts", {})
         )
-        if script_name not in scripts:
-            continue
-        module_name = scripts[script_name].partition(":")[0]
+        for pyproject_path in sorted(_APPS_DIR.glob("*/pyproject.toml"))
+    }
+
+
+def _script_entry_points(script_name: str) -> list[tuple[Path, str]]:
+    """Every app package declaring a console script, with the ``module:function`` it points at.
+
+    One package may declare several (the terminal's declares ``terminal-app`` and
+    ``terminal-pty`` both), and several packages may declare the same name, in which case the
+    venv's bin directory holds only whichever installed last -- a declaration alone does not
+    say a package runs anything.
+    """
+    return [
+        (package, scripts[script_name])
+        for package, scripts in _scripts_by_package().items()
+        if script_name in scripts
+    ]
+
+
+def _entry_point_script(command: str) -> str | None:
+    """The console script a program's command ends by running from the workspace venv, by name;
+    ``None`` for a command that ends in anything else."""
+    words = command.split()
+    last = words[-1].strip('"') if words else ""
+    return (
+        last.removeprefix(_VENV_BIN_PREFIX)
+        if last.startswith(_VENV_BIN_PREFIX)
+        else None
+    )
+
+
+def _package_running_program(
+    program: str, command_by_program: dict[str, str]
+) -> Path | None:
+    """The app package that runs a supervisord program: the sole declarer of the console script
+    its command ends in, whose script is therefore the only one of that name in the venv.
+
+    ``None``, so excusing nothing: a program with no block, one whose command runs something
+    other than an app's entry point, and one whose script several packages declare -- which of
+    those runs is not something this config decides. That last state is reported under its own
+    name by ``test_no_two_app_packages_declare_the_same_console_script``, since the collision
+    this silence leaves standing says nothing about the duplicated declaration behind it.
+    """
+    script = _entry_point_script(command_by_program.get(program, ""))
+    if script is None:
+        return None
+    entry_points = _script_entry_points(script)
+    if len(entry_points) != 1:
+        return None
+    return entry_points[0][0]
+
+
+def _entry_point_manifest_paths(command: str) -> list[str]:
+    """The manifest an app's own entry point registers with, when the program's command ends in one.
+
+    A Python app runs its console script from the workspace venv and registers from inside it
+    (the terminal's entry point calls ``app_manifest.registry.register_app`` with its manifest),
+    so the manifest path is a constant the script's module exports as ``MANIFEST_PATH`` rather
+    than a flag on the command line.
+    """
+    script = _entry_point_script(command)
+    manifest_paths: list[str] = []
+    for package_directory, entry_point in (
+        _script_entry_points(script) if script else []
+    ):
+        module_name = entry_point.partition(":")[0]
         module_relative = Path(*module_name.split(".")).with_suffix(".py")
         for module_file in (
-            pyproject_path.parent / module_relative,
-            pyproject_path.parent / "src" / module_relative,
+            package_directory / module_relative,
+            package_directory / "src" / module_relative,
         ):
             if module_file.is_file():
                 manifest_path = _manifest_path_constant(module_file)
@@ -126,7 +193,9 @@ def test_every_manifest_validates_against_the_repo_root(manifest_path: Path) -> 
 
 
 @pytest.mark.parametrize(
-    "convention_path", sorted(set(APP_CONVENTIONS + SKILL_CONVENTIONS)), ids=str
+    "convention_path",
+    sorted(set(APP_CONVENTIONS + SKILL_CONVENTIONS + SERVICE_CONVENTIONS)),
+    ids=str,
 )
 def test_every_convention_doc_the_scope_file_names_exists(convention_path: str) -> None:
     # The scope file points every review pass at these; a renamed doc would otherwise
@@ -134,27 +203,138 @@ def test_every_convention_doc_the_scope_file_names_exists(convention_path: str) 
     assert (_REPO_ROOT / convention_path).is_file(), convention_path
 
 
+@pytest.mark.parametrize(
+    "manifest_path", _built_in_manifest_paths(), ids=lambda path: path.parent.name
+)
+def test_built_in_app_footprint_carries_the_drop_ins_that_run_it(
+    manifest_path: Path,
+) -> None:
+    # The footprint's wiring is read off the real tree here, where every program block
+    # is a drop-in: a finder that reads the daemon's config alone finds nothing for any
+    # app, and the library's own tests write their own layout, so none of them sees that.
+    manifest = load_manifest(manifest_path, repo_root=_REPO_ROOT)
+    scope = compute_app_scope(_REPO_ROOT, manifest_path, manifest)
+    sections_by_path = {entry.path: list(entry.sections) for entry in scope.wiring}
+
+    for program in (manifest.program, *manifest.wiring.programs):
+        dropin = f"system/supervisord.conf.d/{program}.conf"
+        # A wiring program may be an event listener (the Screen's watcher), declared in its own section kind.
+        assert sections_by_path.get(dropin) in (
+            [f"program:{program}"],
+            [f"eventlistener:{program}"],
+        ), (
+            f"{manifest_path} runs program {program!r}, whose drop-in the footprint does not "
+            f"carry as wiring: {sections_by_path}"
+        )
+
+
 def test_every_declared_wiring_program_has_a_supervisord_block() -> None:
-    command_by_program = _command_by_program()
+    command_by_program = _program_or_listener_commands()
     for manifest_path in _every_manifest_path():
-        for program in load_manifest(manifest_path, repo_root=_REPO_ROOT).wiring.programs:
+        for program in load_manifest(
+            manifest_path, repo_root=_REPO_ROOT
+        ).wiring.programs:
             assert program in command_by_program, (
-                f"{manifest_path} declares wiring program {program!r}, which supervisord.conf does not define"
+                f"{manifest_path} declares wiring program {program!r}, which neither "
+                "system/supervisord.conf nor a drop-in beside it defines"
             )
 
 
 def test_the_first_label_of_every_standalone_program_is_a_reserved_app_name() -> None:
     # An app named after a standalone program's first label would claim that program as
     # its <name>-<role> sidecar when its footprint is computed, so the label is reserved.
-    app_programs = {load_manifest(path, repo_root=_REPO_ROOT).program for path in _every_manifest_path()}
+    manifests = [
+        load_manifest(path, repo_root=_REPO_ROOT) for path in _every_manifest_path()
+    ]
+    # A program an app's manifest declares as its wiring (the Screen's stack members) is that app's, not standalone.
+    app_programs = {manifest.program for manifest in manifests} | {
+        program for manifest in manifests for program in manifest.wiring.programs
+    }
     standalone_labels = {
         program.partition("-")[0]
-        for program in _command_by_program()
+        for program in _program_commands()
         if "-" in program and program not in app_programs
     }
     unreserved = sorted(standalone_labels - RESERVED_APP_NAMES)
 
-    assert unreserved == [], f"add these to RESERVED_APP_NAMES (and forward_port.py's RESERVED_NAMES): {unreserved}"
+    assert unreserved == [], (
+        f"add these to RESERVED_APP_NAMES (and forward_port.py's RESERVED_NAMES): {unreserved}"
+    )
+
+
+def test_no_app_claims_another_apps_program_as_a_sidecar() -> None:
+    # The sidecar rule is a prefix match on the app NAME (``scope.py``'s
+    # ``sidecar_prefix``), so an app named ``pr`` claims ``program:pr-review`` as its
+    # own. Reserving the first label of every standalone program (the test above)
+    # does not cover this: both sides here carry a manifest, so neither is standalone,
+    # and the collision is between two ordinary apps. Checked over every manifest in
+    # the tree, user-built apps included, since that is where two such names would meet.
+    # An app matching itself is no collision: a manifest may set ``program`` to its own
+    # ``<name>-<role>`` form, and that program IS its sidecar. Neither is a program the
+    # claiming app's own package runs: ``terminal_pty`` is only the manifest of an origin
+    # the ``terminal`` package registers and runs (its ``terminal-pty`` console script), so
+    # ``program:terminal-pty`` is the terminal's sidecar in fact as well as by name.
+    command_by_program = _program_commands()
+    manifest_by_package = {
+        path.parent: load_manifest(path, repo_root=_REPO_ROOT)
+        for path in _every_manifest_path()
+    }
+    collisions = sorted(
+        f"{owner.name} would claim {claimed.program!r} (app {claimed.name})"
+        for owner_package, owner in manifest_by_package.items()
+        for claimed in manifest_by_package.values()
+        if owner is not claimed
+        and claimed.program.startswith(f"{owner.name}-")
+        and owner_package
+        != _package_running_program(claimed.program, command_by_program)
+    )
+
+    assert collisions == [], (
+        f"apps whose names collide with another app's program: {collisions}"
+    )
+
+
+def test_no_two_app_packages_declare_the_same_console_script() -> None:
+    # Every built-in app package installs into the one workspace venv, so two declaring one
+    # script name leave one file in its bin directory for whichever installed last. It is also
+    # what lets a supervisord command ending in a script name be traced back to the package
+    # that runs it, which the sidecar guard above rests on. Checked over every app package,
+    # user-built apps included: one declaring a built-in's script name would leave that
+    # built-in's program with two packages to trace back to.
+    packages_by_script: dict[str, list[str]] = {}
+    for package, scripts in _scripts_by_package().items():
+        for script_name in scripts:
+            packages_by_script.setdefault(script_name, []).append(package.name)
+    shared = sorted(
+        f"{script_name}: {', '.join(sorted(packages))}"
+        for script_name, packages in packages_by_script.items()
+        if len(packages) > 1
+    )
+
+    assert shared == [], (
+        f"console scripts declared by more than one app package: {shared}"
+    )
+
+
+def test_every_built_in_python_app_is_a_root_dependency() -> None:
+    # A `uv sync` without --all-packages prunes every workspace member the root project does not
+    # depend on, deleting the console scripts the apps' programs exec from .venv/bin.
+    root = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
+    dependencies = {
+        re.split(r"[\s\[<>=!~;]", entry, maxsplit=1)[0]
+        for entry in root["project"]["dependencies"]
+    }
+    missing = sorted(
+        project_name
+        for package in _BUILT_IN_APP_PACKAGES
+        if (pyproject := _APPS_DIR / package / "pyproject.toml").is_file()
+        and (project_name := tomllib.loads(pyproject.read_text())["project"]["name"])
+        not in dependencies
+    )
+
+    assert missing == [], (
+        f"built-in apps the root pyproject.toml does not depend on: {missing}"
+    )
 
 
 def test_every_built_in_app_directory_ships_a_manifest() -> None:
@@ -174,7 +354,7 @@ def test_built_in_manifest_validates_and_matches_its_program(
     manifest_path: Path,
 ) -> None:
     manifest = load_manifest(manifest_path)
-    command_by_program = _command_by_program()
+    command_by_program = _program_commands()
 
     assert manifest.program in command_by_program, (
         f"{manifest_path} names program {manifest.program!r}, which supervisord.conf does not define"
@@ -207,6 +387,27 @@ def test_built_in_manifest_validates_and_matches_its_program(
 @pytest.mark.parametrize(
     "manifest_path", _built_in_manifest_paths(), ids=lambda path: path.parent.name
 )
+def test_built_in_app_runs_its_entry_point_from_the_workspace_venv(
+    manifest_path: Path,
+) -> None:
+    # The venv is an app's only install, and the update's pre-flight boots
+    # ``.venv/bin/<script>``; a bare entry point is resolved through PATH, which can reach
+    # some other install.
+    manifest = load_manifest(manifest_path)
+    command = _program_commands()[manifest.program]
+    script = _entry_point_script(command)
+
+    assert script is not None, (
+        f"program {manifest.program!r} does not exec from {_VENV_BIN_PREFIX}: {command}"
+    )
+    assert _script_entry_points(script), (
+        f"no app package declares the console script {script!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "manifest_path", _built_in_manifest_paths(), ids=lambda path: path.parent.name
+)
 def test_built_in_manifest_priority_is_a_band(manifest_path: Path) -> None:
     manifest = load_manifest(manifest_path)
 
@@ -218,32 +419,351 @@ def test_built_in_manifest_priority_is_a_band(manifest_path: Path) -> None:
     assert manifest.priority != "user"
 
 
+@pytest.mark.parametrize(
+    "manifest_path", _built_in_manifest_paths(), ids=lambda path: path.parent.name
+)
+def test_built_in_manifest_keybindings_spell_their_default_chords_in_the_grammar(
+    manifest_path: Path,
+) -> None:
+    # The shell's Keyboard shortcuts dialog skips a registry row whose default chords are
+    # off the grammar, and the app's own resolved-chords route refuses to load them.
+    manifest = load_manifest(manifest_path)
+
+    assert find_off_grammar_default_chords(manifest.keybindings) == []
+
+
+@pytest.mark.parametrize(
+    "manifest_path",
+    [
+        path
+        for path in _built_in_manifest_paths()
+        if "preview" in tomllib.loads(path.read_text())
+    ],
+    ids=lambda path: path.parent.name,
+)
+def test_every_built_in_preview_boots_its_programs_entry_point(
+    manifest_path: Path,
+) -> None:
+    # preview_app.py execs the preview command, or the program's name when the table names
+    # none, with the venv's bin first on PATH; whatever the venv holds under that name is
+    # what boots. Anything but the script the app's own program runs previews some other
+    # package, or nothing.
+    manifest = load_manifest(manifest_path)
+    launched = (
+        manifest.preview.command[0]
+        if manifest.preview.command
+        else str(manifest.program)
+    )
+    program_script = _entry_point_script(_program_commands()[manifest.program])
+
+    assert launched == program_script, (
+        f"{manifest.name}'s preview runs {launched!r}, but its program runs {program_script!r}"
+    )
+
+
 def test_built_in_manifests_agree_with_the_contract_table() -> None:
     by_name = {
-        manifest.name: manifest
+        str(manifest.name): manifest
         for manifest in map(load_manifest, _built_in_manifest_paths())
     }
 
     assert by_name["system_interface"].internal is True
     assert by_name["system_interface"].critical is True
+    # The terminal's pty origin (desktop-interface contracts.md section 2): ttyd, framed by the
+    # terminal's wrapper page, never offered on its own.
+    assert by_name["terminal-pty"].internal is True
+    assert by_name["terminal-pty"].critical is True
+    assert by_name["terminal-pty"].program == "terminal-pty"
+    assert by_name["terminal-pty"].priority == "terminal"
+    assert by_name["terminal-pty"].launch_paths == ()
+    assert by_name["terminal-pty"].default_shortcuts == ()
     assert by_name["chat"].internal is False
     assert by_name["chat"].critical is True
     assert by_name["chat"].program == "chat"
     assert by_name["chat"].priority == "chat"
-    assert by_name["chat"].instances is True
-    assert by_name["chat"].instances_url is None
-    assert by_name["chat"].default_shortcut is not None
-    assert by_name["chat"].default_shortcut.action == "new"
-    assert by_name["chat"].default_shortcut.mode == "new"
-    assert [action.id for action in by_name["chat"].actions] == ["new", "subagent"]
     assert by_name["terminal"].critical is True
     assert by_name["files"].critical is False
-    assert by_name["browser"].critical is False
-    for name in ("terminal", "files", "browser"):
-        assert by_name[name].instances is True
-        assert by_name[name].default_shortcut is not None
-        assert by_name[name].default_shortcut.action == "new"
-        assert [action.id for action in by_name[name].actions] == ["new"]
-    assert by_name["terminal"].instances_url == "http://127.0.0.1:7682"
-    assert by_name["files"].instances_url == "http://127.0.0.1:8301"
-    assert by_name["browser"].instances_url is None
+    assert by_name["screen"].critical is False
+    # The Screen (docs/system/specs/screen/spec.md D2 and section 18): one page at its root, the browser a launch
+    # path of it, the stack's programs and the watcher its wiring, never stopped for emptiness, band ``screen``.
+    assert by_name["screen"].program == "screen"
+    assert by_name["screen"].priority == "screen"
+    assert by_name["screen"].system is True
+    # Each of its launch paths is a desktop shortcut, as each is a launcher row.
+    assert [
+        (shortcut.launch, shortcut.mode)
+        for shortcut in by_name["screen"].default_shortcuts
+    ] == [
+        ("screen", "focus"),
+        ("browser", "focus"),
+    ]
+    assert [
+        (entry.id, entry.path, entry.method.value)
+        for entry in by_name["screen"].launch_paths
+    ] == [
+        ("screen", "/", "GET"),
+        ("browser", "/launch/browser", "POST"),
+    ]
+    assert [param.name for param in by_name["screen"].launch_paths[1].params] == ["url"]
+    assert by_name["screen"].wiring.programs == (
+        "screen-xorg",
+        "screen-session",
+        "screen-pulse",
+        "screen-neko",
+        "screen-watch",
+    )
+    assert [
+        (handler.type, handler.path) for handler in by_name["screen"].message_handlers
+    ] == [("open:url", "/api/open-url")]
+    # The actions the Keyboard shortcuts dialog lists (the user-profile-state spec in the mngr
+    # repository, section 10): the terminal declares none, since xterm owns its page's keystrokes.
+    assert {
+        name: [str(action.id) for action in manifest.keybindings]
+        for name, manifest in by_name.items()
+        if manifest.keybindings
+    } == {
+        "system_interface": ["launcher-secondary-send"],
+        "chat": ["send-message"],
+        "files": [
+            "select-all",
+            "go-up",
+            "back",
+            "forward",
+            "new-folder",
+            "open",
+            "rename",
+            "delete",
+            "clear-selection",
+            "save-file",
+        ],
+    }
+    # The stop-when-no-windows spec, section 4.2: Files, Getting Started, Routines, System Monitor, and the
+    # Style Guide stop once no window shows them; the Screen never stops for emptiness (the Screen spec, D3);
+    # and the critical ones (which the manifest refuses the field on) never stop.
+    assert {
+        name: manifest.stop_when_no_windows for name, manifest in by_name.items()
+    } == {
+        "system_interface": False,
+        "chat": False,
+        "terminal": False,
+        "terminal-pty": False,
+        "files": True,
+        "screen": False,
+        "getting-started": True,
+        "routines": True,
+        "system-monitor": True,
+        "style-guide": True,
+    }
+    # The composer's dictation (the workspace-voice-input spec in the mngr repository) is the one built-in that
+    # listens, so the chat's frames alone are handed the microphone.
+    assert {name for name, manifest in by_name.items() if manifest.uses_microphone} == {"chat"}
+    # Where the minds Share tab lists each built-in: never for an internal one, under its System group for the
+    # interfaces the workspace is built out of, and up front for the rest.
+    assert {
+        name: "internal"
+        if manifest.internal
+        else "system"
+        if manifest.system
+        else "app"
+        for name, manifest in by_name.items()
+    } == {
+        "system_interface": "internal",
+        "chat": "system",
+        "terminal": "system",
+        "terminal-pty": "internal",
+        "files": "app",
+        "screen": "system",
+        "getting-started": "system",
+        "routines": "app",
+        "system-monitor": "system",
+        "style-guide": "system",
+    }
+    # Getting Started (launcher-and-getting-started plan section 3.6): one window is what it is for, so its shortcut
+    # focuses it like the Screen's; it declares no launch path, so the desktop synthesizes ``open`` at its root.
+    assert by_name["getting-started"].critical is False
+    assert by_name["getting-started"].program == "getting-started"
+    assert by_name["getting-started"].priority == "getting-started"
+    assert by_name["getting-started"].launch_paths == ()
+    assert [
+        (shortcut.launch, shortcut.mode)
+        for shortcut in by_name["getting-started"].default_shortcuts
+    ] == [("open", "focus")]
+    assert by_name["getting-started"].pin is None
+    # Its preview (update-app's preview_app.py) boots unregistered, so it does not re-point the live row.
+    assert by_name["getting-started"].preview.command[:2] == (
+        "getting-started",
+        "--no-register",
+    )
+    # System Monitor: one polling page (its views are paths of it, reached inside the app), focused like Getting
+    # Started, with its own band so it is shed after every user service.
+    assert by_name["system-monitor"].critical is False
+    assert by_name["system-monitor"].program == "system-monitor"
+    assert by_name["system-monitor"].priority == "system-monitor"
+    assert by_name["system-monitor"].launch_paths == ()
+    assert [
+        (shortcut.launch, shortcut.mode)
+        for shortcut in by_name["system-monitor"].default_shortcuts
+    ] == [("open", "focus")]
+    # Routines: one window over the schedule, focused like System Monitor; the runner's notifications land on a
+    # routine's page through the one message type it registers, with the library's routine_id field as the path.
+    assert by_name["routines"].critical is False
+    assert by_name["routines"].program == "routines"
+    assert by_name["routines"].priority == "routines"
+    assert by_name["routines"].launch_paths == ()
+    assert [
+        (shortcut.launch, shortcut.mode)
+        for shortcut in by_name["routines"].default_shortcuts
+    ] == [("open", "focus")]
+    assert [
+        (handler.type, handler.show) for handler in by_name["routines"].message_handlers
+    ] == [("minds:show-routine", "/{routine_id}")]
+    assert by_name["routines"].preview.env["ROUTINES_APP_PREVIEW"] == "1"
+    # One order for the built-ins: the desktop seeds its shortcuts in it and the launcher lists its apps in it.
+    assert sorted(
+        (manifest.launcher_rank, manifest.name)
+        for manifest in by_name.values()
+        if manifest.launcher_rank is not None
+    ) == [
+        (10, "chat"),
+        (15, "getting-started"),
+        (20, "files"),
+        (30, "screen"),
+        (40, "terminal"),
+        (45, "routines"),
+        (50, "system-monitor"),
+    ]
+    # Every seeded shortcut opens a new window of its app; the one Screen is focused instead (the Screen spec D2).
+    for name, mode in (
+        ("chat", "new"),
+        ("terminal", "new"),
+        ("files", "new"),
+        ("screen", "focus"),
+    ):
+        assert {shortcut.mode for shortcut in by_name[name].default_shortcuts} == {
+            mode
+        }, name
+    # The desktop interface's launch paths (desktop-interface contracts.md section 2; the POST ones are the
+    # post-launch-paths plan's section 7 and 8).
+    assert by_name["system_interface"].launch_paths == ()
+    assert [
+        (entry.id, entry.path, entry.method.value)
+        for entry in by_name["chat"].launch_paths
+    ] == [
+        ("root", "/", "GET"),
+        ("main", "/api/chats/intake", "POST"),
+        ("new", "/api/chats/intake", "POST"),
+        ("send", "/api/chats/intake", "POST"),
+        ("draft", "/api/chats/intake", "POST"),
+        ("lounge", "/api/chats/intake", "POST"),
+        ("app-chat", "/api/chats/intake", "POST"),
+    ]
+    assert [shortcut.launch for shortcut in by_name["chat"].default_shortcuts] == [
+        "root"
+    ]
+    for name, launch_path, method in (
+        ("terminal", "/new", "POST"),
+        ("files", "/home/user/workspace/", "GET"),
+    ):
+        assert [
+            (entry.id, entry.path, entry.method.value)
+            for entry in by_name[name].launch_paths
+        ] == [("new", launch_path, method)], name
+        assert [shortcut.launch for shortcut in by_name[name].default_shortcuts] == [
+            "new"
+        ], name
+    assert [param.name for param in by_name["chat"].launch_paths[0].params] == []
+    assert [param.name for param in by_name["chat"].launch_paths[1].params] == [
+        "message"
+    ]
+    assert [param.name for param in by_name["chat"].launch_paths[2].params] == [
+        "account_id",
+        "message",
+    ]
+    assert [param.name for param in by_name["chat"].launch_paths[3].params] == [
+        "message"
+    ]
+    assert [param.name for param in by_name["chat"].launch_paths[4].params] == [
+        "message"
+    ]
+    assert [param.name for param in by_name["chat"].launch_paths[5].params] == [
+        "message"
+    ]
+    assert [param.name for param in by_name["chat"].launch_paths[6].params] == [
+        "app",
+        "app_display_name",
+    ]
+    # The intake's presets (post-launch-paths plan section 3.5): how each launch path chooses the receiving chat.
+    assert by_name["chat"].launch_paths[0].presets == {}
+    assert by_name["chat"].launch_paths[1].presets == {"target": "main_chat"}
+    assert by_name["chat"].launch_paths[2].presets == {"target": "new_chat"}
+    assert by_name["chat"].launch_paths[3].presets == {"target": "chat_selector"}
+    assert by_name["chat"].launch_paths[4].presets == {
+        "target": "current_chat",
+        "is_draft": "true",
+    }
+    # The tray's mention of a person (the multiplayer spec, section 7.5): drafted into the Lounge.
+    assert by_name["chat"].launch_paths[5].presets == {
+        "target": "lounge",
+        "is_draft": "true",
+    }
+    # A window's "Chat about this app" (the multiplayer spec, section 9.2): the chat about the named app.
+    assert by_name["chat"].launch_paths[6].presets == {"target": "app_chat"}
+    app_params = by_name["chat"].launch_paths[6].app_params
+    assert app_params is not None
+    assert (app_params.name, app_params.display_name) == ("app", "app_display_name")
+    # The launcher's free-text rows (launcher-and-getting-started plan section 3.1): the chat's ``main`` (the
+    # launcher's Enter) sends the typed text to the main chat, its ``new`` takes it as a new chat's first message,
+    # its ``send`` as a message to an existing chat, and its ``draft`` as text for a composer; the ``lounge`` path
+    # declares the mention param alone (the multiplayer spec, section 7.5), the ``app-chat`` path the app params
+    # alone (section 9.2), and nothing else declares a text, draft, mention, or app param.
+    assert by_name["chat"].launch_paths[0].text_param is None
+    assert by_name["chat"].launch_paths[1].text_param == "message"
+    assert by_name["chat"].launch_paths[2].text_param == "message"
+    assert by_name["chat"].launch_paths[3].text_param == "message"
+    assert by_name["chat"].launch_paths[4].text_param is None
+    assert by_name["chat"].launch_paths[4].draft_param == "message"
+    assert by_name["chat"].launch_paths[5].text_param is None
+    assert by_name["chat"].launch_paths[5].draft_param is None
+    assert by_name["chat"].launch_paths[5].mention_param == "message"
+    assert [entry.mention_param for entry in by_name["chat"].launch_paths[:5]] == [
+        None
+    ] * 5
+    assert by_name["chat"].launch_paths[6].mention_param is None
+    assert [entry.text_param for entry in by_name["chat"].launch_paths[5:]] == [
+        None,
+        None,
+    ]
+    assert [entry.draft_param for entry in by_name["chat"].launch_paths[5:]] == [
+        None,
+        None,
+    ]
+    assert [entry.app_params for entry in by_name["chat"].launch_paths[:6]] == [
+        None
+    ] * 6
+    for name in ("terminal", "files"):
+        assert by_name[name].launch_paths[0].text_param is None, name
+        assert by_name[name].launch_paths[0].draft_param is None, name
+        assert by_name[name].launch_paths[0].mention_param is None, name
+        assert by_name[name].launch_paths[0].app_params is None, name
+        assert by_name[name].launch_paths[0].presets == {}, name
+    assert [param.name for param in by_name["terminal"].launch_paths[0].params] == [
+        "workdir"
+    ]
+    assert [param.name for param in by_name["files"].launch_paths[0].params] == ["path"]
+
+
+def test_every_package_the_template_ships_is_a_root_member() -> None:
+    # A package under system/ that is neither a root member nor standalone would run as a
+    # user package without being one: a package the template ships is listed, and a user
+    # package carries its own lock.
+    unlisted = [
+        relative
+        for relative in user_packages.user_packages(_REPO_ROOT)
+        if not (_REPO_ROOT / relative / "uv.lock").is_file()
+    ]
+    assert unlisted == [], (
+        f"{unlisted} sit under system/ with no uv.lock of their own and are not root "
+        "workspace members. A package the template ships belongs in the root "
+        "pyproject.toml's [tool.uv.workspace] members; a user package is instead "
+        f"converted to a standalone project ({user_packages.MIGRATION_REFERENCE})."
+    )

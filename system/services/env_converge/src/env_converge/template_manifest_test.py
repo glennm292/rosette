@@ -1,5 +1,6 @@
 import ast
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -11,17 +12,22 @@ from env_converge.template_manifest import (
     MANIFEST_MARKDOWN_NAME,
     MANIFEST_THUMBNAIL_NAME,
     MANIFEST_TOML_NAME,
+    SUPERVISORD_DROPIN_DIRECTORY,
+    AdaptationRequirement,
     Requirements,
     TemplateManifest,
     TemplateManifestNotFoundError,
     TemplateManifestParseError,
     check_env_d_units,
     check_markdown_agreement,
+    check_secret_references,
     check_unfinished_placeholders,
     find_manifest_path,
     load_template_manifest,
     validate_template_tree,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[5]
 
 _MINIMAL_TOML = """
 format = "v2"
@@ -66,7 +72,7 @@ def _manifest(toml_text: str, tmp_path: Path) -> TemplateManifest:
     return load_template_manifest(path)
 
 
-# --- the schema itself ---
+# the schema itself
 
 
 def test_a_minimal_manifest_loads_with_the_documented_defaults(tmp_path: Path) -> None:
@@ -223,7 +229,7 @@ def test_a_v1_repo_with_slug_named_manifests_is_not_mistaken_for_v2(
     assert find_manifest_path(tmp_path) is None
 
 
-# --- env.d unit checks ---
+# env.d unit checks
 
 
 def _manifest_with_units(
@@ -296,7 +302,7 @@ def test_a_unit_covered_by_a_parent_include_path_is_accepted(tmp_path: Path) -> 
     assert check_env_d_units(manifest) == ()
 
 
-# --- markdown / toml agreement ---
+# markdown / toml agreement
 
 
 def test_matching_markdown_and_toml_agree(tmp_path: Path) -> None:
@@ -389,7 +395,7 @@ def test_declared_activation_requirements_matching_the_markdown_pass(
     assert check_markdown_agreement(manifest, markdown) == ()
 
 
-# --- placeholders ---
+# placeholders
 
 
 def test_unreplaced_placeholders_are_caught() -> None:
@@ -398,7 +404,7 @@ def test_unreplaced_placeholders_are_caught() -> None:
     assert check_unfinished_placeholders("<!-- minds-placeholder-thumbnail -->")
 
 
-# --- the whole tree ---
+# the whole tree
 
 
 def test_a_complete_tree_validates_clean(tmp_path: Path) -> None:
@@ -463,6 +469,40 @@ def test_a_tree_still_carrying_the_placeholder_thumbnail_is_flagged(
     assert any("placeholder thumbnail" in problem for problem in problems)
 
 
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "<svg><script>alert(1)</script></svg>",
+        "<svg><foreignObject><div/></foreignObject></svg>",
+        '<svg><rect onload="x()"/></svg>',
+        '<svg><rect ONCLICK = "x()"/></svg>',
+    ],
+)
+def test_an_unsafe_thumbnail_is_flagged_even_on_an_unfinished_skeleton(
+    tmp_path: Path, unsafe: str
+) -> None:
+    """The thumbnail renders on GitHub and in the adopter's app, so it must stay inert."""
+    _write_tree(tmp_path, thumbnail_text=unsafe)
+
+    problems = validate_template_tree(tmp_path, is_unfinished_allowed=True)
+
+    assert any("thumbnail" in problem for problem in problems)
+
+
+def test_ordinary_svg_attributes_are_not_mistaken_for_event_handlers(
+    tmp_path: Path,
+) -> None:
+    _write_tree(
+        tmp_path,
+        thumbnail_text=(
+            '<svg version="1.1" viewBox="0 0 240 160"><text font-family="sans-serif" '
+            'text-anchor="middle" dominant-baseline="central">Inbox</text></svg>'
+        ),
+    )
+
+    assert validate_template_tree(tmp_path) == ()
+
+
 def test_a_readme_with_an_unfinished_block_is_flagged(tmp_path: Path) -> None:
     _write_tree(tmp_path)
     (tmp_path / "README.md").write_text("<!-- FILL-IN (publishing agent): overview -->")
@@ -486,7 +526,7 @@ def test_every_problem_in_a_tree_is_reported_at_once(tmp_path: Path) -> None:
     assert len(problems) >= 2
 
 
-# --- the import constraint that keeps the publish-time gate runnable ---
+# the import constraint that keeps the publish-time gate runnable
 
 
 def test_the_schema_module_imports_only_stdlib_and_pydantic() -> None:
@@ -554,11 +594,11 @@ def test_an_template_needing_no_activation_says_so() -> None:
     # straight to the adaptation conversation instead of opening approval flows.
     assert not Requirements().has_activation_requirements()
     assert not Requirements(
-        adaptation=({"summary": "swap the data source"},)
+        adaptation=(AdaptationRequirement(summary="swap the data source"),)
     ).has_activation_requirements()
 
 
-# --- front matter is YAML, and titles are the user's own words ---
+# front matter is YAML, and titles are the user's own words
 
 
 @pytest.mark.parametrize(
@@ -623,7 +663,7 @@ def test_an_unquoted_plain_title_still_works(tmp_path: Path) -> None:
     assert check_markdown_agreement(manifest, _MINIMAL_MARKDOWN) == ()
 
 
-# --- a manifest written by a workspace we are not ---
+# a manifest written by a workspace we are not
 
 
 def test_a_format_this_workspace_does_not_write_is_refused(tmp_path: Path) -> None:
@@ -663,3 +703,143 @@ def test_a_manifest_with_no_format_key_is_treated_as_ours(tmp_path: Path) -> Non
     manifest = _manifest(_MINIMAL_TOML.replace('format = "v2"\n', ""), tmp_path)
 
     assert manifest.format == CURRENT_MANIFEST_FORMAT
+
+
+def test_a_secret_requirement_names_a_file_with_variables_or_a_legacy_bare_name(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(
+        _MINIMAL_TOML
+        + '\n[[requirements.secret]]\nfile = "widget"\nvariables = ["WIDGET_TOKEN"]\nnote = "a token"\n'
+        + '\n[[requirements.secret]]\nname = "SLACK_SIGNING_SECRET"\n',
+        tmp_path,
+    )
+    modern, legacy = manifest.requirements.secret
+    assert (modern.file, modern.variables, modern.name) == (
+        "widget",
+        ("WIDGET_TOKEN",),
+        None,
+    )
+    assert (legacy.file, legacy.variables, legacy.name) == (
+        None,
+        (),
+        "SLACK_SIGNING_SECRET",
+    )
+    for bad in (
+        '\n[[requirements.secret]]\nfile = "widget"\n',
+        '\n[[requirements.secret]]\nnote = "nothing named"\n',
+        '\n[[requirements.secret]]\nfile = "widget"\nvariables = ["A"]\nname = "A"\n',
+    ):
+        with pytest.raises(TemplateManifestParseError):
+            _manifest(_MINIMAL_TOML + bad, tmp_path)
+
+
+_WIDGET_DROPIN = "system/supervisord.conf.d/widget.conf"
+_TOML_INCLUDING_WIDGET = _MINIMAL_TOML.replace(
+    'include = ["system/apps/slack_inbox"]',
+    f'include = ["system/apps/slack_inbox", "{_WIDGET_DROPIN}", "mcp-servers.json"]',
+)
+
+
+def _write_dropin(root: Path, relative: str, text: str) -> None:
+    (root / relative).parent.mkdir(parents=True, exist_ok=True)
+    (root / relative).write_text(text)
+
+
+def test_an_included_program_or_mcp_server_under_an_undeclared_secret_file_is_flagged(
+    tmp_path: Path,
+) -> None:
+    _write_tree(tmp_path, toml_text=_TOML_INCLUDING_WIDGET)
+    _write_dropin(
+        tmp_path,
+        _WIDGET_DROPIN,
+        '[program:widget]\ncommand=bash -c "python3 system/scripts/with_secrets.py data/.secrets/widget.env -- widget"\n',
+    )
+    (tmp_path / "mcp-servers.json").write_text(
+        '{"mcpServers": {"m": {"args": ["/home/user/workspace/data/.secrets/mailer.env"]}}}'
+    )
+
+    problems = validate_template_tree(tmp_path)
+
+    assert len(problems) == 2
+    assert any(
+        "widget.conf" in problem and "widget.env" in problem for problem in problems
+    )
+    assert any(
+        "mcp-servers.json" in problem and "mailer.env" in problem
+        for problem in problems
+    )
+
+    (tmp_path / "declared").mkdir()
+    declared = _manifest(
+        _TOML_INCLUDING_WIDGET
+        + '\n[[requirements.secret]]\nfile = "widget"\nvariables = ["A"]\n'
+        + '\n[[requirements.secret]]\nfile = "mailer"\nvariables = ["B"]\n',
+        tmp_path / "declared",
+    )
+    assert check_secret_references(tmp_path, declared) == ()
+
+
+def test_the_stock_workspace_programs_need_no_template_secret(tmp_path: Path) -> None:
+    """Every snapshot carries the base's own programs, whatever it includes.
+
+    Those programs run under files Imbue Studio provides, not anything a template
+    could declare, so the template's own include set is all that is checked. Copies
+    the real drop-ins so a new base program is covered too.
+    """
+    _write_tree(tmp_path)
+    shutil.copytree(
+        _REPO_ROOT / SUPERVISORD_DROPIN_DIRECTORY,
+        tmp_path / SUPERVISORD_DROPIN_DIRECTORY,
+    )
+
+    assert validate_template_tree(tmp_path, is_unfinished_allowed=True) == ()
+
+
+def test_a_base_program_outside_the_include_set_is_not_checked(tmp_path: Path) -> None:
+    _write_tree(tmp_path, toml_text=_TOML_INCLUDING_WIDGET)
+    _write_dropin(
+        tmp_path,
+        "system/supervisord.conf.d/host-backup.conf",
+        "[program:host-backup]\ncommand=python3 system/scripts/with_secrets.py data/.secrets/restic.env -- host-backup\n",
+    )
+
+    assert (
+        check_secret_references(tmp_path, _manifest(_TOML_INCLUDING_WIDGET, tmp_path))
+        == ()
+    )
+
+
+def test_a_secret_file_named_only_in_a_supervisord_comment_is_not_a_reference(
+    tmp_path: Path,
+) -> None:
+    """Supervisord reads `#`/`;` lines and whitespace-preceded inline `;`/`#` as comments."""
+    _write_tree(tmp_path, toml_text=_TOML_INCLUDING_WIDGET)
+    _write_dropin(
+        tmp_path,
+        _WIDGET_DROPIN,
+        "# idles watching data/.secrets/share.env\n"
+        "; data/.secrets/restic.env is injected by Imbue Studio\n"
+        "[program:widget]\n"
+        "command=widget-app ; reads data/.secrets/inline-semicolon.env\n"
+        "directory=/home/user/workspace # data/.secrets/inline-hash.env\n",
+    )
+
+    assert (
+        check_secret_references(tmp_path, _manifest(_TOML_INCLUDING_WIDGET, tmp_path))
+        == ()
+    )
+
+
+def test_an_unparseable_included_program_is_reported_rather_than_raised(
+    tmp_path: Path,
+) -> None:
+    _write_tree(tmp_path, toml_text=_TOML_INCLUDING_WIDGET)
+    _write_dropin(tmp_path, _WIDGET_DROPIN, "command=x data/.secrets/ghost.env\n")
+
+    problems = check_secret_references(
+        tmp_path, _manifest(_TOML_INCLUDING_WIDGET, tmp_path)
+    )
+
+    assert len(problems) == 1
+    assert "widget.conf" in problems[0]

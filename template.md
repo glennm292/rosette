@@ -2,7 +2,7 @@
 title: "Rosette"
 description: "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail: "template.svg"
-version: v3
+version: v4
 format: v2
 ---
 
@@ -258,10 +258,12 @@ whatever this publisher happened to have.
 
 Nothing extra -- runs on the stock workspace environment. The app's only
 dependencies are ordinary Python packages declared in its own `pyproject.toml`
-(flask, flask-sock, litellm, loguru, pydantic, werkzeug), which `uv sync
---all-packages` resolves like any other package in the repo; it shells out to
-nothing but the `claude` CLI the workspace already has, and only on the keyless
-route. The `[environment]` tables in
+(flask, flask-sock, litellm, loguru, pydantic, werkzeug). It is a standalone uv
+project: it carries its own `uv.lock` and its own `.venv`, and its supervisord
+program syncs that project from the lock before starting, so its dependencies
+never move a built-in's. Nothing has to be added to the workspace's own lock or
+venv. It shells out to nothing but the `claude` CLI the workspace already has,
+and only on the keyless route. The `[environment]` tables in
 `template.toml` are therefore empty by design, not by omission.
 
 One runtime note that is not an environment declaration: the page loads two
@@ -338,6 +340,8 @@ This is distinct from "Adaptation history" below, which is the ADOPTERS' log.
 - A damaged cleared-lines file no longer stops the app from starting.
 - Short English phrases ("to hit") are now translated, rather than explained
   back in English; glossing is only for the language being learned.
+
+### v4 (2026-11-19) -- Review page for past sittings; short phrases translated rather than marked; the answer no longer redraws while you edit; rebuilt on the current workspace base.
 
 ## Adaptation history
 

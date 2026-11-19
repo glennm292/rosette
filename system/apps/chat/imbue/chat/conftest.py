@@ -17,6 +17,7 @@ from playwright.sync_api import sync_playwright
 
 from imbue.chat.agent_manager import AgentManager
 from imbue.chat.testing import FORTRESS_CHROMIUM_PATH
+from imbue.chat.testing import private_tmux_server
 from imbue.chat.ws_broadcaster import WebSocketBroadcaster
 
 
@@ -33,7 +34,7 @@ def _isolate_chat_tests(
     these (e.g. the chat endpoints, ``AgentManager.build``) gets an
     empty world rather than the developer's running agents.
 
-    No ``observe`` pipeline runs in tests because nothing calls
+    No follower of the agent observer runs in tests because nothing calls
     ``AgentManager.start``: ``create_application`` takes an already-built state
     and never starts the manager, and ``testing.build_test_state`` only builds
     one. ``main`` is the sole caller of ``start``.
@@ -43,11 +44,10 @@ def _isolate_chat_tests(
     run would write into the developer's own ``~/.minds``, and the leaked account would
     then bind every subsequent create in the session.
 
-    Skipped for ``agent_manager_test.py``: those tests deliberately exercise
-    ``AgentManager.start`` / ``_start_observe`` (long-lived subprocess behavior,
-    watchdog behavior, etc.) and need the real observe semantics with the
-    developer's actual MNGR_HOST_DIR. They do their own per-test
-    ``monkeypatch.setenv`` for the cases they care about.
+    Skipped for ``agent_manager_test.py``: those tests set the host dir themselves
+    through the ``agent_manager`` fixture (the follower reads the observer's event
+    file under it) and do their own per-test ``monkeypatch.setenv`` for the cases
+    they care about.
 
     CI doesn't have MNGR_HOST_DIR set and doesn't have running docker
     containers, so this only bites local developer runs; the fixture closes
@@ -61,7 +61,7 @@ def _isolate_chat_tests(
     # The chat document reads the app registry (for the terminal's origin label) from the
     # working directory otherwise, which in a workspace is the live one.
     monkeypatch.setenv("MINDS_APPS_FILE", str(tmp_path_factory.mktemp("minds-registry") / "apps.toml"))
-    # The chat's posts to the shell (nudges, client activity) go to the workspace's real shell
+    # The chat's posts to the shell (client activity) go to the workspace's real shell
     # otherwise; a port nothing listens on refuses them at once. The pipeline and e2e tests
     # serve a shell of their own and point at it.
     monkeypatch.setenv("MINDS_WORKSPACE_SERVER_URL", "http://127.0.0.1:1")
@@ -238,7 +238,7 @@ def agent_manager(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> AgentManager:
-    """Create an AgentManager without starting the observe subprocess.
+    """Create an AgentManager without starting its follower.
 
     ``MNGR_HOST_DIR`` is forced to a per-test ``tmp_path`` so the
     activity-state marker watcher does not try to attach to the developer's
@@ -253,11 +253,7 @@ def agent_manager(
 
 @pytest.fixture
 def false_binary() -> str:
-    """Cross-platform path to a binary that exits immediately with failure.
-
-    Used by tests that exercise the observe watchdog's error path without
-    relying on a real mngr installation.
-    """
+    """Cross-platform path to a binary that exits immediately with failure: a stand-in for an mngr verb that fails."""
     path = shutil.which("false")
     assert path is not None, "Could not find 'false' binary on this system"
     return path
@@ -308,3 +304,10 @@ def git_work_dir(tmp_path: Path) -> Path:
         },
     )
     return tmp_path
+
+
+@pytest.fixture
+def isolated_tmux(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """A tmux server of the test's own, for a real ``mngr create`` and everything it starts."""
+    with private_tmux_server(monkeypatch):
+        yield

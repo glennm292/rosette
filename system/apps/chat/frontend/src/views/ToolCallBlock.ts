@@ -19,6 +19,12 @@
 
 import m from "mithril";
 import { isBlockExpanded, setBlockExpanded } from "./expansion-state";
+import { appPartAttrs } from "@imbue/workspace-ui/src/themes/parts";
+
+/** A tool the agent called and what came back (an open tool chip's panel, a tool call written into markdown) is
+ *  the chat's declared `tool-call` part (its app.toml `[theming]`), which themes may style. The system chips this
+ *  block draws are not tool calls and do not carry it. */
+export const TOOL_CALL_PART = appPartAttrs("chat", "tool-call");
 
 /** The class names are bare markers (markdown.ts drives the same state class;
  *  the inspector reads them); the utilities beside them carry the look. */
@@ -26,7 +32,7 @@ const BLOCK_CLASS = "tool-call-block group/tool overflow-hidden rounded-md borde
 
 const HEADER_CLASS =
   "tool-call-header flex cursor-pointer items-center gap-1.5 px-2.5 py-[3px] font-mono " +
-  "text-(length:--font-size-body) text-secondary select-none transition-colors duration-(--dur-base) hover:bg-fill-hover";
+  "text-(length:--font-size-helper) text-secondary select-none transition-colors duration-(--dur-base) hover:bg-fill-hover";
 
 // text-[10px]: icon glyph (the chevron), sized independently of the text scale.
 const CHEVRON_CLASS =
@@ -35,7 +41,7 @@ const CHEVRON_CLASS =
 
 const DETAILS_CLASS = "tool-call-details hidden border-t group-[.tool-call-block--expanded]/tool:block";
 
-const PANE_CLASS = "px-3 py-2";
+const PANE_CLASS = "px-3.5 py-2";
 
 /** A pane's deferred-payload state: events are payload-free on the wire, so a
  *  pane may still be fetching or reference a payload the backend no longer holds. */

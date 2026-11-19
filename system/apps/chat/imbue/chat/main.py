@@ -1,44 +1,59 @@
 import argparse
 import atexit
+import os
 import signal
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from types import FrameType
 from typing import Final
 
 import httpx
-from app_instances.nudge import ShellNudger
-from app_instances.nudge import ThreadedNudger
-from app_instances.nudge import shell_base_url
-from app_instances.sidecar import register_app
 from app_manifest.primitives import AppUrl
+from app_manifest.registry import register_app
 from flask import Flask
+from latchkey_access.gateway import GatewayAccess
 from loguru import logger as _loguru_logger
+from workspace_layout.client import DisconnectedShell
 
 from imbue.chat.accounts import AccountError
 from imbue.chat.accounts import reconcile
 from imbue.chat.accounts import regenerate_create_defaults
 from imbue.chat.agent_manager import AgentManager
+from imbue.chat.authors import AuthorStore
 from imbue.chat.auto_open import AutoOpenLedger
 from imbue.chat.auto_open import AutoOpenReactor
-from imbue.chat.auto_open import DEFAULT_LEDGER_PATH
-from imbue.chat.auto_open import ShellLayoutClient
-from imbue.chat.chat_records import DEFAULT_CHAT_RECORDS_ROOT
+from imbue.chat.auto_open import LEDGER_FILENAME
+from imbue.chat.background_tasks import BACKGROUND_TASKS_DIRNAME
+from imbue.chat.background_tasks import BackgroundTaskReader
+from imbue.chat.chat_naming import ChatNamer
+from imbue.chat.chat_records import CHAT_RECORDS_DIRNAME
 from imbue.chat.chat_records import FileChatRecordStore
 from imbue.chat.chat_settings import ChatSettingsStore
-from imbue.chat.chat_settings import DEFAULT_SETTINGS_PATH
+from imbue.chat.chat_settings import SETTINGS_FILENAME
 from imbue.chat.config import Config
 from imbue.chat.config import load_config
 from imbue.chat.event_queues import AgentEventQueues
 from imbue.chat.harnesses.auth_flows import AuthFlowService
 from imbue.chat.harnesses.auth_flows import reap_orphaned_auth_processes
 from imbue.chat.harnesses.claude.auth import ClaudeAuthService
-from imbue.chat.instances import CHAT_APP_NAME
-from imbue.chat.message_stamps import DEFAULT_STAMPS_PATH
+from imbue.chat.harnesses.registry import build_one_shot_completion
+from imbue.chat.lounge import LoungeKeeper
+from imbue.chat.main_chat import MAIN_CHAT_FILENAME
+from imbue.chat.main_chat import MainChatStore
+from imbue.chat.mentions import MENTIONS_DIRNAME
+from imbue.chat.mentions import MentionStore
 from imbue.chat.message_stamps import MessageStampStore
+from imbue.chat.message_stamps import STAMPS_FILENAME
+from imbue.chat.roster_client import RosterClient
+from imbue.chat.secret_requests import DEFAULT_SECRETS_DIRECTORY
+from imbue.chat.secret_requests import SECRET_REQUESTS_DIRNAME
+from imbue.chat.secret_requests import SecretRequestStore
 from imbue.chat.server import create_application
+from imbue.chat.shell_client import build_live_chat_shell_client
 from imbue.chat.state import ChatAppState
 from imbue.chat.state import state_of
+from imbue.chat.tray_feed import TrayFeed
 from imbue.chat.ws_broadcaster import WebSocketBroadcaster
 from imbue.chat.wsgi import make_threaded_server
 
@@ -81,8 +96,19 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Boot without side effects, for the update apply's pre-flight check: no account "
-            "reconciliation (it reaps sign-in processes), no agent manager (no mngr observe, "
-            "no sweep, no memory prioritizer, no nudges to the shell), and no registration"
+            "reconciliation (it reaps sign-in processes), no agent manager (no follower of the "
+            "agent observer, no sweep, no memory prioritizer), and no registration"
+        ),
+    )
+    parser.add_argument(
+        "--secondary",
+        action="store_true",
+        help=(
+            "Boot as a second chat beside the live one (a preview): follows the same agent "
+            "observer and reads the live accounts, but reconciles no accounts, writes no memory "
+            "scores, runs no automatic compaction, starts or resumes no switch, opens no windows, "
+            "reports no client activity to the shell, and registers nothing; point CHAT_DATA_DIR "
+            "at a scratch copy so its writes never land in the live data"
         ),
     )
     return parser.parse_args(argv)
@@ -93,45 +119,85 @@ def build_production_state(
     provider_names: tuple[str, ...] | None = None,
     include_filters: tuple[str, ...] = (),
     exclude_filters: tuple[str, ...] = (),
+    is_secondary: bool = False,
 ) -> ChatAppState:
     """Construct the real object graph -- the composition root.
 
     This is the single place the production collaborators are wired together.
     It builds but does not start the agent manager (``main`` starts it once the
-    app is assembled), so it spawns no ``mngr observe`` pipeline by itself.
-    Tests do not use this; they build a ``ChatAppState`` with fakes via
-    ``testing.build_test_state``.
+    app is assembled), so it follows no event stream by itself. Tests build a
+    ``ChatAppState`` with fakes via ``testing.build_test_state`` instead, except where
+    what is under test is this wiring itself (where the chat's data directory lands).
+
+    Everything the chat keeps on disk lands under ``config.chat_data_dir``, so a secondary
+    chat pointed at a scratch copy never writes the live chat's data. A secondary also
+    opens no windows and marks no chat read: the auto-open ledger, the shell it would drive,
+    and the Imbue Studio app's notification feed belong to the live chat.
     """
     broadcaster = WebSocketBroadcaster()
-    chat_settings = ChatSettingsStore(path=DEFAULT_SETTINGS_PATH)
+    data_dir = config.chat_data_dir
+    # The one client of the shell's layout, shared by the auto-open reactor and the routes; a secondary has none.
+    shell = DisconnectedShell() if is_secondary else build_live_chat_shell_client()
+    chat_settings = ChatSettingsStore(path=data_dir / SETTINGS_FILENAME)
+    chat_records_root = data_dir / CHAT_RECORDS_DIRNAME
     agent_manager = AgentManager.build(
         broadcaster,
-        message_stamps=MessageStampStore(path=DEFAULT_STAMPS_PATH),
-        # The tab of a chat the Mind app starts is opened through the shell, and which chats
+        message_stamps=MessageStampStore(path=data_dir / STAMPS_FILENAME),
+        main_chat=MainChatStore(path=data_dir / MAIN_CHAT_FILENAME),
+        # The main chat never sleeps; a secondary's chats are a preview's, so it wakes nothing.
+        keeps_main_chat_awake=not is_secondary,
+        # The window of a chat the Imbue Studio app starts is opened through the shell, and which chats
         # have had theirs is remembered beside the stamps so a restart never re-pops one.
-        auto_open=AutoOpenReactor(
-            ledger=AutoOpenLedger(path=DEFAULT_LEDGER_PATH), shell=ShellLayoutClient(shell_url=shell_base_url())
-        ),
+        auto_open=None
+        if is_secondary
+        else AutoOpenReactor(ledger=AutoOpenLedger(path=data_dir / LEDGER_FILENAME), shell=shell),
         # Which agents each chat has run on, for the chats that have had a handoff.
-        chat_record_store=FileChatRecordStore(root=DEFAULT_CHAT_RECORDS_ROOT),
+        chat_record_store=FileChatRecordStore(root=chat_records_root),
+        chat_files_root=chat_records_root,
         chat_settings=chat_settings,
+        is_secondary=is_secondary,
+        # Reading a chat marks it read in the Imbue Studio app; a secondary's windows are a preview's, not the user's.
+        imbue_studio_gateway=None if is_secondary else GatewayAccess.from_environ(os.environ),
+        background_tasks=BackgroundTaskReader(root=data_dir / BACKGROUND_TASKS_DIRNAME),
     )
     # The codex ledger owns live user-turns; route each committed user-turn it emits onto
     # the same per-chat event fan-out the session watchers use. Wired here (not at manager build)
     # because the manager is constructed before its event-queue collaborator.
     event_queues = AgentEventQueues()
     agent_manager.set_transcript_broadcaster(event_queues.broadcast_batch)
+    # The shell's tray hears every message and every chat-list change from here; a secondary's are a preview's.
+    tray_feed = None if is_secondary else TrayFeed(shell=shell)
+    if tray_feed is not None:
+        agent_manager.set_chats_updated_listener(tray_feed.report_chats)
+    # The snapshots name who has written in each chat, and who sent each message not on its transcript yet, read off
+    # the author annotations.
+    authors = AuthorStore(root=chat_records_root)
+    agent_manager.set_author_annotations_reader(authors.annotations)
+    lounge = None if is_secondary else LoungeKeeper(agent_manager=agent_manager)
     state = ChatAppState(
         config=config,
         provider_names=provider_names,
         include_filters=include_filters,
         exclude_filters=exclude_filters,
         agent_manager=agent_manager,
+        is_secondary=is_secondary,
         chat_settings=chat_settings,
         event_queues=event_queues,
+        chat_namer=None
+        if is_secondary
+        else ChatNamer(
+            chat_files_root=chat_records_root,
+            get_active_agent_info=agent_manager.get_active_agent_info,
+            resolve_chat_account_binding=agent_manager.resolve_chat_account_binding,
+            show_automatic_title=agent_manager.show_automatic_title,
+            clear_automatic_title=agent_manager.clear_automatic_title,
+            has_placeholder_name=agent_manager.has_placeholder_name,
+            rename_placeholder_named_chat=agent_manager.rename_placeholder_named_chat,
+            build_one_shot_completion=build_one_shot_completion,
+        ),
         # One long-lived service per app: it holds the in-flight sign-in PTY between the
-        # start call and the polls that advance it. A successful re-auth restarts the agents
-        # bound to that account -- they do not pick up a swapped credential on their own.
+        # start call and the polls that advance it. A successful re-auth restarts the live agents
+        # bound to that account -- they do not pick up a swapped credential until they next start.
         auth_flows=AuthFlowService.create(restart_bound_agents=agent_manager.restart_agents_on_account_in_background),
         # Read-only: it reports claude's auth state and writes and restarts nothing, so it
         # needs no collaborators.
@@ -140,11 +206,26 @@ def build_production_state(
         # separate one for the latchkey catalog proxy.
         http_client=httpx.Client(follow_redirects=False, timeout=30.0),
         latchkey_http_client=httpx.Client(timeout=30.0),
+        shell=shell,
+        secret_requests=SecretRequestStore(
+            requests_directory=data_dir / SECRET_REQUESTS_DIRNAME, secrets_directory=DEFAULT_SECRETS_DIRECTORY
+        ),
+        authors=authors,
+        roster=RosterClient(shell=shell),
+        mentions=MentionStore(root=data_dir / MENTIONS_DIRNAME),
+        tray_feed=tray_feed,
+        lounge=lounge,
     )
-    # Eviction wiring: when the manager sees an agent destroyed or its lifecycle
-    # transition into a dead state, the state drops that agent's watcher -- the
-    # resident transcript, watch thread, and inotify watches go with it.
+    # Eviction wiring: the state drops what an agent holds resident -- the transcript,
+    # watch thread, and inotify watches -- when the manager sees it destroyed (the whole
+    # chat's when it was the active agent) or an archived member die, and after every
+    # observe event (and every stream close, in server.py) releases each stopped chat
+    # nobody is streaming. Removing a chat's active agent also ends the chat's open
+    # streams, which nothing feeds once its watcher is gone.
     agent_manager.set_watcher_eviction_callback(state.stop_and_remove_watcher)
+    agent_manager.set_unviewed_transcript_release(state.release_unviewed_stopped_transcripts)
+    agent_manager.set_session_watcher_check(state.has_watcher)
+    agent_manager.set_chat_stream_ender(state.event_queues.end_streams)
     return state
 
 
@@ -152,14 +233,14 @@ def build_application(config: Config, args: argparse.Namespace) -> Flask:
     """Build the Flask app from parsed CLI args, threading the agent filters through.
 
     Wires the production object graph and assembles the app, but does not start
-    the agent manager's ``mngr observe`` pipeline -- ``main`` does that once the
-    app is built.
+    the agent manager's follower -- ``main`` does that once the app is built.
     """
     state = build_production_state(
         config,
         provider_names=tuple(args.provider) if args.provider else None,
         include_filters=tuple(args.include),
         exclude_filters=tuple(args.exclude),
+        is_secondary=args.secondary,
     )
     return create_application(state)
 
@@ -200,39 +281,37 @@ def _reconcile_account_store() -> None:
 
 
 def main() -> None:
-    """Run the chat app: register with the shell, start ``mngr observe``, and serve.
+    """Run the chat app: register with the shell, follow the agent observer, and serve.
 
     Under ``--preflight`` the app only imports, builds, and serves: the update apply boots
     the merged chat this way on a throwaway port to learn whether it can start at all
     (mngr and the harness plugins import here, so a broken plugin table or a missing
     dependency surfaces here first) without touching the live workspace.
+
+    Under ``--secondary`` the app is a second chat beside the live one: it follows the
+    same observer and tracks the same agents, but withholds the writes a second instance
+    must not make (the account reconcile, the memory scores, the registration, the
+    automatic compaction, the switches, the window auto-opening, the client-activity
+    reports to the shell, the answers to secret cards, the read marks in the Imbue Studio
+    app's notification feed).
     """
     args = _parse_args(None)
     config = load_config()
     if args.preflight:
         logger.info("Booting in pre-flight mode: no account reconciliation, no agent manager, no registration")
+    elif args.secondary:
+        logger.info(
+            "Booting as a secondary chat: no account reconciliation, memory scores, compaction, or registration"
+        )
     else:
         _reconcile_account_store()
     application = build_application(config, args)
     state = state_of(application)
 
-    if not args.preflight:
-        # The chat app tells the shell when its instance list changes (contracts.md section
-        # 5). Installed here, at the process entry point, so a manager a test builds nudges
-        # nobody; on a thread of its own, so an agent event never waits on the shell.
-        state.agent_manager.set_nudger(
-            ThreadedNudger(inner=ShellNudger(app_name=CHAT_APP_NAME, shell_url=shell_base_url()))
-        )
-
-        # Start the ``mngr observe`` pipeline now that the app is assembled. This is
-        # the one place observe is started; ``build_application`` only constructs, so
-        # tests that build an app never spawn it.
-        state.agent_manager.start()
-
     # Tear down the broadcaster, watchers, agent manager, and http clients on
     # exit. ``atexit`` covers a normal return; the signal handlers cover
-    # supervisord's SIGTERM and an interactive SIGINT (Ctrl-C), which
-    # ``serve_forever`` would otherwise turn into an abrupt exit.
+    # supervisord's SIGTERM and an interactive SIGINT (Ctrl-C), which would
+    # otherwise end the process abruptly.
     atexit.register(state.shutdown)
     signal.signal(signal.SIGTERM, _exit_on_signal)
     signal.signal(signal.SIGINT, _exit_on_signal)
@@ -243,12 +322,33 @@ def main() -> None:
     # SSE streaming.
     server = make_threaded_server(config.chat_host, config.chat_port, application)
 
-    # Registered once the socket is bound and just before serving, so the shell's first
-    # fetch after the registration finds the app answering (a 503 until the agent list is
-    # known, never a refused connection).
-    if not (args.no_register or args.preflight):
+    # Served before the agent manager starts, whose first read of the agent list asks mngr about
+    # every agent: a page that connects first is told the list is not known yet rather than
+    # refused. The start stays on the main thread so a failure in it still ends the process for
+    # supervisord.
+    serving = threading.Thread(target=server.serve_forever, name="chat-server", daemon=True)
+    serving.start()
+
+    # Registered once the server answers, so a window the shell opens on the chat right after the
+    # registration finds the app answering.
+    if not (args.no_register or args.preflight or args.secondary):
         register_app(args.manifest, AppUrl(f"http://localhost:{config.chat_port}"))
-    server.serve_forever()
+
+    if not args.preflight:
+        # Follow the agent observer's event stream now that the app is assembled. This is
+        # the one place the follower is started; ``build_application`` only constructs, so
+        # tests that build an app never follow anything.
+        state.agent_manager.start()
+        state.start_reply_draft_publisher()
+        if state.lounge is not None:
+            state.lounge.start(state.roster)
+        if state.tray_feed is not None:
+            state.tray_feed.start()
+
+    # Nothing shuts the server down, so serving ends only if the server itself failed.
+    serving.join()
+    logger.error("The chat server stopped serving")
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

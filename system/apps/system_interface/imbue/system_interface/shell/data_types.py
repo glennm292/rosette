@@ -1,370 +1,495 @@
-from typing import Any
+from collections.abc import Mapping
+from collections.abc import Sequence
 from typing import Final
+from typing import Literal
 
-from app_instances.data_types import InstanceLifetime
-from app_instances.data_types import InstanceRecord
-from app_instances.data_types import InstanceStatus
-from app_instances.primitives import InstanceKey
-from app_manifest.manifest import DefaultShortcut
-from app_manifest.manifest import ShortcutMode
-from app_manifest.primitives import ActionId
+from app_manifest.manifest import LocationScope
+from app_manifest.manifest import OPEN_LAUNCH_PATH_ID
+from app_manifest.manifest import Pin
 from app_manifest.primitives import AppName
-from app_manifest.registry import RegistryAction
+from app_manifest.primitives import LaunchPathId
+from app_manifest.primitives import LaunchPathValue
+from app_manifest.registry import RegistryLaunchPath
 from app_manifest.registry import RegistryRow
-from loguru import logger
 from pydantic import AwareDatetime
 from pydantic import ConfigDict
 from pydantic import Field
-from pydantic import ValidationError
 from pydantic import model_validator
+from workspace_layout.answers import InventoryApp
+from workspace_layout.primitives import ClientId
+from workspace_layout.primitives import DesktopId
+from workspace_layout.primitives import IfPresent
+from workspace_layout.primitives import ShowOutcome
+from workspace_layout.primitives import UserId
+from workspace_layout.primitives import WindowId
+from workspace_layout.primitives import WindowPage
+from workspace_layout.primitives import WindowPath
+from workspace_layout.primitives import WindowTitle
+from workspace_layout.records import ClientRecord
+from workspace_layout.records import Desktop
+from workspace_layout.records import DesktopLayout
+from workspace_layout.records import DesktopLayoutView
+from workspace_layout.records import DesktopView
+from workspace_layout.records import ShortcutTarget
+from workspace_layout.records import StoredWindowPath
+from workspace_layout.records import Window
+from workspace_layout.records import WindowPlacement
+from workspace_layout.records import WindowView
+from workspace_themes.primitives import ThemeId
 
 from imbue.imbue_common.frozen_model import FrozenModel
+from imbue.imbue_common.model_update import to_update
 from imbue.imbue_common.primitives import NonEmptyStr
 from imbue.imbue_common.pure import pure
-from imbue.system_interface.shell.primitives import Address
-from imbue.system_interface.shell.primitives import ClientActivityKind
-from imbue.system_interface.shell.primitives import ClientId
-from imbue.system_interface.shell.primitives import DeviceKind
-from imbue.system_interface.shell.primitives import ProjectId
+from imbue.system_interface.shell.app_theming import theming_of
+from imbue.system_interface.shell.errors import InvalidShellValueError
+from imbue.system_interface.shell.primitives import LaunchTargetKind
+from imbue.system_interface.shell.primitives import PageId
+from imbue.system_interface.shell.primitives import ReportId
 from imbue.system_interface.shell.primitives import SaveId
-from imbue.system_interface.shell.primitives import TabId
-from imbue.system_interface.shell.primitives import ViewId
-from imbue.system_interface.shell.primitives import address_for
+from imbue.system_interface.shell.primitives import WindowInputKind
 
 
-class Shortcut(FrozenModel):
-    """One rail entry of a project: an app's action, in focus or new mode."""
+class ClientShownRequest(FrozenModel):
+    """The body of ``POST /api/clients/<client_id>/shown``: the window the client now shows, or None for home."""
 
-    app: AppName = Field(description="The registered app")
-    action: ActionId = Field(description="The action the row runs")
-    mode: ShortcutMode = Field(description="Focus the app's most recent tab first, or always run the action")
+    window_id: WindowId | None = Field(description="The window shown, or None for the home grid")
 
 
-class Project(FrozenModel):
-    """A named view: its display metadata, its shared tab set, and its shortcuts (contracts.md section 6)."""
+class UserRecord(FrozenModel):
+    """What the shell keeps about one signed-in visitor: the desktop made for them (desktop plan section 3.10)."""
 
-    id: ProjectId = Field(description="The slugified name, stable across renames")
-    name: str = Field(description="Free-form name shown in the UI")
-    color: str = Field(description="Accent color as a '#RRGGBB' string")
-    glyph: int = Field(description="Index into the frontend's squiggle glyph table")
-    tabs: tuple[Address, ...] = Field(description="Every instance the project shows, in the order added")
-    shortcuts: tuple[Shortcut, ...] = Field(description="The rail rows, in rail order")
-
-
-# The ``kind`` the ``params`` of a dockview panel showing an instance carry (contracts.md section 6). A
-# launcher panel (the New Tab page) carries another kind and names no instance, so the shell never looks for it.
-INSTANCE_PANEL_KIND: Final[str] = "instance"
+    user_id: UserId = Field(description="The account's user id, as the identity header carries it")
+    desktop_id: DesktopId = Field(description="The desktop made for the user, where their new clients land")
+    desktop_name: str = Field(
+        description="That desktop's name as of the user's last arrival, for the notice when it is gone"
+    )
+    email: str | None = Field(default=None, description="The verified email as of the user's last arrival")
+    display_name: str | None = Field(default=None, description="The display name as of the user's last arrival")
+    last_seen: AwareDatetime = Field(description="When a client of the user last arrived")
 
 
-class InstancePanelParams(FrozenModel):
-    """The ``params`` dockview stores on a panel showing an instance: the one place a tab's identity lives (contracts.md section 6)."""
+class GrantedIdentity(FrozenModel):
+    """What the Imbue Studio desktop recorded of one granted account when it saved the grants: the address and name
+    it resolved the grant from, so the roster can name a person who has not arrived yet (the multiplayer spec,
+    section 4.2). Cross-version data from another program, so a field this build does not know is ignored."""
 
-    # The browser owns this object and may add keys the shell does not know; reading tolerates them, and
-    # the shell edits the stored dict itself (``with_panel_params_address``, which keeps every other key)
-    # rather than round-tripping it through this model.
     model_config = ConfigDict(extra="ignore")
 
-    address: Address = Field(description="The instance the panel shows")
-    tab_id: TabId = Field(
-        alias="tabId",
-        description="The page's id: minted when the page was first opened, shared by every panel showing it",
-    )
-    last_focused_ms: int = Field(
-        default=0,
-        alias="lastFocusedMs",
-        description="Epoch milliseconds the panel was last the active one, 0 when never",
-    )
-
-
-@pure
-def _panel_entries(dockview: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
-    panels = dockview.get("panels") if dockview is not None else None
-    if not isinstance(panels, dict):
-        return {}
-    return {panel_id: entry for panel_id, entry in panels.items() if isinstance(entry, dict)}
-
-
-def instance_panel_params_by_id(dockview: dict[str, Any] | None) -> dict[str, InstancePanelParams]:
-    """Each instance panel's params, keyed by dockview panel id. Launchers are skipped; an instance panel whose params
-    do not parse is skipped with a warning, so a damaged entry costs one tab rather than the whole arrangement."""
-    parsed: dict[str, InstancePanelParams] = {}
-    for panel_id, entry in _panel_entries(dockview).items():
-        params = entry.get("params")
-        if not isinstance(params, dict) or params.get("kind") != INSTANCE_PANEL_KIND:
-            continue
-        try:
-            parsed[panel_id] = InstancePanelParams.model_validate(params)
-        except ValidationError as e:
-            logger.warning("Skipped panel {} with unreadable params: {}", panel_id, e.errors()[0]["msg"])
-    return parsed
-
-
-@pure
-def instance_panel_params_json(address: Address, tab_id: TabId, last_focused_ms: int) -> dict[str, Any]:
-    """The ``params`` entry the shell writes for an instance panel, in the browser's spelling."""
-    return {
-        "kind": INSTANCE_PANEL_KIND,
-        "address": str(address),
-        "tabId": str(tab_id),
-        "lastFocusedMs": last_focused_ms,
-    }
-
-
-@pure
-def with_panel_params_address(dockview: dict[str, Any], panel_id: str, address: Address) -> dict[str, Any]:
-    """The document with the params of ``panel_id`` pointed at ``address``, every other key of the params kept."""
-    panels = dockview["panels"]
-    entry = panels[panel_id]
-    return {
-        **dockview,
-        "panels": {**panels, panel_id: {**entry, "params": {**entry["params"], "address": str(address)}}},
-    }
-
-
-# CLEANUP: drop this fold, the ``_fold_legacy_tabs`` validators on ``LayoutRecord`` and ``LayoutSaveRequest`` that
-# call it, the ``tabs`` mention in the docstrings that cite it, and the two tests of the older shape
-# (``test_a_layout_in_the_older_shape_reads_as_params_only`` in data_types_test.py and
-# ``test_a_save_in_the_older_shape_is_folded_into_the_panels_params`` in routes_test.py) once every workspace has
-# saved a layout with a shell from after the workspace app model's params-only layout files: a file written by
-# the older shell carried a ``tabs`` block beside the dockview document, and that block was the truth of each
-# panel's identity.
-@pure
-def fold_legacy_tabs_into_dockview(data: Any) -> Any:
-    """A layout body in the older shape, with its ``tabs`` block folded into each panel's ``params``; any other value unchanged."""
-    if not isinstance(data, dict) or "tabs" not in data:
-        return data
-    without_tabs = {key: value for key, value in data.items() if key != "tabs"}
-    tabs = data["tabs"]
-    dockview = without_tabs.get("dockview")
-    if not isinstance(tabs, dict) or not isinstance(dockview, dict) or not isinstance(dockview.get("panels"), dict):
-        return without_tabs
-    panels = dict(dockview["panels"])
-    for panel_id, tab in tabs.items():
-        entry = panels.get(panel_id)
-        if not isinstance(tab, dict) or not isinstance(entry, dict):
-            continue
-        panels[panel_id] = {
-            **entry,
-            "params": {
-                "kind": INSTANCE_PANEL_KIND,
-                "address": tab.get("address"),
-                "tabId": tab.get("tab_id"),
-                "lastFocusedMs": tab.get("last_focused_ms", 0),
-            },
-        }
-    return {**without_tabs, "dockview": {**dockview, "panels": panels}}
-
-
-class LayoutRecord(FrozenModel):
-    """One client's arrangement of one view (contracts.md section 6): dockview's own document, whose per-panel ``params`` name what each tab shows."""
-
-    dockview: dict[str, Any] | None = Field(description="The serialized dockview grid, None for a never-arranged view")
-    device_kind: DeviceKind = Field(description="The device kind the arrangement was made on")
-    updated_at: AwareDatetime | None = Field(
-        description="When the arrangement was last saved, None for the empty layout"
-    )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _fold_legacy_tabs(cls, data: Any) -> Any:
-        return fold_legacy_tabs_into_dockview(data)
-
-
-class ClientRecord(FrozenModel):
-    """What the shell keeps about one browser context (contracts.md section 7)."""
-
-    id: ClientId = Field(description="The client's stored id")
-    device_kind: DeviceKind = Field(description="Desktop or mobile")
-    active_view: ViewId = Field(description="The view the client is on")
-    last_seen: AwareDatetime = Field(description="When the client last reported")
-
-
-class InventoryInstance(FrozenModel):
-    """One instance as the shell lists it: the app's record plus its address; the synthesized record of a single-instance app has an empty key."""
-
-    key: str = Field(description="The app-scoped key; empty for a single-instance app's one record")
-    url: str = Field(description="Where the instance's page is, as a path under the app's origin")
-    title: str = Field(description="What users see")
-    status: InstanceStatus = Field(description="What the instance is doing")
-    lifetime: InstanceLifetime = Field(description="Whether it lives until deleted or only while referenced")
-    last_active: AwareDatetime | None = Field(description="When it was last active, None when unknown")
-    renameable: bool = Field(description="Whether the rename route is accepted")
-    stoppable: bool = Field(description="Whether the stop and start routes are accepted")
-
-    @pure
-    def address(self, app: AppName) -> Address:
-        return address_for(app, None if self.key == "" else InstanceKey(self.key))
-
-
-@pure
-def inventory_instance_from_record(record: InstanceRecord) -> InventoryInstance:
-    return InventoryInstance(
-        key=str(record.key),
-        url=str(record.url),
-        title=str(record.title),
-        status=record.status,
-        lifetime=record.lifetime,
-        last_active=record.last_active,
-        renameable=record.renameable,
-        stoppable=record.stoppable,
-    )
-
-
-@pure
-def synthesized_single_instance(row: RegistryRow, is_running: bool) -> InventoryInstance:
-    """The one record a single-instance app carries (contracts.md section 8)."""
-    return InventoryInstance(
-        key="",
-        url="/",
-        title=str(row.display_name) if row.display_name is not None else str(row.name),
-        status=InstanceStatus.IDLE if is_running else InstanceStatus.STOPPED,
-        lifetime=InstanceLifetime.EXPLICIT,
-        last_active=None,
-        # The app-level Stop and Start are the single-instance app's; its one record has none of its own.
-        renameable=False,
-        stoppable=False,
-    )
+    email: str | None = Field(default=None, description="The account's verified email as the desktop last saw it")
+    display_name: str | None = Field(default=None, description="The account's display name as the desktop last saw it")
 
 
 class AppInventoryEntry(FrozenModel):
-    """One app of the inventory: its registry row, whether it runs, and its instances as last fetched."""
+    """One app of the inventory: its registry row and whether it runs."""
 
     row: RegistryRow = Field(description="The registry row, validated on read")
     is_running: bool = Field(description="Derived from supervisord or a TCP probe, never stored")
-    instances: tuple[InventoryInstance, ...] = Field(description="The app's instances, in the app's list order")
-    # False until the app's instances API has answered a list once (a single-instance app's one
-    # record is synthesized, so it counts as listed): an empty list that was never fetched is
-    # not evidence that an address is missing, and a client shows nothing as unavailable on it.
-    is_listed: bool = Field(description="Whether the instance list is the app's own answer rather than the seed")
-    # A record the shell has held for less than the grace period is not deleted for being
-    # unreferenced: the create that made it has returned but the tab docking it may not have
-    # been saved yet.
-    first_seen_at_by_key: dict[str, float] = Field(
-        description="Monotonic seconds each key was first listed, for the referenced-deletion grace"
+
+
+@pure
+def stoppable_program_of(entry: AppInventoryEntry, entries: Sequence[AppInventoryEntry]) -> str | None:
+    """The supervised program the workspace may stop, start, park, and wake for this app, or None: an app with no
+    program, a critical app, and any row inside a critical app's program are never acted on (desktop contracts.md
+    section 5.1)."""
+    program = entry.row.program or ""
+    if not program or entry.row.critical:
+        return None
+    if any(other.row.critical and other.row.program == program for other in entries):
+        return None
+    return program
+
+
+@pure
+def app_view(entry: AppInventoryEntry, share_domain: str | None, theming_off: frozenset[AppName]) -> InventoryApp:
+    """The ``app`` object of desktop contracts.md section 5.5; ``share_domain`` is the domain the workspace was last
+    shared under, if it ever was, on which an app with a label has an address."""
+    row = entry.row
+    return InventoryApp(
+        name=row.name,
+        display_name=str(row.display_name) if row.display_name is not None else str(row.name),
+        icon=row.icon or "",
+        label=row.label,
+        url=row.url,
+        internal=row.internal,
+        program=row.program or "",
+        critical=row.critical,
+        stop_when_no_windows=row.stop_when_no_windows,
+        uses_microphone=row.uses_microphone,
+        launch_paths=effective_launch_paths(row),
+        default_shortcuts=row.default_shortcuts,
+        launcher_rank=row.launcher_rank,
+        pin=row.pin,
+        message_handlers=row.message_handlers,
+        is_running=entry.is_running,
+        share_url=f"https://{row.label}.{share_domain}/" if share_domain is not None and row.label else None,
+        theming=theming_of(row, theming_off),
     )
 
-    @pure
-    def address_of(self, instance: InventoryInstance) -> Address:
-        return instance.address(self.row.name)
 
-    @pure
-    def addresses(self) -> list[Address]:
-        return [self.address_of(instance) for instance in self.instances]
+class AppPin(FrozenModel):
+    """A registered app's pin: the app, and the table its manifest declares (pinned-taskbar-entries plan section 3.1)."""
 
-
-@pure
-def app_wire_json(entry: AppInventoryEntry) -> dict[str, Any]:
-    """The ``app`` object of contracts.md section 8."""
-    row = entry.row
-    return {
-        "name": str(row.name),
-        "display_name": str(row.display_name) if row.display_name is not None else str(row.name),
-        "icon": row.icon or "",
-        "label": row.label,
-        "url": str(row.url),
-        "internal": row.internal,
-        "program": row.program or "",
-        "critical": row.critical,
-        "instances_url": instances_url_of(row),
-        "has_instances": row.instances,
-        "actions": [action_wire_json(action) for action in effective_actions(row)],
-        "default_shortcut": default_shortcut_wire_json(row.default_shortcut),
-        "launcher_rank": row.launcher_rank,
-        "is_running": entry.is_running,
-        "is_listed": entry.is_listed,
-        "instances": [instance.model_dump(mode="json") for instance in entry.instances],
-    }
-
-
-@pure
-def instances_url_of(row: RegistryRow) -> str:
-    """Where the app's instances API is reached: its ``instances_url``, else its ``url`` (contracts.md section 3)."""
-    return str(row.instances_url) if row.instances_url is not None else str(row.url)
-
-
-@pure
-def action_wire_json(action: RegistryAction) -> dict[str, Any]:
-    return {"id": str(action.id), "label": str(action.label), "params": [str(param) for param in action.params]}
-
-
-@pure
-def default_shortcut_wire_json(shortcut: DefaultShortcut | None) -> dict[str, str] | None:
-    if shortcut is None:
-        return None
-    return {"action": str(shortcut.action), "mode": shortcut.mode.value}
-
-
-# The one action every single-instance app has, synthesized by the shell (contracts.md section 2).
-OPEN_ACTION: RegistryAction = RegistryAction(id=ActionId("open"), label=NonEmptyStr("Open"))
-
-
-@pure
-def effective_actions(row: RegistryRow) -> tuple[RegistryAction, ...]:
-    """The actions an app offers: its declared ones, or the synthesized ``open`` for a single-instance app."""
-    if row.instances:
-        return row.actions
-    display = str(row.display_name) if row.display_name is not None else str(row.name)
-    return (RegistryAction(id=OPEN_ACTION.id, label=NonEmptyStr(f"Open {display}")),)
+    app: AppName = Field(description="The pinned app")
+    pin: Pin = Field(description="The pin as the registry row carries it")
 
 
 class ClientStateReport(FrozenModel):
-    """The inbound ``client_state`` WebSocket message (contracts.md section 8)."""
+    """The inbound ``client_state`` WebSocket message (desktop contracts.md section 6)."""
 
     client_id: ClientId = Field(description="The reporting client")
-    device_kind: DeviceKind = Field(description="Desktop or mobile")
-    active_view: ViewId = Field(description="The view the client is on now")
-    previous_view: str = Field(default="", description="The view it was on before, empty on connect")
-
-
-class ClientActivityReport(FrozenModel):
-    """The body of ``POST /api/client-activity`` (contracts.md section 5)."""
-
-    client_id: ClientId = Field(description="The client the activity belongs to")
-    device_kind: DeviceKind = Field(description="Desktop or mobile")
-    view_id: ViewId = Field(description="The view the client was on")
-    kind: ClientActivityKind = Field(description="A message sent to an instance, or a view switch")
-    app: str = Field(default="", description="The app a message went to")
-    key: str = Field(default="", description="The instance key a message went to")
-    text: str = Field(default="", description="The message text, truncated at write time")
-    from_view_id: str = Field(default="", description="For a view switch, the view left")
-
-
-class TabInstanceReport(FrozenModel):
-    """The body of ``POST /api/tabs/<tab_id>/instance`` (contracts.md section 5)."""
-
-    app: AppName = Field(description="The app that owns the tab's instance")
-    key: str = Field(description="The key the tab now shows")
-
-
-class LayoutSaveRequest(FrozenModel):
-    """The body of ``POST /api/layouts/<view_id>`` (contracts.md section 6)."""
-
-    client_id: ClientId = Field(description="The saving client")
-    save_id: SaveId = Field(description="The save id the window minted, echoed in the layout_updated broadcast")
-    base_updated_at: AwareDatetime | None = Field(
-        default=None,
-        description="The updated_at of the arrangement the window last fetched or saved; None for one it only saw empty",
+    active_desktop: DesktopId = Field(description="The desktop the client is on now")
+    previous_desktop: str = Field(
+        default="",
+        description="The desktop the window left, empty when the report names none (a connect, a landing, or a "
+        "following report)",
     )
-    device_kind: DeviceKind = Field(description="The device kind the arrangement was made on")
-    dockview: dict[str, Any] | None = Field(description="The serialized dockview grid, its panels' params included")
+    report_id: ReportId | None = Field(
+        default=None,
+        description="The window's id for a report that moves the client, echoed on the broadcast it causes; None for a "
+        "following report",
+    )
+    is_following: bool = Field(
+        default=False,
+        description="Whether the window only followed the client's stored desktop (pushed, or read on a reconnect): "
+        "the connection is registered on it and the record is not moved",
+    )
+    page_id: PageId = Field(description="The reporting page's id, which tells its own desktop moves from the others'")
+    revision: int | None = Field(
+        default=None,
+        ge=0,
+        description="For a report that moves the client, the newest desktop revision the page had heard when it made "
+        "the report; None for a following report",
+    )
 
-    @model_validator(mode="before")
-    @classmethod
-    def _fold_legacy_tabs(cls, data: Any) -> Any:
-        return fold_legacy_tabs_into_dockview(data)
+    @model_validator(mode="after")
+    def _check_revision_named_for_a_move(self) -> "ClientStateReport":
+        if self.is_following != (self.revision is None):
+            raise InvalidShellValueError("a client_state report names a revision exactly when it moves the client")
+        return self
+
+
+class PopOutStateReport(FrozenModel):
+    """The inbound ``client_state`` WebSocket message of a pop-out's page (desktop contracts.md section 6): the
+    client it belongs to, and no desktop, since the client's active desktop is its main window's."""
+
+    client_id: ClientId = Field(description="The client the pop-out belongs to")
+    is_pop_out: Literal[True] = Field(description="Marks the report as a pop-out's")
 
 
 class ClientReportOutcome(FrozenModel):
-    """What recording a ``client_state`` report came to: the record, and whether its active view moved."""
+    """What recording a ``client_state`` report came to: the record, whether its active desktop moved, and whether
+    the report was superseded."""
 
     record: ClientRecord = Field(description="The client record as written")
-    is_active_view_changed: bool = Field(description="Whether the stored active view differs from before the report")
+    is_active_desktop_changed: bool = Field(
+        description="Whether the stored active desktop differs from before the report"
+    )
+    is_superseded: bool = Field(
+        default=False,
+        description="Whether the report was made before a move its page had not heard of, and so recorded nothing",
+    )
 
 
-class LayoutEditOutcome(FrozenModel):
-    """What editing a client's layout under the state lock came to: the arrangement now in force, and whether it was written."""
+# The desktop model (desktop-interface contracts.md sections 4 and 5)
 
-    layout: LayoutRecord = Field(description="The arrangement after the edit, stamped when it was written")
-    is_written: bool = Field(
-        description="Whether the edit changed the arrangement and was written to the client's file"
+
+# The launch path every app that declares none has, at its root, synthesized by the shell (desktop
+# contracts.md section 2). Its ``label`` is the app's display name, filled in by
+# ``effective_launch_paths``: the row stands in a list beside rows an app labelled for itself, where
+# a verb reads as a different KIND of row rather than as the same row with a word in front of it.
+OPEN_LAUNCH_PATH_VALUE: Final[LaunchPathValue] = LaunchPathValue("/")
+
+
+@pure
+def effective_launch_paths(row: RegistryRow) -> tuple[RegistryLaunchPath, ...]:
+    """The launch paths an app offers: its declared ones, or the synthesized ``open`` when it declares none."""
+    if row.launch_paths:
+        return row.launch_paths
+    display = str(row.display_name) if row.display_name is not None else str(row.name)
+    return (
+        RegistryLaunchPath(id=OPEN_LAUNCH_PATH_ID, label=NonEmptyStr(display), path=OPEN_LAUNCH_PATH_VALUE, params=()),
+    )
+
+
+class DesktopsDocument(FrozenModel):
+    """The whole of ``desktops.json``."""
+
+    version: int = Field(description="The file format version")
+    desktops: tuple[Desktop, ...] = Field(
+        description="Every desktop, in display order (creation order, as the order route rearranged it); the first is "
+        "the fallback"
+    )
+
+
+class DesktopThemesDocument(FrozenModel):
+    """The whole of ``desktop_themes.json``: the workspace's default theme, and the desktops that wear another
+    (docs/system/blueprint/workspace-themes/, section 5.2).
+
+    Kept beside ``desktops.json`` rather than in it: a shell from before themes still reads that file, and its
+    records refuse a key they do not know.
+    """
+
+    version: int = Field(description="The file format version")
+    default: ThemeId | None = Field(description="The workspace's default theme; none wears the standard one")
+    desktops: dict[DesktopId, ThemeId] = Field(description="Each desktop that wears its own theme, by desktop id")
+
+
+class ThemeChoices(FrozenModel):
+    """What the workspace and its desktops chose to wear, as stored; availability is the catalog's to judge."""
+
+    default: ThemeId | None = Field(description="The workspace's default theme; none wears the standard one")
+    theme_by_desktop_id: dict[DesktopId, ThemeId] = Field(description="Each desktop that wears its own theme")
+
+
+class DefaultShortcutsOfferedDocument(FrozenModel):
+    """The whole of ``default_shortcuts_offered.json``: the default shortcuts the shell has offered."""
+
+    version: int = Field(description="The file format version")
+    targets: tuple[ShortcutTarget, ...] = Field(
+        description="The target of every default shortcut the shell has put on a desktop or found there, sorted"
+    )
+
+
+# CLEANUP: drop ``AppsOfferedDocument`` and its read in ``DesktopStore._read_offered_unlocked`` once every workspace
+# has taken the release after minds-v0.10.0; the first shell read after that update rewrites the record.
+class AppsOfferedDocument(FrozenModel):
+    """``default_shortcuts_offered.json`` as it was while an app had at most one default shortcut: the apps offered."""
+
+    version: int = Field(description="The file format version")
+    apps: tuple[AppName, ...] = Field(description="Every app whose one default shortcut the shell had offered")
+
+
+class PlacementsSaveRequest(FrozenModel):
+    """The body of ``POST /api/placements/<desktop_id>`` (desktop contracts.md section 5.4)."""
+
+    client_id: ClientId = Field(description="The saving client")
+    save_id: SaveId = Field(description="The save id the window minted, echoed in the placements_updated broadcast")
+    base_updated_at: AwareDatetime | None = Field(
+        default=None,
+        description="The updated_at of the layout the window last fetched or saved; None for one only seen empty",
+    )
+    placements: tuple[WindowPlacement, ...] = Field(description="The whole layout, back to front")
+
+
+class WindowInputReport(FrozenModel):
+    """One window a shell page's heartbeat reports a person's input in (the app-usage-signals spec, section 6.3)."""
+
+    window_id: WindowId = Field(description="The window whose page reported")
+    app: AppName = Field(description="The window's app as the page knows it; the desktop's record wins when it exists")
+    kind: WindowInputKind = Field(
+        default=WindowInputKind.INPUT,
+        description="The page's own report, or focus landing in a page that reports none",
+    )
+
+
+class WindowOpenRequest(FrozenModel):
+    """The body of ``POST /api/desktops/<id>/windows`` (desktop contracts.md section 5.3)."""
+
+    app: AppName = Field(description="The app to open a page of")
+    path: WindowPath = Field(description="The path under the app origin the page is at, query string included")
+    client_id: ClientId = Field(description="The requesting client, whose placement is written at once")
+    if_present: IfPresent = Field(
+        default=IfPresent.FOCUS, description="Focus a window already at the path, or open another"
+    )
+    minimized: bool = Field(
+        default=False, description="Whether a window this open creates is placed minimized for the client"
+    )
+
+
+class PageShowRequest(FrozenModel):
+    """The body of ``POST /api/clients/<id>/show`` (desktop contracts.md section 5.3): the ``show`` op's arguments."""
+
+    app: AppName = Field(description="The app whose page to show")
+    path: WindowPath = Field(description="The path to put on the client's screen")
+    showing: tuple[WindowPath, ...] = Field(
+        default=(), description="The app's other paths that count as already showing it"
+    )
+    repoint: tuple[WindowPage, ...] = Field(
+        default=(), description="The pages whose windows the shell may point at the path"
+    )
+
+
+class LaunchTarget(FrozenModel):
+    """Where a launch's page goes (post-launch-paths plan section 3.3)."""
+
+    kind: LaunchTargetKind = Field(
+        description="A new window, a window already at the path, a named window, or the show op's choice"
+    )
+    window_id: WindowId | None = Field(
+        default=None, description="The window this client points at the page; required for the window kind"
+    )
+    beside: WindowId | None = Field(
+        default=None,
+        description="For the show kind, a window of the desktop the shown window is snapped beside (the multiplayer "
+        "spec, section 9.2); none lays nothing out",
+    )
+    sends_window_path: bool = Field(
+        default=True,
+        description="Whether the named window's page goes to a POST launch path as its ``window_path``; false for a "
+        "text that is not about what the window shows",
+    )
+
+    @model_validator(mode="after")
+    def _check_fields_fit_the_kind(self) -> "LaunchTarget":
+        if (self.kind is LaunchTargetKind.WINDOW) != (self.window_id is not None):
+            raise InvalidShellValueError("a launch target names a window exactly when its kind is 'window'")
+        if self.beside is not None and self.kind is not LaunchTargetKind.SHOW:
+            raise InvalidShellValueError(
+                "only a launch target of the 'show' kind lays the shown window out beside one"
+            )
+        if not self.sends_window_path and self.kind is not LaunchTargetKind.WINDOW:
+            raise InvalidShellValueError("only a launch target of the 'window' kind has a window path to withhold")
+        return self
+
+
+class LaunchRequest(FrozenModel):
+    """The body of ``POST /api/desktops/<id>/launch`` (post-launch-paths plan section 5.3)."""
+
+    app: AppName = Field(description="The app whose launch path runs")
+    launch: LaunchPathId = Field(description="The launch path's id (the synthesized ``open`` included)")
+    params: dict[str, str] = Field(default_factory=dict, description="The caller's values for the declared params")
+    client_id: ClientId = Field(description="The requesting client, whose placement or page follows the launch")
+    target: LaunchTarget = Field(description="Where the page the launch answers goes")
+    minimized: bool = Field(
+        default=False, description="Whether a window this launch opens is placed minimized for the client"
+    )
+
+
+class LaunchOutcome(FrozenModel):
+    """What a launch came to: the window showing the page, the page's path, and whether the window was opened."""
+
+    window: Window = Field(description="The window opened, focused, or navigated, as the requesting client sees it")
+    path: WindowPath = Field(description="The page path the launch resolved to")
+    is_new: bool = Field(description="True when a window was opened for the page")
+
+
+class WindowLocationReport(FrozenModel):
+    """The body of ``POST /api/desktops/<id>/windows/<window_id>/location``."""
+
+    client_id: ClientId = Field(
+        description="The client whose page reported, whose own path an independent window keeps"
+    )
+    path: WindowPath = Field(description="Where the page is now")
+    title: WindowTitle = Field(description="What the page calls itself now")
+
+
+class ClientDesktopView(FrozenModel):
+    """One desktop as one client sees it: the desktop, the client's layout of it, and its windows at the paths the
+    client sees (an independent window at the client's own path)."""
+
+    desktop: Desktop = Field(description="The shared record")
+    layout: DesktopLayout = Field(description="The client's layout of the desktop, pinned windows placed")
+    seen_windows: tuple[Window, ...] = Field(description="The desktop's windows as the client sees them")
+
+
+class ShownWindow(FrozenModel):
+    """What showing a path came to for one client (the ``show`` op's rule applied): the desktop the window is on,
+    the window, how it was put on screen, and whether that was a raise of a pulled-out window's own desktop window."""
+
+    desktop: Desktop = Field(description="The desktop the shown window is on, as it stands after the show")
+    window_id: WindowId = Field(description="The window showing the path")
+    outcome: ShowOutcome = Field(description="Raised, navigated, the pinned window navigated, or opened")
+    is_raised_in_own_window: bool = Field(
+        description="The window was pulled out into a desktop window of the embedder's own, so that was raised and "
+        "nothing on the desktop moved"
+    )
+
+
+class ShowChoice(FrozenModel):
+    """What a ``show`` op settled on: how it shows the path, on which desktop, and the window (none for an open)."""
+
+    outcome: ShowOutcome = Field(description="Raised, navigated, pinned, or opened")
+    desktop_id: DesktopId = Field(description="The desktop the path is shown on")
+    window: Window | None = Field(
+        description="The window raised or navigated, as the client sees it; None to open one"
+    )
+
+    @model_validator(mode="after")
+    def _check_a_window_exactly_unless_opening(self) -> "ShowChoice":
+        if (self.window is None) != (self.outcome is ShowOutcome.OPENED):
+            raise InvalidShellValueError(f"a show names a window unless it opens one, not {self.outcome.value}")
+        return self
+
+
+class WindowOpenOutcome(FrozenModel):
+    """What an open came to: the window answered, and whether it was opened rather than found."""
+
+    window: Window = Field(description="The window opened or focused")
+    is_new: bool = Field(description="True for an open, False when an existing window was answered")
+
+
+class DesktopChangeOutcome(FrozenModel):
+    """What a desktop write that may change nothing came to: the desktop, and whether it was written."""
+
+    desktop: Desktop = Field(description="The desktop after the edit")
+    is_written: bool = Field(description="Whether the edit changed the desktop and was written")
+
+
+class DesktopsChangeOutcome(FrozenModel):
+    """What an edit over every desktop that may change nothing came to: the desktops, and whether they were written."""
+
+    desktops: tuple[Desktop, ...] = Field(description="Every desktop after the edit, in display order")
+    is_written: bool = Field(description="Whether the edit changed a desktop and the file was written")
+
+
+class PlacementsEditOutcome(FrozenModel):
+    """What editing a client's layout of a desktop under the state lock came to."""
+
+    layout: DesktopLayout = Field(description="The layout after the edit, stamped when it was written")
+    is_written: bool = Field(description="Whether the edit changed the layout and was written")
+
+
+class ClientArrivalOutcome(FrozenModel):
+    """What a client's arrival came to: the desktop it lands on, and the desktop made for its user when one was."""
+
+    desktop_id: DesktopId = Field(description="Where the client lands")
+    created_desktop: Desktop | None = Field(description="The desktop seeded for a first-time user, else None")
+    replaced_desktop_name: str | None = Field(
+        description="The name of the user's earlier desktop when it had been deleted and a fresh one was seeded"
+    )
+
+
+class DesktopDeleteOutcome(FrozenModel):
+    """What deleting a desktop came to: the desktop that went, and where its clients fall back to."""
+
+    deleted: Desktop = Field(description="The desktop as it was")
+    fallback_desktop_id: DesktopId = Field(description="The first remaining desktop")
+
+
+@pure
+def window_view(window: Window, client_paths: Mapping[ClientId, WindowPath]) -> WindowView:
+    """The ``window`` object of desktop contracts.md section 5.2: the record, with each client's own path."""
+    return WindowView.model_validate({**dict(window), "client_paths": dict(client_paths)})
+
+
+@pure
+def desktop_view(
+    desktop: Desktop, client_paths: Mapping[WindowId, Mapping[ClientId, WindowPath]], theme: ThemeId | None
+) -> DesktopView:
+    """The ``desktop`` object of desktop contracts.md section 5.2: the record of section 4.1 with each window
+    carrying ``client_paths``, the path each client's page of an independent window is at (empty for a linked
+    window, and for a client at the home path), so a reader of the shell's windows sees what every client shows; and
+    ``theme``, the desktop's own theme, or None when it wears the workspace's default."""
+    windows = tuple(window_view(window, client_paths.get(window.id, {})) for window in desktop.windows)
+    return DesktopView.model_validate(
+        {**dict(desktop), "windows": windows, "theme": None if theme is None else str(theme)}
+    )
+
+
+@pure
+def desktop_layout_view(layout: DesktopLayout, window_paths: Mapping[WindowId, StoredWindowPath]) -> DesktopLayoutView:
+    """The ``layout`` object of desktop contracts.md section 4.2, with the client's stored paths for the desktop's
+    independent windows (pinned-taskbar-entries plan section 5.3)."""
+    return DesktopLayoutView.model_validate({**dict(layout), "window_paths": dict(window_paths)})
+
+
+@pure
+def effective_window(window: Window, stored: StoredWindowPath | None) -> Window:
+    """The window as one client sees it: an independent window wears the client's stored path and title (the home
+    path with no title when it has none); a linked window is the shared record."""
+    if window.scope is LocationScope.LINKED or stored is None:
+        return window
+    return window.model_copy_update(
+        to_update(window.field_ref().path, stored.path), to_update(window.field_ref().title, stored.title)
     )

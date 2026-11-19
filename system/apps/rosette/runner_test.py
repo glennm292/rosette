@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 import rosette.runner
-
 from rosette.credentials import API_KEY_FILENAME
+from rosette.data_types import Analysis, Row
+from rosette.notebook import now_utc_iso
 
 
 @pytest.fixture
@@ -122,6 +123,19 @@ def test_the_stored_key_is_readable_only_by_its_owner(
     assert mode & 0o077 == 0, "the key file is readable by someone other than its owner"
 
 
+def test_a_key_that_cannot_be_removed_is_reported_not_a_bare_error(
+    runner_module, tmp_path: Path
+) -> None:
+    client = runner_module.app.test_client()
+    # A directory where the key file belongs cannot be unlinked as a file.
+    (tmp_path / API_KEY_FILENAME).mkdir()
+
+    refused = client.delete("/api/credentials")
+
+    assert refused.status_code == 500
+    assert "Cannot remove the stored key" in refused.get_json()["error"]
+
+
 def test_editing_a_line_keeps_its_previous_answer_until_the_new_one_lands(
     runner_module, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -226,3 +240,36 @@ def test_an_unknown_undo_token_is_refused(
         "/api/notebook/restore", json={"undo": "../../../etc/passwd"}
     )
     assert refused.status_code == 400
+
+
+def test_the_review_page_reads_both_what_is_on_the_page_and_what_was_cleared(
+    runner_module,
+) -> None:
+    """Cleared lines are most of a past sitting, so review must read them too."""
+    client = runner_module.app.test_client()
+    client.put("/api/rows/kept", json={"text": ""})
+
+    store = runner_module._notebook_store
+    store.upsert_row(
+        Row(
+            row_id="put-away",
+            text="asino",
+            status="done",
+            analysis=Analysis(mode="gloss", english="donkey"),
+            created_at=now_utc_iso(),
+        ),
+        None,
+    )
+    store.delete_row_and_below("put-away")
+
+    sessions = client.get("/api/sessions").get_json()["sessions"]
+
+    assert len(sessions) == 1
+    assert [r["row_id"] for r in sessions[0]["rows"]] == ["put-away"]
+
+
+def test_the_review_page_is_served(runner_module) -> None:
+    response = runner_module.app.test_client().get("/review")
+
+    assert response.status_code == 200
+    assert "/api/sessions" in response.get_data(as_text=True)

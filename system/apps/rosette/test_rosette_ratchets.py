@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from imbue.imbue_common.ratchet_testing import standard_ratchet_checks as rc
+from imbue.imbue_common.ratchet_testing.ratchets import check_no_type_errors
 from inline_snapshot import snapshot
 
 _DIR = Path(__file__).parent
@@ -80,3 +81,6 @@ def test_prevent_dataclasses_import() -> None:
     chunks = rc.check_ratchet_rule(rc.PREVENT_DATACLASSES_IMPORT, _DIR, _VENDORED)
     assert len(chunks) <= snapshot(0), rc.PREVENT_DATACLASSES_IMPORT.format_failure(chunks)
 
+
+def test_no_type_errors() -> None:
+    check_no_type_errors(_DIR)

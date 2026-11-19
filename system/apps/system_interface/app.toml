@@ -1,7 +1,31 @@
 # The workspace's own shell (window manager plus app management). Internal: it
-# hosts every other app's tabs, so it is never offered as a tab itself.
+# hosts every other app's windows, so it is never offered as a window itself.
 name = "system_interface"
 display_name = "Workspace"
+description = "The workspace's shell: its windows, desktops and apps, and who is here."
+api_schema_path = "/api/schema"
 internal = true
 critical = true
 priority = "system_interface"
+
+# A preview shell is the real desktop with one app swapped: it boots over a seeded
+# copy of the live state directory and a copied registry whose rows for previewed
+# sibling apps point at their previews (the preview script writes that copy and
+# fills {registry}), and refuses only the verbs that would reach the live workspace.
+[preview]
+command = ["system-interface", "--preview", "--state-dir", "{copy:state}"]
+env = {SYSTEM_INTERFACE_PORT = "{port:main}", SYSTEM_INTERFACE_HOST = "{host}", MINDS_APPS_FILE = "{registry}"}
+copies = {state = "data/.state/system_interface"}
+health_path = "/api/health"
+
+# The keystrokes a person may re-bind in the Keyboard shortcuts dialog (the user-profile-state spec in the mngr
+# repository, section 10). The launcher's plain Enter stays fixed.
+[[keybindings]]
+id = "launcher-secondary-send"
+label = "Launcher: send the typed text to a chosen chat"
+default_chords = ["ctrl+enter", "meta+enter"]
+
+# The desktop marks the contract's own parts (docs/system/blueprint/workspace-themes/, section 4.2) and declares none
+# of its own: a theme styles it through those.
+[theming]
+mode = "parts"

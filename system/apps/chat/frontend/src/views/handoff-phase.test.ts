@@ -1,23 +1,38 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi } from "vitest";
+import m from "mithril";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../models/Chats", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../models/Chats")>()),
   getChatById: (id: string) => chats.get(id),
+  getProvisionalChat: (id: string) => provisionals.get(id),
 }));
 vi.mock("../models/HarnessCatalog", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../models/HarnessCatalog")>()),
   getHarnessCatalog: (await import("../models/harnessCatalogFixture")).harnessCatalogFixture,
 }));
 
-import type { ChatSnapshot } from "../models/Chats";
+import type { ChatSnapshot, HeldSend, ProvisionalChat } from "../models/Chats";
 import { isHandoffCancellable } from "../models/Chats";
-import { chatSnapshotFixture, handoffStateFixture, rebindStateFixture } from "../models/chatSnapshotFixture";
+import {
+  chatSnapshotFixture,
+  handoffStateFixture,
+  provisionalChatFixture,
+  rebindStateFixture,
+} from "../models/chatSnapshotFixture";
+import { setParticipantsForTesting } from "../models/Participants";
+import { ownerAndVisitorRosterFixture } from "../models/participantFixture";
 import { appendEvents } from "../models/Response";
 import { handoffComposerPlaceholder, handoffPhaseText } from "./handoff-phase";
-import { renderHeldSends } from "./HeldSendView";
+import { renderHeldSends, renderProvisionalHeldSends } from "./HeldSendView";
 
 const chats = new Map<string, ChatSnapshot>();
+const provisionals = new Map<string, ProvisionalChat>();
+
+function rowClassOf(bubble: { attrs: unknown }): string {
+  const attrs = bubble.attrs as { class?: string; className?: string };
+  return attrs.className ?? attrs.class ?? "";
+}
 
 describe("the words for a chat switching harness", () => {
   it("follows the phase, naming the harness each phase is about", () => {
@@ -72,7 +87,7 @@ describe("the words for a chat changing account in place", () => {
 });
 
 describe("the held-send bubbles", () => {
-  it("renders every held message from the snapshot, captioned like any send", () => {
+  it("renders every held message from the snapshot, solid like any send", () => {
     chats.set(
       "agent-1",
       chatSnapshotFixture("agent-1", {
@@ -90,9 +105,13 @@ describe("the held-send bubbles", () => {
     const text = JSON.stringify(bubbles);
     expect(text).toContain("Carry on in Codex");
     expect(text).toContain("and this");
-    // The switch's progress is the handoff node's to tell, not the bubbles'.
-    expect(text).toContain("Sending…");
+    // The switch's progress is the handoff node's to tell, not the bubbles': a held message is
+    // drawn as an ordinary send, with no caption and no fading.
+    expect(text).not.toContain("Sending…");
     expect(text).not.toContain("Claude Code is writing a summary…");
+    expect(
+      bubbles.every((bubble) => rowClassOf(bubble).includes("message-user") && !/opacity-/.test(rowClassOf(bubble))),
+    ).toBe(true);
   });
 
   it("stands the confirming message down once the switch marker carrying it is on the transcript", () => {
@@ -132,16 +151,81 @@ describe("the held-send bubbles", () => {
     expect(renderHeldSends(chat).map((bubble) => bubble.key)).toEqual(["held-m-2"]);
   });
 
-  it("captions a rebind's held messages the same way", () => {
+  it("renders a rebind's held messages the same way", () => {
     chats.set("agent-3", chatSnapshotFixture("agent-3", { handoff: rebindStateFixture() }));
-    const text = JSON.stringify(renderHeldSends("agent-3"));
+    const bubbles = renderHeldSends("agent-3");
+    const text = JSON.stringify(bubbles);
     expect(text).toContain("Carry on on the other account");
-    expect(text).toContain("Sending…");
+    expect(text).not.toContain("Sending…");
+    expect(
+      bubbles.every((bubble) => rowClassOf(bubble).includes("message-user") && !/opacity-/.test(rowClassOf(bubble))),
+    ).toBe(true);
+  });
+
+  it("shows a held background-task report as its one-line notice, and the user's own words as a bubble", () => {
+    const chat = `agent-report-${Math.random()}`;
+    chats.set(
+      chat,
+      chatSnapshotFixture(chat, {
+        handoff: rebindStateFixture({
+          held_sends: [
+            { message_id: "trigger-1", text: "Carry on on the other account" },
+            {
+              message_id: "m-report",
+              text: "<background-task-report>\n<summary>Wait for the worker (finished)</summary>\nExit code: 0\n</background-task-report>",
+              display: "notice",
+              display_label: "Background task",
+              display_body: "Wait for the worker (finished)",
+            },
+          ],
+        }),
+      }),
+    );
+    const root = document.createElement("div");
+
+    m.render(root, renderHeldSends(chat));
+
+    expect(root.querySelector(".held-send .message-notice")?.textContent).toBe(
+      "Background task: Wait for the worker (finished)",
+    );
+    expect(root.textContent).not.toContain("<background-task-report>");
+    expect(root.querySelector(".held-send .message-user-bubble")?.textContent).toBe("Carry on on the other account");
   });
 
   it("renders nothing for a chat that is not switching", () => {
     chats.set("agent-2", chatSnapshotFixture("agent-2"));
     expect(renderHeldSends("agent-2")).toEqual([]);
     expect(renderHeldSends("agent-unknown")).toEqual([]);
+  });
+});
+
+describe("the held-send bubbles in a shared workspace", () => {
+  // The owner's confirming message, then a visitor's send, as the backend lists them: the words, and who sent them.
+  const heldSends: HeldSend[] = [
+    { message_id: "trigger-1", text: "Carry on in Codex", author: null, author_name: null },
+    { message_id: "m-2", text: "and this", author: "user:glenn-2", author_name: "glenn" },
+  ];
+
+  afterEach(() => {
+    setParticipantsForTesting(null, []);
+  });
+
+  it("draws a switch's and a new chat's held sends under their senders on the owner's page", () => {
+    setParticipantsForTesting("user:owner-1", ownerAndVisitorRosterFixture());
+    const switching = `agent-switching-${Math.random()}`;
+    chats.set(switching, chatSnapshotFixture(switching, { handoff: handoffStateFixture({ held_sends: heldSends }) }));
+    const creating = `agent-creating-${Math.random()}`;
+    provisionals.set(creating, provisionalChatFixture(creating, { held_sends: heldSends }));
+
+    for (const bubbles of [renderHeldSends(switching), renderProvisionalHeldSends(creating)]) {
+      const root = document.createElement("div");
+      m.render(root, bubbles);
+      const [owners, glenns] = Array.from(root.querySelectorAll(".held-send"));
+      expect(owners?.classList.contains("message-other")).toBe(false);
+      expect(owners?.querySelector(".message-author")).toBeNull();
+      expect(glenns?.classList.contains("message-other")).toBe(true);
+      expect(glenns?.querySelector(".message-author")?.textContent).toBe("Glenn");
+      expect(glenns?.querySelector(".message-user-bubble")?.textContent).toBe("and this");
+    }
   });
 });

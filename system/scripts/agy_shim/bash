@@ -12,7 +12,7 @@
 # things the hooks were for: block (exit non-zero; stderr becomes the tool result), rewrite
 # (prepend, then exec), and inform.
 #
-# WHAT IT ENFORCES. The same four blockers claude runs, in claude's order, by feeding them the
+# WHAT IT ENFORCES. The same blockers claude runs, in claude's order, by feeding them the
 # claude-shaped payload they already parse -- so the guard logic and its wording stay
 # single-sourced across claude, codex and agy. The policies themselves are stated in
 # system/apps/chat/imbue/chat/harnesses/core-contracts/tool-call-policies.md.
@@ -48,8 +48,7 @@ note() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$SHIM_LOG" 2>
 # Outermost call only. A command the agent runs may itself invoke bash (a build, a test runner,
 # `xargs -n1 bash -c`), and policing those would block third-party code the agent did not write,
 # re-apply the rewrite prefix at every level, and pay the whole checker cost per nesting level.
-# Nested harnesses being unguarded is already the house norm (see "which pi runs which
-# extension" in tool-call-policies-state-of-things.md). MNGR_AGY_SHIM_OFF is the kill switch.
+# MNGR_AGY_SHIM_OFF is the kill switch.
 if [ -n "${MNGR_AGY_BASH_SHIM:-}" ] || [ -n "${MNGR_AGY_SHIM_OFF:-}" ] || [ ! -d "$SCRIPTS_DIR" ]; then
     # Every other fail-open path logs. This one is the broadest -- an unset or wrong
     # MNGR_AGENT_WORK_DIR disables every guard -- so it must not be the silent one.
@@ -80,12 +79,13 @@ if [ -z "$PAYLOAD" ]; then
 fi
 
 # claude's PreToolUse order (.claude/settings.json), on the command the agent actually wrote --
-# the rewrite happens after, so no guard ever inspects a prefixed command. Getting that ordering
-# for free is the one thing this shim has over pi, which needs `mngrOriginalCommand` for it.
+# the rewrite happens after, so no guard ever inspects a prefixed command.
 for guard in \
     agent_prevent_commit_rewrite.sh \
     agent_block_pipe_tail_head.sh \
+    agent_block_foreground_sleep.sh \
     agent_latchkey_request_standalone.sh \
+    agent_secrets_guard.sh \
     agent_tk_standalone.sh
 do
     guard_path="$SCRIPTS_DIR/$guard"
@@ -112,7 +112,7 @@ do
     esac
 done
 
-# --- the two SOFT policies, which have no other route to agy ------------------------------
+# The two SOFT policies, which have no other route to agy.
 #
 # agy fires no PreToolUse and no prompt-submit event, so neither of these can be a hook. But
 # this shim's stderr BECOMES the tool result the model reads -- the same channel the blockers
@@ -130,10 +130,19 @@ done
 # way round for a soft policy. Best effort throughout: a reminder never costs a command.
 TURN_STAMP="${MNGR_AGENT_STATE_DIR:-/tmp}/agy_shim_turn"
 TURN_REARM_SECONDS=900
-TURN_KEY=$(PATH="$SAFE_PATH" stat -c %i "${MNGR_AGENT_STATE_DIR:-}/active" 2>/dev/null || echo "")
+# `stat -c` is GNU; BSD stat (macOS) spells the same fields `-f`. The workspace is Linux,
+# but an agent reading a red suite on a laptop cannot tell an unportable probe from a
+# broken guard, so ask both rather than going quiet on one of them.
+stat_field() {
+    PATH="$SAFE_PATH" stat -c "$1" "$3" 2>/dev/null \
+        || PATH="$SAFE_PATH" stat -f "$2" "$3" 2>/dev/null \
+        || echo ""
+}
+TURN_KEY=$(stat_field %i %i "${MNGR_AGENT_STATE_DIR:-}/active")
 if [ -n "$TURN_KEY" ]; then
     stamped=$(cat "$TURN_STAMP" 2>/dev/null || echo "")
-    stamp_age=$(( $(date +%s) - $(PATH="$SAFE_PATH" stat -c %Y "$TURN_STAMP" 2>/dev/null || echo 0) ))
+    stamp_mtime=$(stat_field %Y %m "$TURN_STAMP")
+    stamp_age=$(( $(date +%s) - ${stamp_mtime:-0} ))
     if [ "$TURN_KEY" != "$stamped" ] || [ "$stamp_age" -ge "$TURN_REARM_SECONDS" ]; then
         printf '%s' "$TURN_KEY" >"$TURN_STAMP" 2>/dev/null || true
         reminder=$(PATH="$SAFE_PATH" "$REAL_BASH" "$SCRIPTS_DIR/agent_open_tickets_reminder.sh" </dev/null 2>/dev/null) || reminder=""

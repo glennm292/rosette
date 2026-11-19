@@ -6,18 +6,33 @@
 import m from "mithril";
 import { MarkdownContent } from "../markdown";
 import type { TranscriptEvent, AssistantMessageEvent, ToolResultEvent, ToolCall } from "../models/Response";
-import { getEventDetailState, getEventDetailVersion, requestEventDetail } from "../models/Response";
+import { getEventDetailState, getEventDetailVersion, getEventsForChat, requestEventDetail } from "../models/Response";
 import { getChatById } from "../models/Chats";
-import { openProviderChooser } from "../models/Providers";
-import { openSubagentTab, startChatOnAccount } from "../shell";
+import { accountForAgent, areAccountsLoaded, openProviderChooser } from "../models/Providers";
+import { openSubagentView } from "../shell";
+import { beginSwitchToAccountId } from "./SwitchDialog";
+import {
+  isResendingAfterSignIn,
+  isSignedInSince,
+  messagesToSendAgain,
+  resendStateOf,
+  sendAgain,
+} from "./auth-recovery";
 import { hoverTooltipAttrs } from "@imbue/workspace-ui/src/components/hoverTooltip";
 import { activityDotClass } from "@imbue/workspace-ui/src/components/activityDot";
-import { isBlockExpanded, setBlockExpanded } from "./expansion-state";
-import type { PermissionResolution } from "./message-classification";
+import { getExpansionVersion, isBlockExpanded, setBlockExpanded } from "./expansion-state";
+import type { PermissionResolution, RequestResolution, SecretResolution } from "./message-classification";
 import { isSkillExpansionUserMessage } from "./message-classification";
 import { PermissionCard, isFiledPermissionRequest, parsePermissionRequest } from "./permission-card";
-import { renderToolBlock, type PayloadState } from "./ToolCallBlock";
+import { SecretCard, isFiledSecretRequest, parseSecretRequest } from "./secret-card";
+import { ToolChipGroup, type ChipEntry } from "./ToolChipGroup";
+import { AutocompactNotice } from "./AutocompactNotice";
+import { compactionChips, type CompactionPart } from "./compaction-chips";
+import { STRETCH_PIECES_CLASS, STRETCH_TEXT_EDGE_CLASS, renderAgentProse } from "./machine-bubbles";
+import { railNodeAttrs } from "./agent-rail";
+import { runningCallElapsed, runningToolCall } from "./ActivityIndicator";
 import { badgeClass } from "@imbue/workspace-ui/src/components/Badge";
+import { BADGE_PART } from "@imbue/workspace-ui/src/themes/parts";
 
 /** A permission-request tool call's own verdict: its own request id's entry in
  *  `resolutionsByRequestId`, or null while the request awaits a decision (or
@@ -25,10 +40,22 @@ import { badgeClass } from "@imbue/workspace-ui/src/components/Badge";
 function resolutionForCall(
   toolCall: ToolCall,
   toolResult: ToolResultEvent | null,
-  resolutionsByRequestId: ReadonlyMap<string, PermissionResolution>,
+  resolutionsByRequestId: ReadonlyMap<string, RequestResolution>,
 ): PermissionResolution | null {
   const details = parsePermissionRequest(toolCall, toolResult);
-  return (details ? resolutionsByRequestId.get(details.requestId) : undefined) ?? null;
+  const resolution = details ? resolutionsByRequestId.get(details.requestId) : undefined;
+  return resolution === "granted" || resolution === "denied" || resolution === "error" ? resolution : null;
+}
+
+/** A secret request's own verdict, by its request id, or null while it awaits an answer. */
+function secretResolutionForCall(
+  toolCall: ToolCall,
+  toolResult: ToolResultEvent | null,
+  resolutionsByRequestId: ReadonlyMap<string, RequestResolution>,
+): SecretResolution | null {
+  const details = parseSecretRequest(toolCall, toolResult);
+  const resolution = details ? resolutionsByRequestId.get(details.requestId) : undefined;
+  return resolution === "stored" || resolution === "declined" || resolution === "superseded" ? resolution : null;
 }
 
 // Per-kind user_message rendering lives in user-message-display.ts (the display
@@ -91,49 +118,6 @@ export function buildToolResultsWithSkillExpansions(events: TranscriptEvent[]): 
   return toolResults;
 }
 
-/**
- * Hide auth-error turns from the pre-login prefix once login has recovered.
- *
- * A fresh chat with no Claude credentials produces a run of "Not logged in"
- * assistant messages before the user authenticates. Once login succeeds and
- * /welcome is resent, the first visible turn should be the friendly greeting,
- * not the prior failed attempts.
- *
- * Restricted to the PREFIX of the transcript (turns that occurred before any
- * successful assistant message). A mid-session token expiration -- where the
- * user has already had successful exchanges before the auth error -- is left
- * intact, since the user may want to scroll back to see what they were doing.
- */
-export function computeAuthErrorHiddenEventIds(events: TranscriptEvent[]): Set<string> {
-  const hidden = new Set<string>();
-
-  let firstSuccessIdx = -1;
-  for (let i = 0; i < events.length; i++) {
-    const ev = events[i];
-    if (ev.type === "assistant_message" && ev.is_auth_error !== true) {
-      firstSuccessIdx = i;
-      break;
-    }
-  }
-  if (firstSuccessIdx === -1) return hidden;
-
-  for (let i = 0; i < firstSuccessIdx; i++) {
-    const ev = events[i];
-    if (ev.type !== "assistant_message" || ev.is_auth_error !== true) continue;
-    hidden.add(ev.event_id);
-    for (let j = i - 1; j >= 0; j--) {
-      const prev = events[j];
-      if (prev.type === "user_message") {
-        hidden.add(prev.event_id);
-        break;
-      }
-      if (prev.type === "assistant_message") break;
-    }
-  }
-
-  return hidden;
-}
-
 export function countResolvedToolResults(
   toolCalls: ToolCall[] | undefined,
   toolResults: Map<string, ToolResultEvent>,
@@ -178,19 +162,48 @@ function resolvedResultSignature(
     .join("|");
 }
 
+/** The input outside the event that the auth-error note renders from: whether the chat is known
+ *  yet, which account it is bound to, and, once that account signed in again, the message offered
+ *  again and how its send went. The memo below has to carry it -- the chat list and the account
+ *  list can land after the transcript. */
+function reauthNoteSignature(event: AssistantMessageEvent, chatId: string): string {
+  if (!event.is_auth_error) return "";
+  const chat = getChatById(chatId);
+  if (chat === undefined) return "unknown";
+  const bound = `bound:${chat.active_agent.account_id ?? ""}`;
+  if (!isSignedInSince(event, chatId)) return bound;
+  const prompts = messagesToSendAgain(getEventsForChat(chatId), event);
+  const resending = isResendingAfterSignIn(chatId) ? "resending" : "-";
+  return `${bound}|recovered|${prompts?.map((prompt) => prompt.event_id).join(",") ?? "-"}|${resendStateOf(event.event_id, prompts) ?? "-"}|${resending}`;
+}
+
+/** What this event's chip row shows of the call the agent is running now: its id and how long the turn has run, or
+ *  nothing when the call is not this event's. The running chip's look and clock live outside the event, so the memo
+ *  below has to carry them. */
+function runningChipSignature(event: AssistantMessageEvent, chatId: string): string {
+  const running = runningToolCall(chatId);
+  if (running === null || !event.tool_calls.some((call) => call.tool_call_id === running.tool_call_id)) return "";
+  return `${running.tool_call_id}|${runningCallElapsed(chatId) ?? ""}`;
+}
+
 export function StableAssistantMessage(): m.Component<{
   event: AssistantMessageEvent;
   toolResults: Map<string, ToolResultEvent>;
   chatId: string;
+  isStretchHead: boolean;
 }> {
   let renderedEvent: AssistantMessageEvent | null = null;
   let renderedToolResultCount = 0;
   let renderedSubagentCardCount = 0;
   let renderedResultSignature = "";
+  let renderedReauthSignature = "";
+  let renderedRunningChipSignature = "";
+  let renderedIsStretchHead = false;
   let renderedDetailVersion = -1;
+  let renderedExpansionVersion = -1;
   return {
     onbeforeupdate(vnode) {
-      const { event, toolResults, chatId } = vnode.attrs;
+      const { event, toolResults, chatId, isStretchHead } = vnode.attrs;
       const currentToolResultCount = countResolvedToolResults(event.tool_calls, toolResults);
       // A subagent card can appear after the message was first rendered: the
       // backend re-broadcasts the parent with subagent_metadata once a running
@@ -208,41 +221,131 @@ export function StableAssistantMessage(): m.Component<{
         currentToolResultCount !== renderedToolResultCount ||
         currentSubagentCardCount !== renderedSubagentCardCount ||
         currentResultSignature !== renderedResultSignature ||
-        getEventDetailVersion(chatId) !== renderedDetailVersion
+        reauthNoteSignature(event, chatId) !== renderedReauthSignature ||
+        runningChipSignature(event, chatId) !== renderedRunningChipSignature ||
+        isStretchHead !== renderedIsStretchHead ||
+        getEventDetailVersion(chatId) !== renderedDetailVersion ||
+        // Opening a tool chip swaps WHICH detail panel exists, so it needs a
+        // real re-render to build one.
+        getExpansionVersion() !== renderedExpansionVersion
       );
     },
     view(vnode) {
       const event = vnode.attrs.event;
       const toolResults = vnode.attrs.toolResults;
       const chatId = vnode.attrs.chatId;
+      const isStretchHead = vnode.attrs.isStretchHead;
       renderedEvent = event;
       renderedToolResultCount = countResolvedToolResults(event.tool_calls, toolResults);
       renderedSubagentCardCount = countSubagentCards(event.tool_calls);
       renderedResultSignature = resolvedResultSignature(event.tool_calls, toolResults);
+      renderedReauthSignature = reauthNoteSignature(event, chatId);
+      renderedRunningChipSignature = runningChipSignature(event, chatId);
+      renderedIsStretchHead = isStretchHead;
       renderedDetailVersion = getEventDetailVersion(chatId);
+      renderedExpansionVersion = getExpansionVersion();
 
-      return m("div", renderAssistantMessageChildren(event, toolResults, chatId));
+      return m(
+        "div",
+        { class: STRETCH_PIECES_CLASS },
+        renderAssistantRun([event], toolResults, chatId, new Map(), new Map(), stretchRun(isStretchHead)),
+      );
     },
   };
 }
 
+/** One message of a stretch of the agent's output, as a part of the stretch. */
 export function renderAssistantMessage(
   event: AssistantMessageEvent,
   toolResults: Map<string, ToolResultEvent>,
   chatId: string,
+  isStretchHead = false,
 ): m.Vnode {
   return m(
     "div",
-    {
-      id: event.event_id,
-      class: "message message-assistant mb-5",
-      key: event.event_id,
-    },
-    m(StableAssistantMessage, { event, toolResults, chatId }),
+    { id: event.event_id, class: "message message-assistant", key: event.event_id },
+    m(StableAssistantMessage, { event, toolResults, chatId, isStretchHead }),
   );
 }
 
-export function renderSubagentCard(toolCall: ToolCall, chatId: string, isRunning: boolean): m.Vnode {
+/** Whether this call renders as a sub-agent card. Gated on the description,
+ *  which rides the tool input, so the card stands as soon as the Agent call is
+ *  issued -- before its subagent session is linked -- showing a non-clickable
+ *  "Running…" until `subagent_metadata.session_id` arrives. A sub-agent is a
+ *  whole conversation, not an action, so it never joins the chips. */
+function isSubagentCardCall(toolCall: ToolCall): boolean {
+  return toolCall.tool_name === "Agent" && Boolean(toolCall.subagent_metadata || toolCall.description);
+}
+
+/** Whether a call renders as a card of its own instead of joining the chip row.
+ *  Naming the rule once keeps {@link isChipOnlyEvent} from drifting away from
+ *  what appendEventParts actually does with a call. */
+function rendersAsCard(toolCall: ToolCall, result: ToolResultEvent | null): boolean {
+  return (
+    isSubagentCardCall(toolCall) ||
+    isFiledPermissionRequest(toolCall, result) ||
+    isFiledSecretRequest(toolCall, result)
+  );
+}
+
+/** Whether a call joins a chip row rather than standing as a card. */
+export function rendersAsChip(toolCall: ToolCall, toolResults: Map<string, ToolResultEvent>): boolean {
+  return !rendersAsCard(toolCall, toolResults.get(toolCall.tool_call_id) ?? null);
+}
+
+/** One member of an assistant run: an assistant event, or a compaction, whose chips
+ *  join the run's chip row like a tool call's. */
+export type RunPart = AssistantMessageEvent | CompactionPart;
+
+/** Whether a part's entire contribution to a run is chips: no thinking
+ *  toggle, no prose, and every call one that chips rather than cards. Nothing
+ *  in such a part can break a chip row, which is what lets a consecutive run
+ *  of them share one (see buildRows). A compaction is chips alone. */
+export function isChipOnlyEvent(event: RunPart, toolResults: Map<string, ToolResultEvent>): boolean {
+  if (event.type === "compaction") return true;
+  if (event.has_thinking) return false;
+  if (event.text) return false;
+  const toolCalls = event.tool_calls || [];
+  if (toolCalls.length === 0) return false;
+  return toolCalls.every((call) => !rendersAsCard(call, toolResults.get(call.tool_call_id) ?? null));
+}
+
+/**
+ * A run of assistant events as ONE part of the agent's turn.
+ *
+ * A harness emits an event per model response, so what a reader sees as one
+ * message -- a line of intent, then the calls that carry it out -- arrives as
+ * several. A row each sets them a full message gap apart and stacks a lone chip
+ * per row; handing the run to renderAssistantRun lays them out exactly as they
+ * would have laid out had the harness sent them as one event: prose, then the
+ * single wrapping chip row tucked under it. Both are what a step's revealed
+ * work already gets.
+ *
+ * Unmemoized, unlike {@link renderAssistantMessage}, which is why buildRows
+ * sends a lone event there instead. The cost is a shallow vnode diff per
+ * redraw: MarkdownContent guards its own re-parse on unchanged content, so the
+ * markdown is not re-rendered either way.
+ */
+export function renderAssistantRunRow(
+  events: RunPart[],
+  toolResults: Map<string, ToolResultEvent>,
+  chatId: string,
+  isStretchHead = false,
+): m.Vnode {
+  const key = events[0].event_id;
+  return m(
+    "div",
+    { id: key, class: `message message-assistant ${STRETCH_PIECES_CLASS}`, key },
+    renderAssistantRun(events, toolResults, chatId, new Map(), new Map(), stretchRun(isStretchHead)),
+  );
+}
+
+export function renderSubagentCard(
+  toolCall: ToolCall,
+  chatId: string,
+  isRunning: boolean,
+  layout: RunLayout = "nested",
+): m.Vnode {
   const metadata = toolCall.subagent_metadata;
   // Description and agent type come from the tool call itself, so the card renders fully
   // even before the subagent session is linked; fall back to metadata if the tool input
@@ -259,7 +362,7 @@ export function renderSubagentCard(toolCall: ToolCall, chatId: string, isRunning
     ? m("span", {
         class: `subagent-card-status-dot subagent-card-status-dot--running ${activityDotClass("h-[7px] w-[7px]")}`,
         "aria-label": "Sub-agent is working",
-        ...hoverTooltipAttrs("Working"),
+        ...hoverTooltipAttrs("Working", "above"),
       })
     : m(
         "svg",
@@ -270,7 +373,7 @@ export function renderSubagentCard(toolCall: ToolCall, chatId: string, isRunning
           viewBox: "0 0 16 16",
           fill: "none",
           "aria-label": "Sub-agent finished",
-          ...hoverTooltipAttrs("Finished"),
+          ...hoverTooltipAttrs("Finished", "above"),
         },
         // Same filled-circle-with-check mark used for a done step in the progress timeline.
         m.trust(
@@ -287,7 +390,10 @@ export function renderSubagentCard(toolCall: ToolCall, chatId: string, isRunning
   return m(
     "div",
     {
-      class: `subagent-card my-[0.75em] flex items-center justify-between gap-3 rounded-md border px-4 py-3 ${cardTone}`,
+      class:
+        `subagent-card ${layout === "stretch" ? "" : "my-[0.75em] "}flex items-center justify-between gap-3 ` +
+        `rounded-md border px-4 py-3 ${cardTone}`,
+      ...(layout === "stretch" ? railNodeAttrs("box") : {}),
     },
     [
       m("div", { class: "subagent-card-header flex min-w-0 flex-1 items-center gap-2" }, [
@@ -297,7 +403,9 @@ export function renderSubagentCard(toolCall: ToolCall, chatId: string, isRunning
           { class: "subagent-card-description truncate text-(length:--font-size-body) font-medium text-primary" },
           description,
         ),
-        agentType ? m("span", { class: badgeClass("accent", { mono: true, extra: "shrink-0" }) }, agentType) : null,
+        agentType
+          ? m("span", { class: badgeClass("accent", { mono: true, extra: "shrink-0" }), ...BADGE_PART }, agentType)
+          : null,
       ]),
       // The click-through needs the subagent session_id, which only arrives once the call is
       // linked. The label stays "View conversation" throughout so it doesn't flip-flop; before
@@ -312,7 +420,7 @@ export function renderSubagentCard(toolCall: ToolCall, chatId: string, isRunning
               onclick(e: Event) {
                 e.preventDefault();
                 e.stopPropagation();
-                openSubagentTab(chatId, sessionId, description);
+                openSubagentView(chatId, sessionId);
               },
             },
             "View conversation",
@@ -328,101 +436,19 @@ export function renderSubagentCard(toolCall: ToolCall, chatId: string, isRunning
   );
 }
 
-export function renderToolCallBlock(
-  toolCall: ToolCall,
-  toolResult: ToolResultEvent | null,
-  chatId: string,
-  assistantEventId: string,
-): m.Vnode {
-  // The harness's parser already worked out what this call should read as -- for
-  // codex that means unwrapping an `exec` whose real operation is buried in a JS
-  // argument, which is not something this view should have to know. Falls back to
-  // the tool name for events parsed before the labels existed.
-  const isError = toolResult?.is_error === true;
-  // Keyed by the tool call's stable id so the expansion survives the row
-  // unmounting and remounting (virtualization) or re-rendering (streaming).
-  const expansionKey = `tc:${toolCall.tool_call_id}`;
-
-  // Events are payload-free on the wire: the full input/output are fetched on demand
-  // (cached frontend-side for the page session) the first time the row is expanded.
-  const requestPayloads = () => {
-    if (toolCall.input_chars > 0) {
-      requestEventDetail(chatId, assistantEventId);
-    }
-    if (toolResult && toolResult.output_chars > 0 && !toolResult.event_id.startsWith("skill-expansion-")) {
-      requestEventDetail(chatId, toolResult.event_id);
-    }
-  };
-  if (isBlockExpanded(expansionKey)) {
-    // Re-request on every expanded render: a no-op when cached or in flight, and it
-    // heals an entry dropped by a transient fetch failure.
-    requestPayloads();
-  }
-
-  let inputText = "";
-  let inputState: PayloadState = "loaded";
-  if (toolCall.input_chars > 0 || Boolean(toolCall.tk_command)) {
-    const inputDetail = getEventDetailState(chatId, assistantEventId);
-    if (inputDetail?.state === "loaded") {
-      inputText = inputDetail.detail.inputs_by_tool_call_id[toolCall.tool_call_id] ?? toolCall.tk_command ?? "";
-    } else if (toolCall.input_chars === 0) {
-      // Only the stamped tk command exists (nothing to fetch).
-      inputText = toolCall.tk_command ?? "";
-    } else {
-      inputState = inputDetail?.state ?? "loading";
-    }
-  }
-
-  let outputText = "";
-  let outputState: PayloadState = "loaded";
-  if (toolResult) {
-    // A frontend-synthesized skill expansion carries its body inline; a real result's
-    // output is fetched. When both exist (a Skill call with real output plus its
-    // expansion), the fetched output leads and the expansion follows.
-    const isFetchable = toolResult.output_chars > 0 && !toolResult.event_id.startsWith("skill-expansion-");
-    const fetched = isFetchable ? getEventDetailState(chatId, toolResult.event_id) : undefined;
-    const inline = toolResult.output ?? "";
-    if (fetched?.state === "loaded") {
-      outputText = [fetched.detail.output ?? "", inline].filter((part) => part).join("\n\n");
-    } else if (isFetchable) {
-      outputState = fetched?.state ?? "loading";
-    } else {
-      outputText = inline;
-    }
-  }
-
-  return renderToolBlock({
-    headerText: toolCall.header_label || `Tool: ${toolCall.tool_name}`,
-    inputText,
-    outputText,
-    inputState,
-    outputState,
-    isError,
-    errorSnippet: toolResult?.error_snippet ?? undefined,
-    // The markdown rhythm: the same vertical slot a paragraph-adjacent block
-    // gets in the assistant flow.
-    extra: "my-[0.25em]",
-    expansionKey,
-    // Kick off the payload fetches; the redraw renders the loading note (or
-    // the cached payload) into the just-revealed details section.
-    onExpand: () => {
-      requestPayloads();
-      m.redraw();
-    },
-  });
-}
-
-/** The "sign in again" affordance under an auth failure.
+/** The two ways out under an auth failure: "Sign in again", and the switch link beside it.
  *
- * Resolves the chat's own account from its `account` label, so the chooser opens ON that
- * account and re-authenticates it in place -- every chat bound to it recovers. Without the
- * label (a chat from before accounts, say) it opens the chooser plainly, which is still the
- * right destination.
+ * "Sign in again" resolves the chat's own account from its `account` label, so the chooser opens
+ * ON that account and re-authenticates it in place -- every chat bound to it recovers. When the
+ * label names no signed-in account (a chat from before accounts, or one whose account was signed
+ * out and signed in again as a new one), there is nothing to re-authenticate: the account signed
+ * in, or picked, is what this chat moves to.
  */
 const REAUTH_ACTION_CLASS = "message-api-error-action cursor-pointer text-accent underline hover:text-accent-hover";
 
 function renderReauthAction(chatId: string): m.Children {
-  const accountId = getChatById(chatId)?.active_agent.account_id ?? "";
+  const chat = getChatById(chatId);
+  const accountId = chat?.active_agent.account_id ?? "";
   return m("div", { class: "message-api-error-note mt-[0.4em] text-[0.85em] text-faint" }, [
     "This provider is no longer working. ",
     m(
@@ -430,30 +456,90 @@ function renderReauthAction(chatId: string): m.Children {
       {
         type: "button",
         class: REAUTH_ACTION_CLASS,
-        onclick: () => openProviderChooser(accountId ? { accountId } : {}),
+        onclick: () => {
+          // Before the account list has loaded no account reads as signed in, which says nothing
+          // about whether this chat's is gone.
+          const isOwnAccountSignedIn =
+            accountId !== "" && (!areAccountsLoaded() || accountForAgent(accountId) !== null);
+          openProviderChooser(
+            isOwnAccountSignedIn
+              ? { accountId }
+              : chat === undefined
+                ? {}
+                : { onSignedIn: (chosen) => beginSwitchToAccountId(chatId, chosen) },
+          );
+        },
       },
       "Sign in again",
     ),
-    // Two ways out, because only the first one revives THIS conversation: a chat binds to its
-    // account when it is created and nothing rebinds it, so "switch provider" cannot mean
-    // moving this chat -- it means starting a fresh one somewhere that works. Both are offered
-    // because the right choice depends on whether the credential is fixable, which the user
-    // knows and we do not: an expired login is, a spent quota mostly is not.
-    " or ",
-    m(
-      "button",
-      {
-        type: "button",
-        class: REAUTH_ACTION_CLASS,
-        onclick: () =>
-          openProviderChooser({
-            onSignedIn: (chosen) => startChatOnAccount(chosen),
-            brokenAccountId: accountId || undefined,
-          }),
-      },
-      "switch to another provider",
-    ),
+    // Two ways out, because the right one depends on whether the credential is fixable, which
+    // the user knows and we do not: an expired login is, a spent quota mostly is not. The second
+    // moves this chat to the account picked: a rebind for another account on the same harness and
+    // lane, a handoff otherwise. It waits for the chat list, which can land after the transcript:
+    // the move needs the chat, and the chooser fixes which account it refuses when it opens.
+    chat === undefined
+      ? null
+      : [
+          " or ",
+          m(
+            "button",
+            {
+              type: "button",
+              class: REAUTH_ACTION_CLASS,
+              onclick: () =>
+                openProviderChooser({
+                  onSignedIn: (chosen) => beginSwitchToAccountId(chatId, chosen),
+                  ...(accountId ? { unpickable: { accountId, reason: "failing" as const } } : {}),
+                }),
+            },
+            "switch to another provider",
+          ),
+        ],
     ".",
+  ]);
+}
+
+/** A failed sign-in turn whose account has since been signed in again, wherever that happened: one
+ *  neutral line in place of the red failure, and the message it failed on to send again while the
+ *  turn is still the chat's newest. The provider's own text stays one click away. */
+function renderSignedInAgain(event: AssistantMessageEvent, chatId: string, text: string): m.Vnode {
+  const prompts = messagesToSendAgain(getEventsForChat(chatId), event);
+  const state = resendStateOf(event.event_id, prompts);
+  // An unconfirmed send may already be with the agent, so it gets the composer's unconfirmed
+  // wording: check before sending, and a button that says it sends again.
+  const offer =
+    state === "unconfirmed"
+      ? {
+          lead: " Couldn't confirm your message arrived. The agent may already have it, so check its terminal before you send it again. ",
+          label: "Send again",
+        }
+      : state === "failed"
+        ? { lead: " That didn't send. ", label: "Try again" }
+        : { lead: " ", label: "Send your message again" };
+  const action =
+    prompts === null || state === "sent"
+      ? null
+      : isResendingAfterSignIn(chatId)
+        ? " Sending your message again\u2026"
+        : [
+            offer.lead,
+            m(
+              "button",
+              {
+                type: "button",
+                class: REAUTH_ACTION_CLASS,
+                disabled: state === "sending",
+                onclick: () => void sendAgain(chatId, event.event_id, prompts),
+              },
+              offer.label,
+            ),
+          ];
+  return m("div", { class: "message-auth-recovered rounded-md bg-fill-hover px-[0.75em] py-[0.5em] text-secondary" }, [
+    m("p", { class: "message-auth-recovered-lead" }, ["Signed in again.", action]),
+    m("details", { class: "message-auth-recovered-details mt-[0.4em] text-[0.85em] text-faint" }, [
+      m("summary", { class: "cursor-pointer" }, "See details"),
+      m(MarkdownContent, { content: text, requestedAt: event.timestamp, expansionKeyPrefix: event.event_id }),
+    ]),
   ]);
 }
 
@@ -463,7 +549,7 @@ function renderReauthAction(chatId: string): m.Children {
 function providerFaultNote(kind: string | null): string {
   const cause =
     kind === "api_error" ? "the model provider's servers hit an error" : "the model provider's servers are overloaded";
-  return `This isn't Mind's fault -- ${cause}. Try again in a moment.`;
+  return `This isn't Imbue Studio's fault -- ${cause}. Try again in a moment.`;
 }
 
 /** The tiny muted "thinking" toggle atop an assistant message whose harness recorded
@@ -514,69 +600,204 @@ function renderThinkingDisclosure(event: AssistantMessageEvent, chatId: string):
   ]);
 }
 
+/** Where a run's pieces stand: on a stretch's line, each one placed for it (prose as bubbles, chip rows on the text
+ *  edge), or nested inside a piece that holds them (a step's unfurled work, a handoff's summary turn), as plain text
+ *  and chip rows off the line. */
+export type RunLayout = "stretch" | "nested";
+
+export interface RunPlacement {
+  readonly layout: RunLayout;
+  /** The stretch's first piece: a bubble that opens the run squares its corner toward the face. */
+  readonly isStretchHead: boolean;
+}
+
+const NESTED_RUN: RunPlacement = { layout: "nested", isStretchHead: false };
+
+/** A run on a stretch's line; `isStretchHead` when it is the stretch's first part. */
+export function stretchRun(isStretchHead = false): RunPlacement {
+  return { layout: "stretch", isStretchHead };
+}
+
+/** A chip row on the stretch's text edge, wrapping where a bubble's text would. */
+const STRETCH_CHIPS_CLASS = "agent-chips max-w-[calc(80%+2rem)] px-4";
+
 /**
- * Render the children (text + tool calls) of an assistant message.
- * Used by both the stable (memoized) and simple assistant message renderers.
+ * Render a run of assistant events as interleaved prose and tool-chip rows.
+ *
+ * Consecutive tool calls collapse into ONE chip row even across event
+ * boundaries, which is what makes a sequence read as one line of "what it did":
+ * a harness emits one event per model response, so three tool calls in a row are
+ * usually three events, and grouping only within an event would leave them as
+ * three separate rows. Prose breaks the run and starts a fresh row after it.
+ * A compaction's chips join the row like a call's, and the one-time Auto-compact
+ * notice goes under the row that holds its anchor compaction.
+ *
+ * Callers that hold a whole list of events (a step's revealed work, an ungrouped
+ * run, a handoff's body) pass them all so the merging can happen; a caller that
+ * holds one event (a lone message in a stretch) passes just that one.
+ */
+export function renderAssistantRun(
+  events: RunPart[],
+  toolResults: Map<string, ToolResultEvent>,
+  chatId: string,
+  resolutionsByRequestId: ReadonlyMap<string, RequestResolution> = new Map(),
+  secretNotesByRequestId: ReadonlyMap<string, string> = new Map(),
+  placement: RunPlacement = NESTED_RUN,
+): m.Children[] {
+  const children: m.Children[] = [];
+  // One array for the whole run, emptied in place by `splice` rather than
+  // reassigned: appendEventParts holds this same reference, so swapping in a
+  // fresh array here would leave it pushing into the flushed one.
+  const pendingChips: ChipEntry[] = [];
+  let isNoticeUnderRow = false;
+  const isOnLine = placement.layout === "stretch";
+
+  // Anything that is not a tool chip ends the run in progress: the row has to
+  // land above whatever interrupted it, in transcript order.
+  const flushChips = (): void => {
+    if (pendingChips.length === 0) return;
+    const row = m(ToolChipGroup, { chips: pendingChips.splice(0), toolResults, chatId, isOnLine });
+    children.push(isOnLine ? m("div", { class: STRETCH_CHIPS_CLASS, ...railNodeAttrs("chips") }, row) : row);
+    if (isNoticeUnderRow) {
+      children.push(
+        isOnLine
+          ? m("div", { class: STRETCH_TEXT_EDGE_CLASS, ...railNodeAttrs("box") }, m(AutocompactNotice))
+          : m(AutocompactNotice),
+      );
+      isNoticeUnderRow = false;
+    }
+  };
+
+  for (const event of events) {
+    if (event.type === "compaction") {
+      pendingChips.push(...compactionChips(event));
+      isNoticeUnderRow ||= event.isNoticeAnchor;
+      continue;
+    }
+    appendEventParts(
+      event,
+      toolResults,
+      chatId,
+      resolutionsByRequestId,
+      secretNotesByRequestId,
+      { layout: placement.layout, isStretchHead: placement.isStretchHead && children.length === 0 },
+      children,
+      pendingChips,
+      flushChips,
+    );
+  }
+  flushChips();
+  return children;
+}
+
+/**
+ * Render the children (text + tool calls) of a single assistant message.
+ * The one-event case of {@link renderAssistantRun}; kept as its own name
+ * because most callers have exactly one event.
  */
 export function renderAssistantMessageChildren(
   event: AssistantMessageEvent,
   toolResults: Map<string, ToolResultEvent>,
   chatId: string,
-  resolutionsByRequestId: ReadonlyMap<string, PermissionResolution> = new Map(),
+  resolutionsByRequestId: ReadonlyMap<string, RequestResolution> = new Map(),
+  secretNotesByRequestId: ReadonlyMap<string, string> = new Map(),
+  placement: RunPlacement = NESTED_RUN,
 ): m.Children[] {
+  return renderAssistantRun([event], toolResults, chatId, resolutionsByRequestId, secretNotesByRequestId, placement);
+}
+
+/** A piece that is not a bubble or a chip row, met at its edge when it stands on a stretch's line. */
+function onLineAsBox(piece: m.Children, placement: RunPlacement): m.Children {
+  return placement.layout === "stretch" ? m("div", railNodeAttrs("box"), piece) : piece;
+}
+
+/** One event's contribution to a run: its thinking toggle, its prose and its
+ *  cards, while its plain tool calls accumulate onto the run's open chip row
+ *  (`pendingChips`), which `flushChips` closes off.
+ *
+ *  Appends into the run's own `children` rather than returning its own list:
+ *  `flushChips` writes the chip row there too, and a run's parts have to
+ *  interleave in ONE array to stay in transcript order -- an event that is
+ *  prose, then a tool call, then a sub-agent card would otherwise land its chip
+ *  row above its own prose. */
+function appendEventParts(
+  event: AssistantMessageEvent,
+  toolResults: Map<string, ToolResultEvent>,
+  chatId: string,
+  resolutionsByRequestId: ReadonlyMap<string, RequestResolution>,
+  secretNotesByRequestId: ReadonlyMap<string, string>,
+  placement: RunPlacement,
+  children: m.Children[],
+  pendingChips: ChipEntry[],
+  flushChips: () => void,
+): void {
   const textContent = event.text || "";
   const toolCalls = event.tool_calls || [];
+  const isOnLine = placement.layout === "stretch";
 
-  const children: m.Children[] = [];
   if (event.has_thinking) {
-    children.push(renderThinkingDisclosure(event, chatId));
+    flushChips();
+    const disclosure = renderThinkingDisclosure(event, chatId);
+    children.push(
+      isOnLine ? m("div", { class: STRETCH_TEXT_EDGE_CLASS, ...railNodeAttrs("box") }, disclosure) : disclosure,
+    );
   }
   if (textContent) {
-    if (event.is_api_error || event.is_auth_error) {
+    flushChips();
+    if (event.is_auth_error && isSignedInSince(event, chatId)) {
+      children.push(onLineAsBox(renderSignedInAgain(event, chatId, textContent), placement));
+    } else if (event.is_api_error || event.is_auth_error) {
       // A model API error: render the failure text in light red, and for a
-      // provider-side fault (5xx / overloaded) add a grey "not Mind's fault" note.
+      // provider-side fault (5xx / overloaded) add a grey "not Imbue Studio's fault" note.
       //
       // An auth error gets a button as well. It is the one failure the user can actually
       // fix, and the fix is not obvious from the provider's wording -- which is usually a
       // raw 401 body. Inline rather than a modal, so it waits to be clicked instead of
       // throwing a sign-in screen over whatever the user was doing.
       children.push(
-        m("div", { class: "message-api-error rounded-md bg-danger/8 px-[0.75em] py-[0.5em] text-danger" }, [
-          m(MarkdownContent, {
-            content: textContent,
-            requestedAt: event.timestamp,
-            expansionKeyPrefix: event.event_id,
-          }),
-          event.is_provider_fault
-            ? m(
-                "div",
-                { class: "message-api-error-note mt-[0.4em] text-[0.85em] text-faint" },
-                providerFaultNote(event.api_error_kind),
-              )
-            : null,
-          event.is_auth_error ? renderReauthAction(chatId) : null,
-        ]),
+        onLineAsBox(
+          m("div", { class: "message-api-error rounded-md bg-danger/8 px-[0.75em] py-[0.5em] text-danger" }, [
+            m(MarkdownContent, {
+              content: textContent,
+              requestedAt: event.timestamp,
+              expansionKeyPrefix: event.event_id,
+            }),
+            event.is_provider_fault
+              ? m(
+                  "div",
+                  { class: "message-api-error-note mt-[0.4em] text-[0.85em] text-faint" },
+                  providerFaultNote(event.api_error_kind),
+                )
+              : null,
+            event.is_auth_error ? renderReauthAction(chatId) : null,
+          ]),
+          placement,
+        ),
       );
     } else {
-      children.push(
-        m(MarkdownContent, { content: textContent, requestedAt: event.timestamp, expansionKeyPrefix: event.event_id }),
-      );
+      const prose = renderAgentProse({
+        text: textContent,
+        timestamp: event.timestamp,
+        expansionKeyPrefix: event.event_id,
+        layout: isOnLine ? "bubble" : "plain",
+        isStretchHead: placement.isStretchHead && children.length === 0,
+      });
+      if (prose !== null) children.push(prose);
     }
   }
   for (const toolCall of toolCalls) {
-    // Render the rich card as soon as we have the Agent call's description (from the tool
-    // input), even before its subagent session is linked; the card shows a non-clickable
-    // "Running…" state until subagent_metadata.session_id arrives.
-    if (toolCall.tool_name === "Agent" && (toolCall.subagent_metadata || toolCall.description)) {
+    const result = toolResults.get(toolCall.tool_call_id) ?? null;
+    if (isSubagentCardCall(toolCall)) {
       // The Agent call's tool result arrives only when the sub-agent finishes, so its
       // absence is our signal that the sub-agent is still actively working.
       const subagentRunning = !toolResults.has(toolCall.tool_call_id);
-      children.push(renderSubagentCard(toolCall, chatId, subagentRunning));
+      flushChips();
+      children.push(renderSubagentCard(toolCall, chatId, subagentRunning, placement.layout));
       continue;
     }
-    const result = toolResults.get(toolCall.tool_call_id) ?? null;
     // A permission request renders as its own card (the request, a verdict or
-    // button, and the raw call) rather than a generic tool block.
+    // button, and the raw call) rather than a chip: it is something to ACT on,
+    // so it must not be one click away behind a chip.
     // Gated on the input-only predicate so the card shows even while the request
     // is still pending -- the same signal the timeline walk uses to lift it out
     // of its step. The resolution (once the user decides) comes from the walk,
@@ -584,38 +805,54 @@ export function renderAssistantMessageChildren(
     // one permission request resolves each of its cards independently.
     if (isFiledPermissionRequest(toolCall, result)) {
       const resolution = resolutionForCall(toolCall, result, resolutionsByRequestId);
+      flushChips();
       children.push(
-        m(PermissionCard, { toolCall, toolResult: result, resolution, chatId, assistantEventId: event.event_id }),
+        onLineAsBox(
+          m(PermissionCard, { toolCall, toolResult: result, resolution, chatId, assistantEventId: event.event_id }),
+          placement,
+        ),
       );
       continue;
     }
-    children.push(renderToolCallBlock(toolCall, result, chatId, event.event_id));
+    // A secret request renders as the secret card: the inputs the user answers on,
+    // then the verdict once the chat app's notice lands (or the page's own submit).
+    if (isFiledSecretRequest(toolCall, result)) {
+      const resolution = secretResolutionForCall(toolCall, result, resolutionsByRequestId);
+      const details = parseSecretRequest(toolCall, result);
+      const note = details ? (secretNotesByRequestId.get(details.requestId) ?? null) : null;
+      flushChips();
+      children.push(onLineAsBox(m(SecretCard, { toolCall, toolResult: result, resolution, note }), placement));
+      continue;
+    }
+    pendingChips.push({ kind: "tool", call: toolCall, eventId: event.event_id });
   }
-  return children;
 }
 
 /**
  * Render a permission-break timeline item: the issuing assistant message (its
  * prose plus the permission card), with the user's granted/denied verdict
- * threaded into the card. Used by the timeline renderers for the `permission`
- * item; goes direct (not via the memoized StableAssistantMessage) so the
- * resolution reaches the card.
+ * threaded into the card, as a part of a stretch. Used by the timeline renderers
+ * for the `permission` item; goes direct (not via the memoized
+ * StableAssistantMessage) so the resolution reaches the card.
  */
 export function renderPermissionItem(
   event: AssistantMessageEvent,
   toolResults: Map<string, ToolResultEvent>,
   chatId: string,
-  resolutionsByRequestId: ReadonlyMap<string, PermissionResolution>,
-  domId: string = event.event_id,
+  resolutionsByRequestId: ReadonlyMap<string, RequestResolution>,
+  secretNotesByRequestId: ReadonlyMap<string, string> = new Map(),
+  isStretchHead = false,
 ): m.Vnode {
-  // ``domId`` defaults to the event id but a top-level permission row passes its
-  // row key (``perm-<event_id>``) so the rendered root's ``id`` matches the key
-  // the virtualization measures by -- otherwise the measured height is cached
-  // under the bare event id and never read, leaving the row stuck at its estimate
-  // and shifting content each time it crosses the window edge.
   return m(
     "div",
-    { id: domId, class: "message message-assistant mb-5", key: event.event_id },
-    renderAssistantMessageChildren(event, toolResults, chatId, resolutionsByRequestId),
+    { id: event.event_id, class: `message message-assistant ${STRETCH_PIECES_CLASS}`, key: event.event_id },
+    renderAssistantMessageChildren(
+      event,
+      toolResults,
+      chatId,
+      resolutionsByRequestId,
+      secretNotesByRequestId,
+      stretchRun(isStretchHead),
+    ),
   );
 }

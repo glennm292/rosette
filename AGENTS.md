@@ -8,13 +8,15 @@ IF YOU FAIL TO FOLLOW ONE, YOU MUST EXPLICITLY CALL THAT OUT IN YOUR RESPONSE.
 
 - You are running in a tmux session inside a container or sandbox that was created via `mngr`
 - This is a monorepo.
-- Run commands by calling "uv run" from the root of the git checkout (ex: "uv run mngr create ...").
+- Run commands from the root of the git checkout. Run scripts and other one-offs with `uv run --no-sync` (ex: `uv run --no-sync mngr create ...`) unless the instruction you are following says `python3`, and never run a long-running process under `uv run`; see `.agents/shared/references/running-python.md`.
 - NEVER amend commits or rebase--always create new commits.
 - If you ever need to work with another *git* repo that is *outside* of this monorepo as a read-only dependency, you should do so by adding a git subtree under `system/vendor/`.
-- If you need to *actively develop* against an external repo (e.g. `mngr`), check out a standalone clone of it under `.external_worktrees/<repo-name>/`. This directory is gitignored so the external clones don't pollute the monorepo. The branch in the external clone should mirror the branch you're on in this monorepo. For mngr specifically -- including changes you tested by editing `system/vendor/mngr/` directly -- follow `.agents/skills/submit-upstream-changes/references/mngr-changes.md`, which submits them as their own mngr PR.
+- If you need to *actively develop* against an external repo, check out a standalone clone of it under `.external_worktrees/<repo-name>/`. This directory is gitignored so the external clones don't pollute the monorepo. The branch in the external clone should mirror the branch you're on in this monorepo. mngr is not one of them: it is installed here as packages from the commit `pyproject.toml` pins (`[tool.uv.sources]`; the public mirror for every release, or the private mngr-internal repo while a branch iterates on a paired change), so a change to it is described and submitted per `.agents/skills/submit-upstream-changes/references/mngr-changes.md` rather than developed from this workspace.
 - This project uses a CLI ticket system (`tk`) for task management. Run `tk help` when you need to use it. Tickets live under `data/.tickets/` (the path is set via the `TICKETS_DIR` env var so tickets sit with the rest of the workspace's data).
 - All relative paths in this repo assume cwd = repo root (`/home/user/workspace`). Supervisord runs the services from there; any process started elsewhere (manual launch, subprocess from a different cwd) must either set cwd to the repo root or use absolute paths. User-facing workspace data lives under `data/` (visible folders are the user's to organize; e.g. `data/.apps/<name>/` holds an app's stored data, including its instance records at `data/.apps/<name>/instances.json`, and `data/.skills/<name>/` a skill's own state); flow-internal scratch lives under `data/.tasks/<flow>/` and machine state (what a program keeps about this machine and can rebuild: the registry, dispatch scripts, pty records, the shell's client layouts) under `data/.state/`. The rule is `docs/system/blueprint/workspace-app-model/contracts.md` section 17.
-- When adding a new app, use the `build-app` skill, which sets up a new package under `system/apps/` + a supervisord program entry + `forward_port.py` registration on its own port. Do NOT edit `system/apps/system_interface/` for this -- that's the top-level workspace UI, not a template for new apps.
+- When adding a new app, use the `build-app` skill, which sets up a new package under `system/apps/` + a supervisord program entry + `forward_port.py` registration on its own port. Every app icon -- a new one or an edit to an existing one -- is built to `docs/system/app-icons.md`: a 216x216 two-layer tile, one fill-only glyph in a centred 144x144 box, coloured from the pair palette that doc carries. Do NOT edit `system/apps/system_interface/` for this -- that's the top-level workspace UI, not a template for new apps.
+- A user can right-click anything on their screen and attach a description of it to a message as a `REF-<id>.json` file ("Explain what I attached in REF-..."). `.agents/shared/references/element-references.md` says what the file holds and how to find the element it names.
+- **`uv run --no-sync workspace-layout open` puts a window on the user's screen the moment it returns.** It is not setup -- it is the act of showing them something, and it applies to the live workspace they are looking at right now. So open a window only when you are ready for the user to see what's in it; do everything you want to check privately *before* that call, not after; and never tell the user to open a window you opened yourself. The same goes for every other mutating `workspace-layout` op (`close`, `focus`, `place`, `refresh`, ...) -- they all change the user's view live. See the `manage-desktop` skill.
 
 # Continuing a chat that moved to you
 
@@ -37,9 +39,9 @@ The first thing you do on any prompt that warrants real work is decompose it int
 
 1. (Optional) one short prose acknowledgement, e.g. "Sure, looking into that now." Keep it to one line; don't narrate the plan here.
 2. `tk create --step "<user facing title>"` for every step you currently expect, in order. You may batch them into one tool call, but each step must be its **own separate `tk create` command** (on its own line or joined with `;`) — each `tk create` makes exactly one step, so never pass multiple `--step`s to a single `tk create` (tk rejects that). **Never redirect the output of a `tk create`/`start`/`close`** (`>`, `>>`, `2>`, `&>`, `| tee`, …): the progress view reads each step from the command's visible output (`Created <id>: <title>`), so a redirect makes the step drop out of the plan. Note the ids. Do NOT `tk start` any yet.
-3. `tk start <id>` the first step, do its work, then `tk close <id> "user facing summary"`. Move to the next. Only one step is `in_progress` at a time.
+3. `tk start <id>` the first step **in the same assistant message as the step's first real command** (two tool calls, one message: the `tk start` first, the work second), do its work, then move to the next step with **one tool call** that closes the finished step and starts the next: `tk close <id> "user facing summary"; tk start <next-id>` — again in the same message as the next step's first command. Only one step is `in_progress` at a time. The last step's `tk close` stands alone, before your wrap-up reply.
 
-**`tk start` and `tk close` must each be the only command in their tool call** — no `cd` prefix, no chaining (`&&`, `;`, `|`, `&`, newline), no redirection; otherwise the progress view can't place the step. (You can still batch several `tk create` commands into one tool call — as separate commands, one `--step` each, with no redirection.)
+**A `tk start` or `tk close` shares its tool call only with other `tk` commands** (`tk create`, `tk start`, `tk close`, joined by `;`, `&&` or a newline) — no `cd` prefix, no real work in the same command (`tk start <id> && pytest` hides the work from the progress view along with the tk call), no `|`, `||` or `&`, no redirection; otherwise the progress view can't place the step. Capturing a new step's id to start it in the same call (`S1=$(tk create --step "..."); tk start "$S1"`) is blocked too: the assignment swallows the `Created <id>` line the view reads, so note the ids from the create output and start the step in a later call. Real work goes in its own tool call, in the same message when you can. A step boundary should cost you one tool call, not two, and the start of a step none at all.
 
 Add steps mid-turn (`tk create --step`) as sub-problems surface; drop ones that turn out unneeded (`tk close <id> "No longer needed — covered by the previous step."`). Granularity follows the user's mental model of the work — "first X, then Y, then Z" is three steps — not one-per-tool-call and not one-for-the-whole-turn. Typically 2–5 per substantive turn.
 
@@ -56,6 +58,7 @@ Skip records for: chitchat, single-line acknowledgements, and trivial answers; p
 - **Never name the machinery to the user — describe the work instead.** The `tk` calls and the words for them are invisible plumbing: the user sees only the progress timeline and your prose, so a sentence like "Let me close this step" refers to something they cannot see and reads as a non-sequitur. This is the single most common leak, so treat it as a hard rule. When talking to the user, NEVER use these words in their `tk` sense: **step, ticket, `tk`, close/closing, open/reopen, start/starting, mark, check off, in progress, record, todo, task list, progress view**. There is nothing to announce before or after a `tk` call — just make the call silently and let the timeline update itself. The same hard rule covers git (see "Git" below): **commit, branch, push, merge, PR, rebase, checkout, diff, repo** are plumbing words too.
   - Instead, speak only about the actual work, using natural transitions. These are good: "Moving on to the API wiring." / "Finishing up with the tests." / "Next I'll check the config." / "That's the migration done — now the cleanup." Say nothing at all if there's no substantive work to describe.
   - Concrete rewrites: "Let me close this step" / "Closing this out" / "Marking this done" → just say what you finished, e.g. "The parser changes are in." (or say nothing). "Starting the next step" → "Now I'll wire up the endpoint." "Let me add a step for that" → "I'll also need to update the schema." If a sentence's subject is the record rather than the work, delete or rewrite it.
+- **Hook feedback is plumbing**, so act on it but don't mention it to the user.
 - Steps may stay open across turns. At the start of each new user message you'll get a system reminder listing your still-open steps; for each, decide before doing anything else whether to keep working on it (`tk start` if needed), replace it (close with a status summary, then create new steps for the new direction), or close it honestly if you're moving on. Don't silently abandon one.
 - There is no "failed" status — every record terminates as `closed`. If a step didn't pan out, still close it; the summary describes the work you did, and your final message reports the result honestly.
 
@@ -67,33 +70,12 @@ When you delegate via the `launch-task` skill, the whole delegation is **one ste
 
 Run `tk help` if you forget a command. Avoid `deps`, `links`, `types`, and `priorities` — they're backlog features the chat progress view doesn't use.
 
-# How to get started on any task:
-
-Always begin your session by reading the relevant READMEs and any other related documentation in the docs/ directory of the project(s) you are working on.
-These represent *user-facing* documentation and are the most important to understand.
-
-Once you've read these once during a session, there's no need to re-read them unless explicitly instructed to do so.
-
-If you will be writing code, be sure to read the base style_guide.md, as well as any specific style_guide.md for the project.
-Then read all README.md files in the relevant project directories, as well as all `.py` files at the root of the project you are working on (ex: `primitives.py`, etc.).
-Also read everything in data_types, interfaces, and utils to ensure you understand the core abstractions.
-
-Then take a look at the other code directories, and based on the task, determine which files are most relevant to read in depth.
-Be sure to read the full contents from those files.
-
-Do NOT read files that end with "_test.py" during this first pass as they contain unit tests (unless you are explicitly instructed to read the unit tests).
-
-Do NOT read files that start with "test_" either, as they contain integration, acceptance, and release tests (again, unless you are explicitly instructed to read the existing tests).
-
-Only after doing all of the above should you begin writing code.
-
 # Important commands and conventions:
 
-- Never run `uv sync`, always run `uv sync --all-packages` instead
-- Browser automation splits two ways, and picking the wrong one is the common mistake:
-  - **Something the user should SEE, or that needs their real logins or their help** (a CAPTCHA, a 2FA code, "log into my account and..."): use the **browser fleet**. `uv run agentic-browser-fleet new` starts a browser streamed to a pane the user can watch and take over, and prints a `playwright-cli attach --cdp=...` line; drive it with `playwright-cli` (`playwright-cli --help` is the command reference). See the `agentic-browser-fleet` skill. This is the collaborative path -- ownership is arbitrated, and the human always wins.
-  - **Headless scripting with no human in the loop** (testing an app you just built, scraping a page into a file, a one-off check): use **Playwright's Python API** in the root venv (`from playwright.sync_api import sync_playwright`, run via `uv run python`). No pane, no fleet, no ownership -- just a browser you drive from a script.
-- Both use the same engine: Fortress (a stealth-patched Chromium fork), not Playwright's own managed Chromium. For the Python API, pass `executable_path="/opt/fortress/tilion-fortress/tilion"` explicitly to `chromium.launch(...)`, since Playwright's browser-cache lookup only auto-discovers builds it downloaded itself. (The fleet does this for you.) Fortress installs asynchronously on first container boot (the one-shot `env-converge` program's env.d units), so in a fresh workspace confirm it finished -- `supervisorctl status env-converge` or `test -x /opt/fortress/tilion-fortress/tilion` -- before launching, or the launch fails with a clear error. It runs as-is under the docker provider's gVisor runtime; if you hit a "No usable sandbox!" error on a runtime without unprivileged user namespaces, pass `args=["--no-sandbox"]`. See `system/libs/bootstrap/README.md` for the full deferral contract.
+- At the repo root, never run a bare `uv sync`; always run `uv sync --all-packages` instead. A user-built app, service or lib under `system/` is its own uv project (not in the root `members`): change its dependencies with `uv add`, or `uv lock` and then `uv sync`, inside its own directory, which touches only its lock and venv (`.agents/shared/references/running-python.md`).
+- **Wait on events, not on timers.** Never estimate how long something will take and `sleep` that long: when you are waiting on a command (tests, a build, a script), run that command in the background with `python3 system/scripts/workspace_bare_scripts/run_in_background.py --description "<what>" -- <command>` (or your harness's own background option, if it wakes you when the command finishes) and end your turn; its finishing wakes you, so never poll its output. When you are waiting on some other state (a service coming back, a file appearing), check that state itself with short sleeps, e.g. `until curl -sf <url>; do sleep 1; done`, and background that loop too if it may run long. A timed sleep is right only when the wait really is about time -- the user asked you to check back in N minutes, a service said to retry after N seconds, pacing calls to a rate-limited API -- and even then it goes inside a background command, not in your own foreground. A foreground `sleep` of 5 seconds or more is blocked.
+- To test an app you built in this workspace, or to script a check of a public page that needs no account, use **Playwright's Python API** in the root venv (`from playwright.sync_api import sync_playwright`, run via `uv run --no-sync python`). Anything else in a browser -- the user's logins, something the user should watch or help with, "log into my account and..." -- goes through the `connect-external-service` skill (see Communication below).
+- Playwright here drives Fortress (a stealth-patched Chromium fork), not Playwright's own managed Chromium: pass `executable_path="/opt/fortress/tilion-fortress/tilion"` explicitly to `chromium.launch(...)`, since Playwright's browser-cache lookup only auto-discovers builds it downloaded itself. Fortress installs asynchronously on first container boot (the one-shot `env-converge` program's `system/scripts/env.d/2000-screen.sh` unit, which also installs the Screen's stack and points that stable path at the pinned release), so in a fresh workspace confirm it finished -- `supervisorctl status env-converge` or `test -x /opt/fortress/tilion-fortress/tilion` -- before launching, or the launch fails with a clear error. It runs as-is under the docker provider's gVisor runtime; if you hit a "No usable sandbox!" error on a runtime without unprivileged user namespaces, pass `args=["--no-sandbox"]`. Fortress also replays a recorded human cursor trajectory for every pointer move it is sent: a `click()` on a target away from the pointer's last position takes up to about a second, and the cursor glides across whatever lies between the two points after the press, so drive hover-sensitive controls such as menus with the keyboard (`locator.press("Space")`) when that glide would change what is under test, and `hover()` the target before a `click()` on a control that follows the press itself from pointerdown to pointerup (a drawer that a leftward drag dismisses): a glide landing between the two reads as a drag, while the hover plays it out before returning, so the click that follows moves nothing. See `system/libs/bootstrap/README.md` for the full deferral contract.
 
 # Always remember these guidelines:
 
@@ -109,88 +91,46 @@ Only after doing all of the above should you begin writing code.
 - **Naming is informative, not cheeky.** Service names, app names, skill names, command names: prefer something that explains what the thing does (`slack-inbox-checker`) over something clever (`nothing-new`). Cute names tax every later mention.
 - **Platform-internal APIs are valid.** Don't restrict yourself to officially documented public APIs. If a platform's own client (web app, mobile app) uses internal or undocumented endpoints to do something, those endpoints are fair game -- inspect what the official client actually calls and use the same endpoints with the same user-session auth. This is often cleaner than designing brute-force workarounds on top of a limited public API.
 
-# When coding, follow these guidelines:
-
-- Only make the changes that are necessary for the current task.
-- Before implementing something, check if there is something in the codebase or look for a library
-- Reuse code and use external dependencies heavily. Before implementing something, make sure that it doesn't already exist in the codebase, and consider if there's a library that can be imported instead of implementing it yourself. We want to be able to maintain the minimum amount of code that gets the job done, even if that means introducing dependencies. If you don't know of a library but think one might be plausible, search the web. (I'm even open to using random GitHub projects, but run anything that's not a well-established library by me first so I can check if it's likely to be reliable.)
-- Code quality is extremely important. Do not compromise on quality to deliver a result--if you don't know a good way to do something, ask.
-- Follow the style guide!
-- Use the power of the type system to constrain your code and provide some assurance of correctness. If some required property can't be guaranteed by the type system, it should be runtime checked (i.e. explode if it fails).
-- Avoid using the `TYPE_CHECKING` guard. Do not add it to files that do not already contain it, and never put imports inside of it yourself--you MUST ask for explicit permission to do this (it's generally a sign of bad architecture that should be fixed some other way).
-- Do NOT write code in `__init__.py`--leave them completely blank (the only exception is for a line like "hookimpl = pluggy.HookimplMarker("mngr")", which should go at the very root __init__.py of a library).
-- Do NOT make constructs like module-level usage of `__all__`
-- Before finishing your response, if you have made any changes, then you must ensure that you have run ALL tests in the project(s) you modified, and that they all pass. DO NOT just run a subset of the tests! However, while iterating (e.g. fixing a failing test, developing a feature), run only the relevant tests for rapid feedback -- save the full suite for the final check.
-- To run tests for a single project: "cd system/vendor/mngr && uv run pytest", "cd system/apps/system_interface && uv run pytest", or "cd system/apps/chat && uv run pytest". Each project has its own pytest and coverage configuration in its pyproject.toml.
-- While you're iterating, you can pass "--no-cov --cov-fail-under=0" to disable coverge (slightly faster), but during your final check, you *MUST NOT* pass those flags (it will fail in CI anyway)
-- For faster iteration, add "-m 'not tmux and not modal and not docker and not docker_sdk and not acceptance and not release'" to skip slow infrastructure tests (~30s instead of ~95s). These still run in CI. Note that you *MUST* also pass "--no-cov --cov-fail-under=0" when doing this, otherwise it will complain about a lack of coverage.
-- Note that "uv run pytest" defaults to running all "unit" and "integration" tests, but the "acceptance" tests also run in CI when a PR exists. Do *not* run *all* the acceptance tests locally to validate changes--let CI run them once a PR is opened (it's faster than running them locally).
-- If you need to run a specific acceptance or release test to write or fix it, iterate on that specific test locally by calling "just test <full_path>::<test_name>" from the root of the git checkout. Do this rather than re-running all tests in CI.
-- Tasks are not allowed to finish without all tests passing (in CI, if a PR exists).
-- Do NOT create a PR yourself--if a PR is needed, the user will create it. Do not mention PRs to the user unless they bring them up.
-- Run the tests, and keep the exact command and the pass/fail counts to yourself (they belong in your reasoning, or in a regular ticket if something is left failing). The user hears "checked it works", or what still fails and what that means for them. Give the command and counts only if the user asks or is already speaking technically.
-- If tests fail because of a lack of coverage, you should add tests for the new code that you wrote.
-- When adding tests, consider whether it should be a unit test (in a _test.py file) or an integration/acceptance/release test (in a test_*.py file, and marked with @pytest.mark.acceptance or @pytest.mark.release, no marks needed for integration).  See the style_guide.md for exact details on the types of tests. In general, most slow tests of all functionality should be release tests, and only important / core functionality should be acceptance tests.
-- Do NOT create tests for test utilities (e.g. never create `testing_test.py`). Code in `testing.py` and `conftest.py` is exercised by the tests that use it and does not need its own test file.
-- Do NOT create tests that code raises NotImplementedError.
-- If you see a flaky test, you must not let it pass silently: fix it as soon as possible (finish your task, commit, then fix the flaky test in a separate commit), and tell the user in their terms only if it affects them ("one of the checks fails at random; I'm making it reliable").
-- Do not add TODO or FIXME unless explicitly asked to do so
-- Code must work on both macOS and Linux. It's ok if it doesn't work on Windows.
-- To reiterate: code correctness and quality is the most important concern when writing code.
-
-# Ratchets
-
-Each project has a `test_ratchets.py` file containing automated code quality checks ("ratchets"). 
-Each ratchet tracks a count of violations for a specific anti-pattern (e.g. raising built-in exceptions, using monkeypatch.setattr). 
-The count can only stay the same or decrease -- increasing it fails the test.
-
-Ratchets are guidance and reminders about good code, not rules to be blindly obeyed. When a ratchet fires on your code:
-
-1. Understand *why* the ratchet exists by reading its `rule_description`. It explains the principle behind the check.
-2. Fix the code in the spirit of the ratchet. For example, if `PREVENT_MONKEYPATCH_SETATTR` fires, a valid fix could be to use dependency injection -- not to manually save/restore the attribute with `try/finally`, which evades the regex while violating the same principle.
-3. Never evade a ratchet. Restructuring code to dodge the regex pattern while still doing the same bad thing is worse than the original violation, because it hides the problem. Common evasion patterns include splitting a statement across lines, assigning to a temporary variable before the flagged operation, or using a synonym that the regex doesn't catch.
-4. If you cannot find a fix that honors the spirit of the ratchet, **flag this to the user** rather than silently working around it. Do not use type-system escape hatches (e.g. assigning through `Any`, intermediate variables, or synonyms) to bypass a ratchet -- these are evasions even if they dodge the regex.
-5. If the ratchet is a **true misfire** -- the regex pattern matched something that is genuinely not the anti-pattern it was designed to catch (e.g. a variable name that happens to contain a flagged substring, or a string literal / comment that matches the pattern) -- then first try to update the ratchet's regex to be more specific so it no longer misfires (be extra careful not to exclude any real violations in the process). If that's not feasible, bump the ratchet count and explain the misfire to the user. This is distinct from a case where there *is* a real violation but you believe it's "justified"; justified violations are still violations and should be handled per steps 1-4 above.
-
-## Test fixture discovery
-
-Before writing new tests, read the relevant `conftest.py` and `testing.py` files to avoid reimplementing things that already exist. 
-Test infrastructure lives in these files:
-
-| File pattern | Purpose |
-|---|---|
-| `conftest.py` | Pytest fixtures and hooks, scoped to the directory they're in (auto-discovered by pytest) |
-| `testing.py` | Non-fixture test utilities: factory functions, helpers, context managers (explicitly imported) |
-| `mock_*_test.py` | Concrete mock implementations of interfaces (explicitly imported) |
-
-All fixtures must be in conftest.py, not in individual test files.
-
 # Manual verification and testing
 
 Before declaring any feature complete, manually verify it: exercise the feature exactly as a real user would, with real inputs, and critically evaluate whether it *actually does the right thing*. 
 Do not confuse "no errors" with "correct behavior" -- a command that exits 0 but produces wrong output is not working.
 
-Then crystallize the verified behavior into formal tests. 
-Assert on things that are true if and only if the feature worked correctly -- this ensures tests are both reliable and meaningful.
+In a chat turn, verifying an app is **one tool call**: `uv run --no-sync system/scripts/workspace_scripts/verify_app.py <name> --restart --marker "<text>" --screenshot /tmp/<name>.png --open` (`--refresh` in place of `--open`, and no `--screenshot`, for an app already on screen) restarts the program without waiting out its start window, waits for the port itself, checks the marker, renders the page, and puts it in front of the user; a changed API route gets one `curl` in the same call. Do not `supervisorctl restart` an app by hand: that waits out the program's 30 s `startsecs` although the app answers within a second. New test files belong to the harden pass unless the user asked for them (a change to hardened code still carries its tests, as "A change to hardened code carries its tests" below says), and the test gate runs in the background as described below.
 
-## Verifying interactive components with tmux
+Formal tests are the background harden pass's job (the `crystallize-creation` and `update-creation` skills run it in a worker): it crystallizes the verified behavior into tests that assert on things that are true if and only if the feature worked correctly -- this ensures tests are both reliable and meaningful.
 
-For interactive components (TUIs, interactive prompts, etc.), use `tmux send-keys` and `tmux capture-pane` to manually verify them. 
-This is a special case: do NOT crystallize these into pytest tests. 
-They are inherently flaky due to timing and useless in CI, but valuable for agents to verify that interactive behavior looks right during development.
+`uv run --no-sync app-manifest select-tests --diff-base <the commit before the change>`, run from the repo root once the change is committed (it reads commits, and refuses to run while an edit is uncommitted), prints the test gate the change calls for, in order. A worker runs its gate as its own guide says. A chat runs it too, even for a change it will hand to a harden worker later, but always through `system/scripts/workspace_bare_scripts/run_in_background.py`, never in the foreground. That run checks the change against the tests it already has; it is not the harden worker's thorough pass, whose new tests and review gates stay the worker's. In the foreground, verify the change as a user would (an app or service through `update-app`'s live loop). The chat app's and the shell's suites (`system/apps/chat`, `system/apps/system_interface`, each run from its own directory) skip their `browser` tests by default, and the chat app also its `real_claude` tests (the ones that run the real claude binary). Pass `-m ''` to run everything, or `-m browser` for only the browser tests. Both suites fail any run under their coverage floor, so a run of only some of their tests (`-m browser`, or named files) needs `--no-cov`. Naming a browser test file without `-m ''` or `-m browser` deselects it, so nothing runs and the run fails on the coverage floor. Mark every test by what it is: `browser` for one that drives a browser, `frontend` for one that reads an app's frontend source, `real_claude` for one that runs the real claude binary; when only the chat app's or the shell's frontend changed, the test gate runs just its `browser` and `frontend` tests.
 
 # Communication
 
+The user may be reaching this workspace from the Imbue Studio desktop app, or through a sharing URL in a browser on a computer, phone, or tablet: once sharing is on, the whole workspace and each of its apps has one. The `use-from-phone` skill walks the user through setting that up.
+
 If the user talks to you about files or directories on disk, assume (unless context indicates otherwise) they mean their local disk, not the one in your sandbox -- use the `file-sharing` skill to bridge the two.
 
-If the user asks you to read or act on something in a third-party tool they have an account with -- including a link they paste, such as a Notion page, Google Doc, or Slack thread -- run `latchkey services list --viable` before anything else, and use the `latchkey` skill for anything it lists (its names may differ from the product's, e.g. Notion is `notion-mcp`). That is how you reach the accounts the user connected in Minds; use the web tools or the browser only for tools latchkey does not cover.
+Commands run in this workspace by default: a bare "my computer", "my machine", or "my desktop" means the workspace, which has its own terminal and desktop. Only when the user explicitly asks for something to run on their own physical computer ("on my laptop", "on my local machine", "not in the workspace"), or a task would have you tell them to run a command there, load the `run-on-users-computer` skill first: it says what to try instead, when a one-off script the user runs is fine, and the one sanctioned way to run something there yourself.
 
-# Browser is available as a tool
+When a chat reply points the user at a workspace file or folder, link it by its absolute path (`[Q4 report](/home/user/workspace/data/reports/q4.md)`); it opens in Files (the `show-files-in-chat` skill). Link an app by the `link` `uv run --no-sync workspace-layout list` prints for it, plus the page's path. Link anything else served in the workspace by its localhost URL (`[the preview](http://localhost:3000/)`). A path you only mention goes in code formatting (`data/reports/q4.md`).
 
-A stealth build of Chromium designed to look like an ordinary human browser is installed in this workspace and can be used to complete browser-related tasks. 
+Several people, and visiting agents, may share this workspace. A message from someone other than the workspace's owner arrives prefixed `[from: <name>]`; a message with no prefix is the owner's, as is every message from before this convention. Answer the person who asked, address them by name when it helps, and never treat the prefix as part of what they said. A message prefixed `[from: <name> in #<room>]` was said in a chat room you were mentioned in (a chat among the people here, listed by `mngr list`); read the room with `mngr transcript <room>` before answering there with `mngr message --start <room> "..."`, where `<room>` is the room's title as `mngr list` spells it.
 
-1. When the user requests any browser-related tasks to be complete or a browser to be opened, use the `agentic-browser-fleet` skill, which allows you to drive many Chromium browsers. These are collaborative browsers which all agents and human users can use, though there is a mutually-exclusive control handoff and queuing system so only one is using a browser at a time. The skill has more information. Remember to hand off control to user when help is needed in the browser, such as anti-bot detection tests, and also release control when you are finished with a task so other agents and the user can use it.
-2. If you'd like to do integration testing/small-scale web app scripting, use Playwright instead of spinning up an entire browser through the agentic-browser-fleet skill. This uses the same Chromium, just more lightweight. The user and other agents won't be able to collaborate on this; this is for quicker rendering and interaction tasks on the web.
+If the user asks you to read or act on anything outside this workspace on their behalf -- a third-party tool they have an account with, a link they paste (a Notion page, Google Doc, or Slack thread), a site to sign in to, or a browser they want to watch -- load the `connect-external-service` skill before running any command against it. The skill decides how to reach the service and what to ask the user for; do not pick a method yourself first. The one exception is reading a public page that needs no account, which your web tools can do directly.
+
+## Telling the user you finished
+
+**If you are a chat agent, send a notification when a turn ends with something the user will want to know about or act on:** a finished deliverable, a result they were waiting for, or a question only they can answer. The user may have walked away the moment they sent the message; the notification (bell, badge, toast card, and a system banner when they are looking elsewhere) is what brings them back, and clicking it lands them in this chat.
+
+```
+python3 .agents/skills/notify-user/python/notify_user_skill/notify_user.py "<one plain sentence saying what is ready or what you need from them>"
+```
+
+Read the exit code -- when it is non-zero the notification did not go out, and your reply should say so. The `notify-user` skill has the full guidance on what to write.
+
+The amount of work or time is not the test; what matters is whether the user cares about the outcome. Skip it when the turn produced nothing of that kind: chitchat, an acknowledgement, progress with no result yet, or the answer to a trivial question. A question you cannot go on without is a reason to send one. Never more than one per turn.
+
+Nothing reminds you of this at the end of a turn; decide it yourself as you finish, and do not narrate the decision -- the user never asked, so a sentence about it is a non-sequitur, the same way naming your `tk` calls is.
+
+**This is for chats only.** If you were launched by another agent -- a `launch-task` worker, or any other sub-agent -- never send one: your result reaches the user through the chat that launched you, and only chats appear in the app's feed.
 
 # Work delegation
 
@@ -207,7 +147,7 @@ Use your judgment on when to do work directly vs delegating. Delegation is usefu
 Chats from agents that have run on this host -- current or past, including ones
 that were destroyed -- are stored locally on this host and are recoverable, so
 never tell the user you can't access an earlier or deleted conversation without
-checking first. Use the `find-past-transcripts` skill to find and read them.
+checking first. Use the `find-transcripts` skill to find and read them.
 
 # Self-modification
 
@@ -220,18 +160,27 @@ You can (and should) modify your own configuration to improve yourself:
 
 Commit your changes to git after making modifications, silently (see "Git" below).
 
-Users make "creations": apps (opened as tabs), skills (a skill run automatically on a schedule is an "automation" -- run via the machinery in `system/libs/automations/`, see the manage-scheduled-tasks skill), data (documents, images, notes), and customizations of any of them. Templates are a publishable, reusable, bootable snapshot of the creations a mind has built (one repo can accumulate several); another mind can adapt one into itself.
+Users make "creations": apps (opened as windows), skills (a skill run automatically on a schedule is an "automation": a routine with a `skill`, run by `system/libs/routines/`, see the manage-routines skill), data (documents, images, notes), and customizations of any of them. Templates are a publishable, reusable, bootable snapshot of the creations an agent has built (one repo can accumulate several); another agent can adapt one into itself.
 
 # Updates
 
 Use the `update-self` skill to pull improvements from the upstream template repo, and the `submit-upstream-changes` skill to push shared changes (skills, scripts, config) back upstream.
 The upstream is defined in `system/config/parent.toml`.
 
+**Finding a defect in built-in code is itself a reason to escalate it upstream -- the user does not have to ask.** Built-in means mngr (installed from the commit `pyproject.toml` pins), vendored (`system/vendor/`), from the initial template commit, or arrived via an `update-self:` merge; the `/assist` skill's "Classify the cause" section has the exact test. The code that needs changing is upstream's, so a local ticket cannot reach it: every workspace that hits the same bug would rediscover it and bury it again. Two channels, by what you have:
+
+- A diagnosis, no fix: report it, using the POST in `.agents/shared/references/report-built-in-issues.md`. It pops a modal for the user to review and send, so the human still gates it. One report per pass, covering everything you found -- not one per issue.
+- A fix you can stand behind: `submit-upstream-changes`, which opens a PR against the parent template repo. Not for mngr: a fix there is its own PR on the mngr repo, not a template one, so an mngr defect goes in a report.
+
+Fixing it locally is *not* an alternative: a fix to a file that is byte-identical to the release only manufactures divergence the next update has to reconcile. "Recorded in `tk`" is not a valid end state for a built-in defect -- either escalate it, or tell the user plainly that you found one and are not escalating it, and why.
+
 # Using crystallized skills
 
-- **A bare slash-command message invokes the skill of that name.** A user message that is exactly `/name` (possibly with arguments), such as `/welcome` or `/assist`, means: read `.agents/skills/<name>/SKILL.md` and follow it as the user's instruction. Do it silently -- read the file without commentary and reply with what the skill says to reply, nothing else. Never narrate the mechanism ("I'm using the welcome flow...", "let me look up that skill"): the user typed a command, not a question about how commands work. (Some harnesses expand these commands into the skill's instructions before you see them; if you are reading the raw `/name` text, the expansion is yours to do.)
+- **A bare slash-command message invokes the skill of that name.** A user message that is exactly `/name` (possibly with arguments), such as `/assist`, means: read `.agents/skills/<name>/SKILL.md` and follow it as the user's instruction. Do it silently -- read the file without commentary and reply with what the skill says to reply, nothing else. Never narrate the mechanism ("I'm using the assist flow...", "let me look up that skill"): the user typed a command, not a question about how commands work. (Some harnesses expand these commands into the skill's instructions before you see them; if you are reading the raw `/name` text, the expansion is yours to do.)
 
 - **Prefer an applicable skill over reinventing.** Skill descriptions are auto-injected into your context, so match by purpose, not by name.
+
+- **Follow a skill without naming it.** Describe the work, not the skill, even when your harness tells you to announce which skills you use. Repeat a skill's name only after the user has used it (`.agents/shared/references/user-facing-language.md`, "Skills in particular").
 
 - **Run the creation, don't redo its job.** When a creation already does what's being asked -- an app that ingests this kind of data, a skill that runs this process -- run it, or extend it and run it. Producing the same result by hand beside it leaves the creation untested against the real case and the user with two sources of truth.
 
@@ -249,14 +198,14 @@ The upstream is defined in `system/config/parent.toml`.
 
 # Apps and services
 
-**Before editing any code that belongs to a supervisord program -- an app (a tab the user can open) or a background service -- load the `update-app` skill first.** It owns the live change loop (apply, refresh, verify) and the turn-end hardening flow; do not hand-edit an app's or service's code or its `system/supervisord.conf.d/<name>.conf` without it.
+**Before editing any code that belongs to a supervisord program -- an app (a window the user can open) or a background service -- load the `update-app` skill first.** It owns the live change loop (apply, refresh, verify) and the turn-end hardening flow; do not hand-edit an app's or service's code or its `system/supervisord.conf.d/<name>.conf` without it. It reads the app's `app.toml` first: a critical app (the shell, the chat, the terminal, or any app that declares `critical = true`) and the shared `system/libs/workspace_ui/`, `system/libs/workspace_layout/`, and `system/libs/workspace_themes/` libraries take its careful flow, which never edits the served tree.
 
 Apps and background services both run as supervisord programs, each declared in its own `system/supervisord.conf.d/<name>.conf` (pulled in by an `[include]` glob in `system/supervisord.conf`, which holds only the daemon's own config).
 Supervisord (launched by `bootstrap` after first-boot setup) supervises them; each program writes its own rotated logs under `/var/log/supervisor/<name>-stdout.log` and `/var/log/supervisor/<name>-stderr.log`.
-To add, change, or remove a service, add/edit/delete its own `system/supervisord.conf.d/<name>.conf` and run `supervisorctl reread && supervisorctl update` (and `supervisorctl restart <name>` to bounce one). Inspect with `supervisorctl status` / `supervisorctl tail -f <name> stderr`.
+To add, change, or remove a service, add/edit/delete its own `system/supervisord.conf.d/<name>.conf` and run `supervisorctl reread && supervisorctl update`. To bounce an app after a code change use `uv run --no-sync system/scripts/workspace_scripts/verify_app.py <name> --restart ...`, never `supervisorctl restart <name>`: a scaffolded app's program block carries `startsecs=30`, so `supervisorctl restart` blocks for 30 s although the app answers within a second; the script asks supervisord to start without waiting and reads readiness from the port. Inspect with `supervisorctl status` / `supervisorctl tail -f <name> stderr`.
 See the `update-app` skill for details.
 
-For routine jobs that run on a cadence and then exit (backups, health checks, the weekly Caretaker -- off by default, see the enable-caretaker skill), use cron via the **`manage-scheduled-tasks`** skill rather than a supervisord program; and after building or editing any service, use the `check-app-errors` skill to scan `/var/log/supervisor/` for errors (a clean exit code does not mean the service is healthy).
+Anything that runs on a schedule and then exits (a sync, a health check, a skill run every morning, the weekly Caretaker -- off by default) is a **routine**, made with the **`manage-routines`** skill, never a supervisord program or a cron line; the Routines app is where the user sees them. After building or editing any service, use the `check-app-errors` skill to scan `/var/log/supervisor/` for errors (a clean exit code does not mean the service is healthy).
 
 # Git
 
@@ -272,13 +221,13 @@ GitHub sync is opt-in via the `github-sync` skill. When the user has enabled it:
 
 When GitHub sync is not enabled, there is no auto-push and no GitHub remote to push to; commits stay local (the restic `host-backup` still protects the whole host dir).
 
-- Don't include auto-generated lockfile churn (`uv.lock`, `package-lock.json`, etc.) in commits unless the change intentionally bumps a dependency.
+- Don't include auto-generated lockfile churn (`uv.lock`, `package-lock.json`, etc.) in commits unless the change intentionally bumps a dependency. A `uv.lock` change that follows from a `pyproject.toml` change -- a dependency, or a new skill `python/` project -- is not churn: commit it.
 
 # Silly error workarounds
 
 If you get a failure in `test_no_type_errors` that seems spurious, try running `uv sync --all-packages` and then re-running the tests. If that doesn't work, the error is probably real, and should be fixed.
 
-If you get a "ModuleNotFoundError" error for a 3rd-party dependency when running a command that is defined in this repo (like `mngr`), which refresh fixes it depends on *which* install you ran, because a standard workspace has two: `uv run mngr ...` resolves from the root venv, and a bare `mngr` on PATH is the uv-managed tool that `system/scripts/build_workspace.sh` installs at build time. For the venv one, run `uv sync --all-packages`. For the tool one, run `python3 system/scripts/install_mngr.py` -- the same program the build runs, which reinstalls it with the plugins `system/config/mngr_plugins.toml` assigns it, into the pinned tool directory the build installs into and puts first on `PATH`. If `mngr` on your PATH turns out to come from somewhere else instead (a workspace created before that pin has a second copy under `/home/user/.local`), follow it with `python3 system/scripts/tool_env.py drop-shadowing-mngr`, which is what the build runs next and what leaves the refreshed install the one a login shell reaches. Do not hand-roll the `uv tool install`: the ways that goes wrong (installing under the wrong `$HOME`, or with no plugins, leaving an mngr that cannot parse `[agent_types.*]`) are exactly what that program exists to prevent. `uv tool list` shows what is installed. Then try running the command again.
+If you get a "ModuleNotFoundError" error for a 3rd-party dependency when running a command that is defined in this repo (like `mngr`), which refresh fixes it depends on *which* install you ran, because a standard workspace has two: `uv run --no-sync mngr ...` resolves from the root venv, and a bare `mngr` on PATH is the uv-managed tool that `system/scripts/build_workspace.sh` installs at build time. For the venv one, run `uv sync --all-packages`. For the tool one, run `python3 system/scripts/install_mngr.py` -- the same program the build runs, which reinstalls it with the plugins `system/config/mngr_plugins.toml` assigns it, into the pinned tool directory the build installs into and puts first on `PATH`. If `mngr` on your PATH turns out to come from somewhere else instead (a workspace created before that pin has a second copy under `/home/user/.local`), follow it with `python3 system/scripts/workspace_bare_scripts/tool_env.py drop-shadowing-mngr`, which is what the build runs next and what leaves the refreshed install the one a login shell reaches. Do not hand-roll the `uv tool install`: the ways that goes wrong (installing under the wrong `$HOME`, or with no plugins, leaving an mngr that cannot parse `[agent_types.*]`) are exactly what that program exists to prevent. `uv tool list` shows what is installed. Then try running the command again.
 
 If you get a failure when trying to commit the first time, just try committing again (the pre-commit hook returns a non-zero exit code when ruff reformats files).
 
@@ -286,8 +235,12 @@ If you get a failure when trying to commit the first time, just try committing a
 
 If something unexpected happens -- errors, confusing state, things not working as documented -- use the `dealing-with-the-unexpected` skill for guidance.
 
-A background OOM-prevention daemon (earlyoom) kills ("sheds") memory-heavy processes under sustained memory pressure -- most-expendable first (an agent's build/test/browser subprocesses before the agent itself). If a command of yours dies with exit 137 (or SIGKILL/SIGTERM) and you did not kill it, confirm by checking the shed ledger at `/home/user/workspace/data/.state/oom_priority/events/shed.jsonl` for a record naming it (matched by pid or process name). If it was shed, do NOT blindly re-run a memory-heavy command -- it will likely be shed again; find a lower-memory approach (smaller batches, streaming, releasing data you no longer need) and only retry if you can.
+A background OOM-prevention daemon (earlyoom) kills ("sheds") memory-heavy processes under sustained memory pressure -- most-expendable first (an agent's build/test/browser subprocesses before the agent itself). If a command of yours dies with exit 137 (or SIGKILL/SIGTERM) and you did not kill it, confirm by checking the shed ledger at `/home/user/workspace/data/.state/oom_priority/events/shed.jsonl` for a record naming it (matched by pid or process name). If it was shed, do NOT blindly re-run a memory-heavy command -- it will likely be shed again; find a lower-memory approach (smaller batches, streaming, releasing data you no longer need) and only retry if you can. That advice is for your own ad-hoc commands. A shed command of a harden worker's test gate follows the gate's own shed handling (`.agents/shared/worker/references/harden-creation.md`, "The test gate"), and memory pressure is never a reason to skip one. When an agent reports a shed to you, free memory with the user per `.agents/shared/references/freeing-memory.md`.
+
+A backup that takes minutes (a slow `host-backup-now`, or a `BACKUP_SLOW` event in the backup events log) is caused by how many files the home tree holds, not how big they are. Follow "Slow backups" in `system/services/host_backup/README.md`, which uses `uv run --no-sync host-backup-heavy-dirs` to find the directories responsible.
+
+`/tmp` is a small RAM disk: a tmpfs capped at about 1 GiB, whose contents count against the container's memory limit until deleted. A write past the cap fails with "No space left on device" (ENOSPC), and until you delete what filled it, everything else that writes to `/tmp` fails the same way. Keep it to small files. Anything that can run to gigabytes -- a copy of an app's data, a clone, a download, a backup export or restore -- goes on disk: a throwaway file under `/var/tmp` (outside the backup), and a copy of an app's data through `serve_isolated_instance.py --copy` (see the `update-app` skill), which checks that it fits.
 
 # Sandboxed runtime
 
-Remote (imbue_cloud) workspaces -- and Linux desktop workspaces -- run their container under gVisor (`runsc`), a user-space kernel that sits between the container and the host kernel (`uname -r` reports `4.19.0-gvisor`). Most software is unaffected, but some things do not work inside the sandbox: ptrace-based tooling (`strace`, `gdb` attach, `perf`), eBPF, FUSE mounts, `io_uring`, nested container runtimes (running docker/podman inside the workspace), and unusual `ioctl`s. Filesystem-metadata-heavy operations (`find`, `tar`, `git status` over large trees) are several times slower than on a plain kernel, and interpreter startup is somewhat slower. Do not try to install or "fix" any of these -- work around them (e.g. `--no-sandbox` for Chromium, logging instead of `strace`) and tell the user when a tool is unavailable for this reason.
+Some providers run the workspace container under gVisor (`runsc`), a user-space kernel that sits between the container and the host kernel. Check with `dmesg 2>/dev/null | grep -q 'Starting gVisor'` (`uname -r` also reports `4.19.0-gvisor`). Most software is unaffected, but some things do not work inside the sandbox: ptrace-based tooling (`strace`, `gdb` attach, `perf`), eBPF, FUSE mounts, `io_uring`, nested container runtimes (running docker/podman inside the workspace), and unusual `ioctl`s. Filesystem-metadata-heavy operations (`find`, `tar`, `git status` over large trees) are several times slower than on a plain kernel, and interpreter startup is somewhat slower. Do not try to install or "fix" any of these -- work around them (e.g. `--no-sandbox` for Chromium, logging instead of `strace`) and tell the user when a tool is unavailable for this reason.

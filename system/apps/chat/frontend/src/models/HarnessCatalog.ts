@@ -22,11 +22,30 @@ export interface CatalogModelOption {
   id: string;
   label: string;
   efforts: EffortChoice[];
+  // The effort the model runs at when none has been picked (codex), or null when the harness does
+  // not report one. A live choice whose effort is null is running at this level.
+  default_effort: string | null;
   supports_fast: boolean;
   in_picker: boolean;
   // The raw model id the harness reports in its live state file (or null = same as `id`).
   // Matched on the backend; the frontend reconciles against the matched option, not this.
   harness_reported_model_id: string | null;
+}
+
+/** The effort an agent is running at: the one it recorded, else its model's default. A harness that
+ *  records no effort until one is picked (codex) runs at the default meanwhile. */
+export function effortInEffect(recordedEffort: string | null, option: CatalogModelOption | null): string | null {
+  return recordedEffort ?? option?.default_effort ?? null;
+}
+
+/** The effort a newly chosen model starts at: its default when it offers that level, else its first
+ *  shown (or first declared) effort. Null when the model has no effort axis. */
+export function startingEffort(option: CatalogModelOption): string | null {
+  if (option.default_effort !== null && option.efforts.some((effort) => effort.level === option.default_effort)) {
+    return option.default_effort;
+  }
+  const shown = option.efforts.filter((effort) => effort.in_picker);
+  return (shown[0] ?? option.efforts[0])?.level ?? null;
 }
 
 // A popup the harness declared for the chat UI (see HarnessSpec.popups on the
@@ -38,9 +57,10 @@ export interface HarnessPopup {
   trigger: "composer_command" | "turn_check";
   commands: string[];
   action: "notice" | "open_auth" | "fast_mode_limit";
-  /** `notice` only: replaces the notice's default body. Absent for most declines,
-   *  which are declined for the same reason (the command takes over the terminal);
-   *  present where the harness has a more specific thing to say. */
+  /** `notice`: replaces the notice's default body. Absent for most declines, which are
+   *  declined for the same reason (the command takes over the terminal); present where
+   *  the harness has a more specific thing to say. `fast_mode_limit`: a line the
+   *  turn-limit notice adds after its default body. */
   notice_body?: string | null;
 }
 
@@ -50,8 +70,7 @@ export interface HarnessCatalog {
   // The static catalog options. EMPTY for a "dynamic" picker (codex): its options are per-agent,
   // fetched from /model-options on open, not carried here.
   options: CatalogModelOption[];
-  // "eager_then_reconcile" (claude/pi -- optimistic) | "on_change" (codex -- no overlay)
-  // | "read_only" (antigravity -- slots render non-interactive, no picker)
+  // "eager_then_reconcile" (optimistic) | "on_change" (no overlay)
   switch_mode: string;
   picker_mode: string; // "list" | "search" | "dynamic" -- how the model dropdown sources/renders options
   // Whether the "Shoulder tap" button can flush the queue atomically (merge into the live
@@ -59,10 +78,14 @@ export interface HarnessCatalog {
   // pi via its inbox sentinel, codex via its live ledger); a false harness would fall back
   // to the restart-based flush.
   native_atomic_shoulder_tap_possible: boolean;
+  // Whether the chat's idle sweep can compact this harness's agents.
+  supports_compaction: boolean;
+  // Whether the stop button's interrupt cancels a compaction in progress; where it does not, the
+  // button is hidden while the agent is compacting.
+  can_interrupt_compaction: boolean;
   // The harness's declared popups plus its agent-auth surface, merged into the
-  // payload from the backend HarnessSpec. Optional so a stale backend without
-  // them degrades to "no popups" rather than a parse failure.
-  popups?: HarnessPopup[];
+  // payload from the backend HarnessSpec.
+  popups: HarnessPopup[];
 }
 
 const catalogByHarness = new Map<string, HarnessCatalog>();
@@ -125,9 +148,19 @@ export function findComposerPopup(
   return null;
 }
 
-/** Whether `harness` declared the fast-mode turn limit: it can launch fast, and the limit applies. */
-export function hasFastModeLimit(harness: string | undefined): boolean {
-  return (getHarnessCatalog(harness)?.popups ?? []).some(
+function findFastModeLimitPopup(harness: string | undefined): HarnessPopup | undefined {
+  return (getHarnessCatalog(harness)?.popups ?? []).find(
     (popup) => popup.trigger === "turn_check" && popup.action === "fast_mode_limit",
   );
+}
+
+/** Whether `harness` declared the fast-mode turn limit: it can launch fast, and the limit applies. */
+export function hasFastModeLimit(harness: string | undefined): boolean {
+  return findFastModeLimitPopup(harness) !== undefined;
+}
+
+/** The line `harness` declared for the fast-mode turn-limit notice to add after its default
+ *  body, or null when it declared none (or no turn limit at all). */
+export function getFastModeLimitNoticeBody(harness: string | undefined): string | null {
+  return findFastModeLimitPopup(harness)?.notice_body ?? null;
 }

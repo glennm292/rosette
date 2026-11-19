@@ -8,8 +8,9 @@ on:
 
 jobs:
   # Changelog gate. Diffs the PR branch against its real base branch and fails
-  # if any touched project is missing its per-PR changelog entry. Pure stdlib,
-  # so no `uv sync`; just enough git history to compute the diff.
+  # if any touched project is missing its per-PR changelog entry. The gate is a
+  # workspace script, so it runs from a frozen sync of the scripts package, the
+  # way agents run it (`uv run --no-sync`), plus enough git history for the diff.
   #
   # Opt-in: this job only runs when the repository variable ENFORCE_CHANGELOG is
   # set to 'true' (Settings -> Secrets and variables -> Actions -> Variables).
@@ -46,13 +47,35 @@ jobs:
           git update-ref "refs/remotes/origin/${CHANGELOG_BASE_REF}" FETCH_HEAD
           git rev-parse --verify "refs/remotes/origin/${CHANGELOG_BASE_REF}" >/dev/null
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
-          python-version: '3.12'
+          # UV_VERSION in system/scripts/setup_system.sh: another uv writes uv.lock differently.
+          version: "0.13.4"
+
+      - name: Sync the scripts package
+        run: uv sync --frozen --package workspace-scripts
 
       - name: Check changelog entries
-        run: python system/scripts/check_changelog_entries.py
+        run: uv run --no-sync system/scripts/workspace_scripts/check_changelog_entries.py
+
+  # The mngr pin must name the public mirror before a branch merges: a private
+  # pin builds only with a credential, which no user's machine and no CI here
+  # holds (docs/system/workspace-internals.md). Its own job so main's branch
+  # protection can require exactly "the tree agrees with its pin": the pin
+  # writer also refuses BuildKit lines that disagree with the pin, and the
+  # vendored skill must be the one at the pinned commit.
+  pin-is-public:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: The mngr pin names the public mirror and the tree agrees with it
+        run: python3 system/scripts/set_mngr_pin.py --require-public
+
+      - name: The vendored imbue-studio skill matches the pinned mngr commit
+        run: python3 system/scripts/vendor_mngr_skill.py --check
 
   test:
     runs-on: ubuntu-latest
@@ -60,22 +83,46 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # The Python suites run here only where the test-offload job below
+      # cannot: a repo without the TEST_IN_WORKSPACE_IMAGE variable (a workspace
+      # repo made from the template) or a fork PR (no Vault, so no Modal token).
+      # Everywhere else that job runs them inside the workspace image instead,
+      # and this job keeps the lockfile, pin and frontend checks.
+      - name: Decide where the Python suites run
+        id: python_suites
+        env:
+          IN_WORKSPACE_IMAGE: ${{ vars.TEST_IN_WORKSPACE_IMAGE }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          if [ "$IN_WORKSPACE_IMAGE" = "true" ] && [ "$IS_FORK_PR" != "true" ]; then
+            echo "on_runner=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "on_runner=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
-          version: "latest"
+          # UV_VERSION in system/scripts/setup_system.sh: another uv writes uv.lock differently.
+          version: "0.13.4"
+
+      # A branch iterating on a paired mngr change may pin mngr from the private
+      # mngr-internal repo (see docs/system/workspace-internals.md). This repo's CI
+      # deliberately holds no credential for it, so every step below that resolves
+      # the pin would fail with git's own auth error. Say why up front instead.
+      - name: Refuse a private mngr pin (this CI has no credential for it, by design)
+        run: python3 system/scripts/set_mngr_pin.py --require-public
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
-          # 22+, not 20: the frontend tests exercise code that reads the global
-          # `navigator` (added to Node in 21), and Node 20 is past end-of-life.
-          node-version: '22'
+          # NODE_VERSION in system/scripts/setup_system.sh, the Node workspaces run.
+          node-version: '24.22.1'
           cache: 'npm'
           cache-dependency-path: system/package-lock.json
 
@@ -90,23 +137,244 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --all-packages
 
+      # Opt-in through the ENFORCE_RUFF repository variable, like check-changelog:
+      # workspace repos made from the template inherit this workflow, and their
+      # own apps were never held to the template's lint. The root config excludes
+      # the chat app and the shell, so each is checked from its own directory
+      # under its own config.
+      - name: Lint Python (ruff check)
+        if: vars.ENFORCE_RUFF == 'true'
+        run: |
+          uv run --no-sync ruff check .
+          (cd system/apps/chat && uv run --no-sync ruff check .)
+          (cd system/apps/system_interface && uv run --no-sync ruff check .)
+
       - name: Install Playwright browsers
+        if: steps.python_suites.outputs.on_runner == 'true'
         run: uv run playwright install --with-deps chromium
 
-      - name: Build and test the frontends (system/ npm workspace)
+      # workspace_ui has no build script, so its typecheck runs on its own here;
+      # each app's build already typechecks the app.
+      - name: Build, lint, and test the frontends (system/ npm workspace)
         working-directory: system
         run: |
           npm ci
           npm run build
+          npm run lint
+          npm run format:check
+          npm run typecheck --workspace=libs/workspace_ui
           npm test
 
+      # A workspace container mounts /tmp noexec, where a test's stub
+      # executable is skipped and the real tool runs. This runner's /tmp is exec, so
+      # without this a pytest root that fails to load pytest-executable-tmp would pass
+      # here and break there. uv and the runner keep their state under $RUNNER_TEMP.
+      - name: Mount /tmp noexec, as a workspace container has it
+        if: steps.python_suites.outputs.on_runner == 'true'
+        run: |
+          sudo mount -t tmpfs -o noexec,nosuid,nodev,mode=1777 tmpfs /tmp
+          printf '#!/bin/sh\nexit 0\n' > /tmp/exec-probe
+          chmod +x /tmp/exec-probe
+          if /tmp/exec-probe; then
+            echo "/tmp still runs files after the noexec mount" >&2
+            exit 1
+          fi
+          rm /tmp/exec-probe
+
+      # An agent runs the suites with its own identity in the environment, which
+      # pytest-workspace-env clears before any test code runs. Fake values here
+      # mean a pytest root that fails to load the plugin fails here, not in an agent.
+      - name: Set an agent's environment, as an agent's test run has it
+        if: steps.python_suites.outputs.on_runner == 'true'
+        run: |
+          {
+            echo "MNGR_AGENT_ID=agent-c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+            echo "MNGR_AGENT_NAME=ci-not-an-agent"
+            echo "MINDS_CHAT_ID=agent-c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+          } >> "$GITHUB_ENV"
+
       - name: Run root tests
+        if: steps.python_suites.outputs.on_runner == 'true'
         run: uv run pytest
 
+      # -m '' replaces the pyproject's default `-m "not browser and not real_claude"`, so
+      # CI also runs the browser and real-claude tests a plain `uv run pytest` skips.
       - name: Run system/apps/system_interface tests
+        if: steps.python_suites.outputs.on_runner == 'true'
         working-directory: system/apps/system_interface
-        run: uv run pytest
+        run: uv run pytest -m ''
 
       - name: Run system/apps/chat tests
+        if: steps.python_suites.outputs.on_runner == 'true'
         working-directory: system/apps/chat
-        run: uv run pytest
+        run: uv run pytest -m ''
+
+  # The three pytest roots inside the workspace image on Modal, through offload
+  # (offload-modal*.toml at the repo root). The bare runner above has none of
+  # what a workspace has (Fortress, Xvfb, claude, mngr, tmux, jq, restic, ...),
+  # so the tests that need them skip there; here they run, and any test that
+  # skips fails the job (pytest-workspace-env).
+  #
+  # Opt-in through the TEST_IN_WORKSPACE_IMAGE repository variable, like
+  # check-changelog: workspace repos made from the template inherit this
+  # workflow but hold no Modal token. Fork PRs cannot reach Vault, so they are
+  # skipped too (the test job runs the suites on the runner for both).
+  test-offload:
+    runs-on: ubuntu-latest
+    if: >-
+      vars.TEST_IN_WORKSPACE_IMAGE == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    timeout-minutes: 90
+    permissions:
+      # offload pushes its image-cache notes (refs/notes/offload-images).
+      contents: write
+      id-token: write
+    env:
+      # The runner's offload and the one built into the image (OFFLOAD_VERSION in
+      # system/scripts/offload_sandbox_init.sh) talk to each other, so they stay
+      # in lockstep; system/test_offload_configs.py checks that.
+      OFFLOAD_VERSION: "0.10.0"
+    steps:
+      - name: Fetch the Modal token from Vault
+        uses: imbue-ai/use-vault-secrets@b9522dcb19272d8e428e945a7e66d2e35c791bec # main, 2026-10-21
+        with:
+          role: dwt_ci_gh
+          secrets: |
+            mngr/ci/MODAL_TOKEN_ID
+            mngr/ci/MODAL_TOKEN_SECRET
+
+      - uses: actions/checkout@v6
+
+      # offload picks the checkpoint commit as the nearest ancestor touching a
+      # build input, so it needs the branch's history.
+      - name: Deepen current-branch history for offload
+        run: |
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --no-tags --unshallow origin "$(git rev-parse HEAD)"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          # UV_VERSION in system/scripts/setup_system.sh: another uv writes uv.lock differently.
+          version: "0.13.4"
+
+      - name: Refuse a private mngr pin (this CI has no credential for it, by design)
+        run: python3 system/scripts/set_mngr_pin.py --require-public
+
+      # Test discovery runs on the runner (`pytest --collect-only` per root);
+      # execution happens in the image.
+      - name: Install Python dependencies
+        # --compile-bytecode moves site-packages .pyc compilation into uv's
+        # parallel install phase, off offload's pytest-discovery critical
+        # path (OFFLOAD-16).
+        run: uv sync --all-packages --compile-bytecode
+
+      # Editable installs are not covered by --compile-bytecode; precompile
+      # them for the same reason (OFFLOAD-17).
+      - name: Precompile repo bytecode
+        run: uv run python -m compileall -q -j 4 system catalog
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-10-16
+
+      - name: Cache the offload binary
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/offload
+          key: cargo-offload-${{ env.OFFLOAD_VERSION }}-${{ runner.os }}
+
+      - name: Install offload
+        run: |
+          if ! command -v offload &> /dev/null || ! offload --version | grep -q "$OFFLOAD_VERSION"; then
+            cargo install "offload@$OFFLOAD_VERSION" --force
+          fi
+
+      - name: Restore offload test durations from previous run
+        uses: actions/cache/restore@v5
+        with:
+          path: test-results/*/junit.xml
+          key: offload-durations-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: offload-durations-${{ github.ref }}-
+
+      - name: Fetch offload image-cache git notes
+        run: git fetch origin 'refs/notes/*:refs/notes/*' || true
+
+      - name: Configure git identity for image-cache note writes
+        run: |
+          git config user.email "dev@imbue.com"
+          git config user.name "imbue-dev"
+
+      # Every suite runs even after an earlier one fails, so one run reports
+      # them all; the outcomes are collected below. offload exits 2 when only
+      # flaky-marked tests failed; that is a pass.
+      - name: Run the root tests via offload
+        id: root_suite
+        continue-on-error: true
+        run: offload -c offload-modal.toml run --trace || [ $? -eq 2 ]
+
+      - name: Run the system/apps/chat tests via offload
+        id: chat_suite
+        continue-on-error: true
+        run: offload -c offload-modal-chat.toml run --trace || [ $? -eq 2 ]
+
+      - name: Run the system/apps/system_interface tests via offload
+        id: system_interface_suite
+        continue-on-error: true
+        run: offload -c offload-modal-system-interface.toml run --trace || [ $? -eq 2 ]
+
+      - name: Fail if any suite failed
+        env:
+          ROOT: ${{ steps.root_suite.outcome }}
+          CHAT: ${{ steps.chat_suite.outcome }}
+          SYSTEM_INTERFACE: ${{ steps.system_interface_suite.outcome }}
+        run: |
+          echo "root: $ROOT, chat: $CHAT, system_interface: $SYSTEM_INTERFACE"
+          [ "$ROOT" = "success" ] && [ "$CHAT" = "success" ] && [ "$SYSTEM_INTERFACE" = "success" ]
+
+      - name: Save offload test durations for next run
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: test-results/*/junit.xml
+          key: offload-durations-${{ github.ref }}-${{ github.run_id }}
+
+      # Each batch measured its own coverage (--cov-fail-under=0 there); the
+      # floor in each app's pyproject applies once, to the combined data.
+      - name: Combine coverage and check each app's floor
+        run: |
+          set -euo pipefail
+          failed=""
+          for app in chat system_interface; do
+            i=0
+            for data_file in $(find "test-results/$app" -name '.coverage*' -type f); do
+              cp "$data_file" "system/apps/$app/.coverage.$i"
+              i=$((i + 1))
+            done
+            echo "=== $app: $i coverage data files"
+            (cd "system/apps/$app" && uv run coverage combine .coverage.* && uv run coverage report) || failed="$failed $app"
+          done
+          if [ -n "$failed" ]; then
+            echo "FAILED coverage floors:$failed" >&2
+            exit 1
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-offload
+          path: test-results/
+          if-no-files-found: ignore
+          # The sandboxes' .coverage* files and .test_output/ trees (download_globs)
+          # are hidden paths, which upload-artifact drops by default.
+          include-hidden-files: true
+          retention-days: 30

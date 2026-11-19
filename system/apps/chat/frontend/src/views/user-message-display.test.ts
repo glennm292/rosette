@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import m from "mithril";
+import { setParticipantsForTesting, type Participant } from "../models/Participants";
+import { personFixture } from "../models/participantFixture";
 import type { UserMessageEvent } from "../models/Response";
-import { renderUserMessage, StableUserMessage } from "./user-message-display";
-import { isBlockExpanded, setBlockExpanded } from "./expansion-state";
+import { authorOfTurn, renderUserMessage, StableUserMessage } from "./user-message-display";
 
 function collectClasses(node: unknown): string[] {
   if (node == null) return [];
@@ -29,40 +30,59 @@ function allText(node: unknown): string {
   return "";
 }
 
-function renderInner(event: UserMessageEvent): m.Vnode {
-  const comp = StableUserMessage();
-  return comp.view(m(StableUserMessage, { event })) as m.Vnode;
+/** What each `MarkdownContent` in the tree was handed; the bubble delegates its attachment
+ *  block to one, which renders as innerHTML and so has no text of its own to collect. */
+function markdownContents(node: unknown): string[] {
+  if (node == null) return [];
+  if (Array.isArray(node)) return node.flatMap(markdownContents);
+  if (typeof node === "object") {
+    const v = node as { attrs?: { content?: unknown }; children?: unknown };
+    const own = typeof v.attrs?.content === "string" ? [v.attrs.content] : [];
+    return [...own, ...markdownContents(v.children)];
+  }
+  return [];
 }
 
+function renderInner(event: UserMessageEvent): m.Children {
+  const comp = StableUserMessage();
+  return comp.view(m(StableUserMessage, { event })) as m.Children;
+}
+
+/** The bubble a person's turn draws, without the name over it. */
+function renderBubble(event: UserMessageEvent): m.Vnode | undefined {
+  const inner = renderInner(event);
+  return (Array.isArray(inner) ? inner : [inner]).find(
+    (node): node is m.Vnode =>
+      typeof node === "object" &&
+      node !== null &&
+      String((node as m.Vnode<{ className?: string }>).attrs?.className ?? "").includes("message-user-bubble"),
+  );
+}
+
+describe("user-message-display system chips", () => {
+  it("draws a system chip without the tool-call part: it is not a tool the agent called", () => {
+    const event: UserMessageEvent = {
+      timestamp: "2026-01-01T00:00:00Z",
+      type: "user_message",
+      event_id: "evt-stop-hook",
+      source: "claude",
+      role: "user",
+      content: "Stop hook feedback:\nlint failed",
+      display: "chip",
+      display_label: "Stop hook feedback",
+    };
+    const root = document.createElement("div");
+    m.render(root, renderInner(event));
+
+    expect(root.textContent).toContain("Stop hook feedback");
+    expect(root.querySelector('[data-part="chat.tool-call"]')).toBeNull();
+  });
+});
+
 describe("user-message-display status messages", () => {
-  beforeEach(() => {
-    setBlockExpanded("status:evt-status-summary", false);
-  });
-
-  it("renders a simple status pill when there is no summary body", () => {
-    const event: UserMessageEvent = {
-      timestamp: "2026-01-01T00:00:00Z",
-      type: "user_message",
-      event_id: "evt-status-plain",
-      source: "claude",
-      role: "system",
-      content: "Context was compacted",
-      display: "status",
-      non_turn_tail: true,
-    };
-
-    const row = renderUserMessage(event);
-    expect(row).not.toBeNull();
-    expect(collectClasses(row)).toContain("message message-system-status-row");
-
-    const inner = renderInner(event);
-    const classes = collectClasses(inner);
-    expect(classes).toContain("message-system-status");
-    expect(classes).not.toContain("message-system-status--toggleable");
-    expect(allText(inner)).toContain("Context was compacted");
-  });
-
-  it("renders an expandable toggle and summary details when display_body is present", () => {
+  // A compaction renders as chips in the agent's chip rows (compaction-chips.ts), which the
+  // transcript walk places; it has no row of its own here.
+  it("renders no row for a compaction, with or without a summary", () => {
     const event: UserMessageEvent = {
       timestamp: "2026-01-01T00:00:00Z",
       type: "user_message",
@@ -70,93 +90,269 @@ describe("user-message-display status messages", () => {
       source: "claude",
       role: "system",
       content: "Context was compacted",
-      display_body: "Summary of earlier conversation across 12 turns.",
       display: "status",
       non_turn_tail: true,
+      compaction_cause: "idle",
     };
-
-    const row = renderUserMessage(event);
-    expect(row).not.toBeNull();
-    expect(collectClasses(row)).toContain("message message-system-status-row");
-
-    const inner = renderInner(event);
-    const classes = collectClasses(inner);
-    expect(classes).toContain("message-system-status-container");
-    expect(classes).toContain("message-system-status message-system-status--toggleable");
-    expect(classes).toContain("tool-call-chevron");
-    expect(classes).toContain("message-system-status-details");
-    expect(classes).toContain("message-system-status-body");
-    expect(allText(inner)).toContain("Context was compacted");
-    expect(allText(inner)).toContain("Summary of earlier conversation across 12 turns.");
-
-    // Initial state is collapsed
-    expect(classes).not.toContain("message-system-status-container message-system-status-container--expanded");
+    expect(renderUserMessage(event)).toBeNull();
+    expect(renderUserMessage({ ...event, display_body: "Summary of earlier conversation." })).toBeNull();
   });
 
-  it("renders with expanded container class when isBlockExpanded is true", () => {
-    setBlockExpanded("status:evt-status-summary", true);
+  it("renders a typed /compact as the user's own bubble", () => {
     const event: UserMessageEvent = {
       timestamp: "2026-01-01T00:00:00Z",
       type: "user_message",
-      event_id: "evt-status-summary",
+      event_id: "evt-compact-command",
       source: "claude",
-      role: "system",
-      content: "Context was compacted",
-      display_body: "Summary of earlier conversation across 12 turns.",
-      display: "status",
+      role: "user",
+      content: "/compact",
       non_turn_tail: true,
     };
-
-    const inner = renderInner(event);
-    const classes = collectClasses(inner);
-    expect(classes).toContain("message-system-status-container message-system-status-container--expanded");
+    expect(collectClasses(renderUserMessage(event))).toContain("message message-user flex flex-col items-end mb-5");
+    expect(allText(renderBubble(event))).toBe("/compact");
   });
+});
 
-  it("toggles expansion state when clicked", () => {
-    const event: UserMessageEvent = {
+describe("user-message-display prompt bubbles", () => {
+  const SEED_BLOCK = "<chat-seed-context>\nthe conversation the chat opened on\n</chat-seed-context>";
+  const ATTACHMENT_MARKDOWN = "![/code/uploads/aaa/diagram.png](/code/uploads/aaa/diagram.png)";
+  const ATTACHMENT = `See attachment here: ${ATTACHMENT_MARKDOWN}`;
+
+  function wrappedSend(spoken: string): UserMessageEvent {
+    return {
       timestamp: "2026-01-01T00:00:00Z",
       type: "user_message",
-      event_id: "evt-status-summary",
+      event_id: "evt-seeded-first-send",
       source: "claude",
-      role: "system",
-      content: "Context was compacted",
-      display_body: "Summary text",
-      display: "status",
-      non_turn_tail: true,
+      role: "user",
+      content: `${SEED_BLOCK}\n${spoken}`,
+      display: "prompt_with_context",
+      display_body: spoken,
     };
+  }
 
-    const inner = renderInner(event);
-    const children = Array.isArray(inner.children) ? inner.children : [];
-    const toggleChild = children[0] as m.Vnode<{
-      onclick?: (e: { currentTarget: HTMLElement }) => void;
-      onkeydown?: (e: { key: string; preventDefault: () => void; currentTarget: HTMLElement }) => void;
-    }>;
-    const containerEl = document.createElement("div");
-    containerEl.className = "message-system-status-container";
-    const toggleEl = document.createElement("div");
-    containerEl.appendChild(toggleEl);
+  it("shows only what the user typed when the chat app wrapped the send in context", () => {
+    const inner = renderBubble(wrappedSend("1"));
 
-    // Call onclick
-    toggleChild.attrs.onclick?.({ currentTarget: toggleEl });
-    expect(containerEl.classList.contains("message-system-status-container--expanded")).toBe(true);
-    expect(isBlockExpanded("status:evt-status-summary")).toBe(true);
+    expect(allText(inner)).toBe("1");
+    expect(allText(inner)).not.toContain("chat-seed-context");
+  });
 
-    // Click again to collapse
-    toggleChild.attrs.onclick?.({ currentTarget: toggleEl });
-    expect(containerEl.classList.contains("message-system-status-container--expanded")).toBe(false);
-    expect(isBlockExpanded("status:evt-status-summary")).toBe(false);
+  it("still renders the attachment a wrapped send carries, beside the words", () => {
+    const inner = renderBubble(wrappedSend(`here you go\n\n${ATTACHMENT}`));
 
-    // Keyboard Enter key expands
-    let prevented = false;
-    toggleChild.attrs.onkeydown?.({
-      key: "Enter",
-      preventDefault: () => {
-        prevented = true;
-      },
-      currentTarget: toggleEl,
+    expect(allText(inner)).toBe("here you go");
+    expect(markdownContents(inner)).toEqual([ATTACHMENT_MARKDOWN]);
+  });
+});
+
+describe("user-message-display other people's turns", () => {
+  function roster(): Participant[] {
+    return [
+      personFixture("user:owner-1", "Josh", { is_owner: true }),
+      personFixture("user:bob-2", "Bob", { profile_picture_url: "https://p.example/bob.png" }),
+    ];
+  }
+
+  function turn(author: { author: string; author_name: string } | null): UserMessageEvent {
+    return {
+      timestamp: "2026-01-01T00:00:00Z",
+      type: "user_message",
+      event_id: "evt-turn",
+      source: "claude",
+      role: "user",
+      content: "hello",
+      ...(author ?? {}),
+    };
+  }
+
+  function mounted(event: UserMessageEvent): HTMLElement {
+    const root = document.createElement("div");
+    m.render(root, renderUserMessage(event));
+    return root;
+  }
+
+  afterEach(() => {
+    setParticipantsForTesting(null, []);
+  });
+
+  it("draws every turn as the viewer's own until the page knows who it is", () => {
+    expect(collectClasses(renderUserMessage(turn({ author: "user:bob-2", author_name: "Bob" })))).toContain(
+      "message message-user flex flex-col items-end mb-5",
+    );
+  });
+
+  it("draws another person's turn on the left, under their name, beside their picture", () => {
+    setParticipantsForTesting("user:owner-1", roster());
+    const root = mounted(turn({ author: "user:bob-2", author_name: "Robert" }));
+
+    expect(root.firstElementChild?.className).toBe(
+      "message message-user message-other flex flex-col items-start mb-5",
+    );
+    expect(root.querySelector(".message-author")?.textContent).toBe("Bob");
+    expect(root.querySelector("[data-participant-picture] img")?.getAttribute("src")).toBe(
+      "https://p.example/bob.png",
+    );
+    expect(root.querySelector("[data-author]")?.getAttribute("data-author")).toBe("user:bob-2");
+  });
+
+  it("draws the viewer's own turn on the right, and an unannotated turn as the owner's", () => {
+    setParticipantsForTesting("user:bob-2", roster());
+
+    expect(mounted(turn({ author: "user:bob-2", author_name: "Bob" })).querySelector(".message-author")).toBeNull();
+    const ownersTurn = mounted(turn(null));
+    expect(ownersTurn.querySelector(".message-author")?.textContent).toBe("Josh");
+    expect(ownersTurn.querySelector("[data-participant-picture]")?.textContent).toBe("J");
+  });
+
+  it("redraws a turn drawn before the page knew who it was, once the roster lands", () => {
+    const root = document.createElement("div");
+    const event = turn({ author: "user:bob-2", author_name: "Bob" });
+    m.render(root, renderUserMessage(event));
+    expect(root.querySelector(".message-author")).toBeNull();
+
+    setParticipantsForTesting("user:owner-1", roster());
+    m.render(root, renderUserMessage(event));
+
+    expect(root.firstElementChild?.className).toContain("message-other");
+    expect(root.querySelector(".message-author")?.textContent).toBe("Bob");
+    expect(root.querySelector("[data-participant-picture] img")?.getAttribute("src")).toBe(
+      "https://p.example/bob.png",
+    );
+  });
+
+  it("redraws a turn whose author the roster names differently once the page reads the roster again", () => {
+    // The page read the roster before Bob arrived, when it named him by his id.
+    const beforeBobArrived = roster().map((entry) =>
+      entry.key === "user:bob-2" ? { ...entry, display_name: "bob-2-account-id" } : entry,
+    );
+    setParticipantsForTesting("user:owner-1", beforeBobArrived);
+    const root = document.createElement("div");
+    const event = turn({ author: "user:bob-2", author_name: "Bob" });
+    m.render(root, renderUserMessage(event));
+    expect(root.querySelector(".message-author")?.textContent).toBe("bob-2-account-id");
+
+    setParticipantsForTesting("user:owner-1", roster());
+    m.render(root, renderUserMessage(event));
+
+    expect(root.querySelector(".message-author")?.textContent).toBe("Bob");
+  });
+
+  it("folds a turn annotated under the synthetic owner key into the owner, for the owner and for a visitor", () => {
+    // Annotated before the workspace was shared, read after: the owner's key of the moment is their account's.
+    setParticipantsForTesting("user:owner-1", roster());
+    expect(mounted(turn({ author: "owner", author_name: "Owner" })).querySelector(".message-author")).toBeNull();
+
+    setParticipantsForTesting("user:bob-2", roster());
+    const seenByVisitor = mounted(turn({ author: "owner", author_name: "Owner" }));
+    expect(seenByVisitor.querySelector(".message-author")?.textContent).toBe("Josh");
+    expect(seenByVisitor.querySelector("[data-author]")?.getAttribute("data-author")).toBe("user:owner-1");
+  });
+
+  it("names a run of one person's turns once, over its first bubble, and starts a new run for someone else", () => {
+    setParticipantsForTesting("user:owner-1", roster());
+    const bob = (id: string): UserMessageEvent => ({
+      ...turn({ author: "user:bob-2", author_name: "Bob" }),
+      event_id: id,
     });
-    expect(prevented).toBe(true);
-    expect(containerEl.classList.contains("message-system-status-container--expanded")).toBe(true);
-    expect(isBlockExpanded("status:evt-status-summary")).toBe(true);
+    const own = (id: string): UserMessageEvent => ({ ...turn(null), event_id: id });
+    const render = (event: UserMessageEvent, previousTurn: UserMessageEvent | null): HTMLElement => {
+      const root = document.createElement("div");
+      m.render(root, renderUserMessage(event, false, previousTurn));
+      return root;
+    };
+
+    const bobsSecond = render(bob("b2"), bob("b1"));
+    expect(bobsSecond.querySelector(".message-author")).toBeNull();
+    expect(bobsSecond.querySelector("[data-participant-picture]")).toBeNull();
+    expect(bobsSecond.querySelector(".message-user-bubble")?.className).not.toContain("rounded-tl-[4px]");
+
+    const ownFirst = render(own("o1"), bob("b2"));
+    expect(ownFirst.querySelector(".message-you")?.textContent).toBe("You");
+    expect(ownFirst.querySelector(".message-user-bubble")?.className).toContain("rounded-br-[4px]");
+    const ownSecond = render(own("o2"), own("o1"));
+    expect(ownSecond.querySelector(".message-you")).toBeNull();
+    expect(ownSecond.querySelector(".message-user-bubble")?.className).not.toContain("rounded-br-[4px]");
+
+    const bobAgain = render(bob("b3"), own("o2"));
+    expect(bobAgain.querySelector(".message-author")?.textContent).toBe("Bob");
+    expect(bobAgain.querySelector(".message-user-bubble")?.className).toContain("rounded-tl-[4px]");
+  });
+
+  it("names an author the roster no longer lists by the name the turn carried", () => {
+    setParticipantsForTesting("owner", roster());
+    const root = mounted(turn({ author: "name:Someone Else", author_name: "Someone Else" }));
+
+    expect(root.querySelector(".message-author")?.textContent).toBe("Someone Else");
+    expect(root.querySelector("[data-participant-picture]")?.textContent).toBe("S");
+  });
+
+  it("reads the owner's turns as the viewer's own on an owner page that still calls itself owner", () => {
+    // The page loaded before the workspace was shared, so its own key is the synthetic one; the owner's later
+    // turns are annotated under their account key, which the roster marks as the owner's.
+    setParticipantsForTesting("owner", roster());
+
+    expect(authorOfTurn({ author: "user:owner-1", author_name: "Josh" })).toBeNull();
+    expect(authorOfTurn({ author: "owner", author_name: undefined })).toBeNull();
+    expect(authorOfTurn({ author: undefined, author_name: undefined })).toBeNull();
+    expect(authorOfTurn({ author: "user:bob-2", author_name: "Bob" })).toEqual({ key: "user:bob-2", name: "Bob" });
+  });
+
+  it("reads both of the owner's keys as the owner's entry on a visitor's page", () => {
+    setParticipantsForTesting("user:bob-2", roster());
+
+    expect(authorOfTurn({ author: "owner", author_name: undefined })).toEqual({ key: "user:owner-1", name: "Josh" });
+    expect(authorOfTurn({ author: "user:owner-1", author_name: undefined })).toEqual({
+      key: "user:owner-1",
+      name: "Josh",
+    });
+    expect(authorOfTurn({ author: "user:bob-2", author_name: "Bob" })).toBeNull();
+  });
+
+  it("reads every turn as the viewer's own until the page knows who it is", () => {
+    setParticipantsForTesting(null, roster());
+
+    expect(authorOfTurn({ author: "user:bob-2", author_name: "Bob" })).toBeNull();
+  });
+});
+
+describe("user-message-display sent-again line", () => {
+  const event: UserMessageEvent = {
+    timestamp: "2026-01-01T00:00:00Z",
+    type: "user_message",
+    event_id: "evt-resent",
+    source: "claude",
+    role: "user",
+    content: "did you get this?",
+  };
+
+  function renderRow(isResent: boolean): HTMLElement {
+    const root = document.createElement("div");
+    m.render(root, renderUserMessage(event, isResent));
+    return root;
+  }
+
+  it("draws no line under a message sent once", () => {
+    expect(renderRow(false).querySelector(".message-resent-note")).toBeNull();
+  });
+
+  it("draws one collapsed line under the bubble of a message sent again, which its help opens", () => {
+    const collapsed = renderRow(true);
+    expect(collapsed.querySelector(".message-user-bubble")?.textContent).toBe("did you get this?");
+    const note = collapsed.querySelector(".message-resent-note");
+    expect(note?.textContent).toBe("Sent again?");
+    const help = collapsed.querySelector<HTMLButtonElement>(".message-resent-note-help");
+    expect(help?.getAttribute("aria-expanded")).toBe("false");
+
+    help!.click();
+    const opened = renderRow(true);
+    expect(opened.querySelector(".message-resent-note-help")?.getAttribute("aria-expanded")).toBe("true");
+    expect(opened.querySelector(".message-resent-note-text")?.textContent).toBe(
+      "Imbue Studio couldn't confirm the agent received this message, so it sent it again. " +
+        "If the first copy arrived too, the agent may see it twice.",
+    );
+
+    opened.querySelector<HTMLButtonElement>(".message-resent-note-help")!.click();
+    expect(renderRow(true).querySelector(".message-resent-note-text")).toBeNull();
   });
 });
