@@ -159,9 +159,12 @@ main { padding: 0 2rem; }
 
 .wrote p, .came-back p { margin: 0; }
 
-.phrase { font-size: 1.05rem; }
+/* The written line on the left, and the phrase that came back on the right,
+   read at the same size; a looked-up meaning is set in italic to tell it from
+   a line of the language itself. */
+.phrase, .came-back .italian { font-size: 1.05rem; }
 
-.meaning { font-size: 1.05rem; font-style: italic; }
+.came-back .english { font-size: 1.05rem; font-style: italic; }
 
 .note {
   font-family: var(--sans);
@@ -280,6 +283,7 @@ main { padding: 0 2rem; }
   <div id="lines"></div>
 </main>
 
+<script src="/row_format.js"></script>
 <script>
 "use strict";
 
@@ -289,12 +293,6 @@ const linesElement = document.getElementById("lines");
 const coverElement = document.getElementById("cover");
 
 let sessions = [];
-
-function escapeText(text) {
-  const holder = document.createElement("div");
-  holder.appendChild(document.createTextNode(text === null || text === undefined ? "" : text));
-  return holder.innerHTML;
-}
 
 // Times are stored in UTC; everything shown is in the reader's own clock, so
 // an evening's work reads as the evening it was.
@@ -326,45 +324,9 @@ function sittingLabel(session) {
     " -- " + countLabel(session.line_count, "line", "lines");
 }
 
-// The corrected line, run by run, with the same markup the notebook uses.
-function renderSegments(segments) {
-  return segments.map((segment, index) => {
-    if (segment.kind === "wrong") return '<span class="wrong">' + escapeText(segment.text) + "</span>";
-    if (segment.kind === "right") {
-      // A replacement lands straight after the text it replaces, so it needs a
-      // real space to read -- and to copy -- as a separate word.
-      const isAfterWrong = index > 0 && segments[index - 1].kind === "wrong";
-      return (isAfterWrong ? " " : "") + '<span class="right">' + escapeText(segment.text) + "</span>";
-    }
-    return escapeText(segment.text);
-  }).join("");
-}
-
-function cameBackHtml(row) {
-  const analysis = row.analysis || {};
-  const parts = [];
-  if (analysis.mode === "gloss" && analysis.english) {
-    parts.push('<p class="meaning">' + escapeText(analysis.english) + "</p>");
-  } else if (analysis.mode === "translate" && analysis.italian) {
-    parts.push('<p class="phrase">' + escapeText(analysis.italian) + "</p>");
-  } else if (analysis.mode === "answer" && analysis.answer) {
-    parts.push('<p class="reply">' + escapeText(analysis.answer) + "</p>");
-  } else if (analysis.mode === "assess") {
-    if (analysis.verdict === "correct") {
-      parts.push('<p class="verdict ok">All correct.</p>');
-    } else if (analysis.verdict === "fix") {
-      const fixCount = (analysis.segments || []).filter(s => s.kind === "right").length;
-      parts.push('<p class="verdict">' + countLabel(fixCount, "fix", "fixes") + ".</p>");
-      parts.push('<p class="phrase">' + renderSegments(analysis.segments || []) + "</p>");
-    }
-  }
-  if (analysis.note) parts.push('<p class="note">' + escapeText(analysis.note) + "</p>");
-  return parts.join("");
-}
-
 function buildEntry(row) {
   const entry = document.createElement("div");
-  const mode = (row.analysis || {}).mode;
+  const mode = RosetteFormat.mode(row);
   // A looked-up word is the only kind worth covering to test yourself on; a
   // correction or an answer has nothing to recall.
   entry.className = mode === "gloss" || mode === "translate" ? "entry is-lookup" : "entry";
@@ -394,7 +356,9 @@ function buildEntry(row) {
 
   const cameBack = document.createElement("div");
   cameBack.className = "came-back";
-  cameBack.innerHTML = cameBackHtml(row);
+  // The same formatter the notebook draws its answers with, so a line read back
+  // here is the line that was on the page.
+  cameBack.innerHTML = RosetteFormat.answer(row.analysis);
 
   entry.appendChild(wrote);
   entry.appendChild(cameBack);

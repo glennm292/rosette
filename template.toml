@@ -10,13 +10,17 @@ slug = "rosette"
 title = "Rosette"
 description = "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail = "template.svg"
-version = "v4"
+version = "v5"
 
 # How this template is DERIVED from the workspace it came from. An
 # update re-runs this recipe rather than diffing two repos, which is what
 # keeps an exclusion excluded even though the thing still exists upstream.
 [recipe]
-include = ["system/apps/rosette", "system/supervisord.conf.d/rosette.conf"]
+# system/test_app_manifests.py is a workspace test, not the app's own
+# code. It ships so the published repo's CI passes: the published copy
+# failed on a convention doc that is a symlink into build-time-populated
+# mngr assets; the shipped version skips when those are not vendored.
+include = ["system/apps/rosette", "system/supervisord.conf.d/rosette.conf", "system/test_app_manifests.py"]
 data_include = []
 # The publishing user's own class notes, and the lines they cleared.
 # Personal content; never ships. The app writes a

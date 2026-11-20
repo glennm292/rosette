@@ -26,9 +26,22 @@ from workspace_profile.manifest import find_off_grammar_default_chords
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _APPS_DIR = _REPO_ROOT / "system" / "apps"
+# Gitignored, filled by system/scripts/fetch_mngr_assets.sh; a convention doc symlinked
+# into it is present only once that has run.
+_MNGR_ASSETS_DIR = _REPO_ROOT / "system" / "vendor" / "mngr-assets"
 _SUPERVISORD_CONF = _REPO_ROOT / "system" / "supervisord.conf"
 
 _MANIFEST_FLAG = re.compile(r"--manifest\s+(\S+)")
+# The manifest-less registration (contracts.md section 2): ``forward_port.py --url
+# <url> --name <name>``. Two different things use it, and the reserved-label rule
+# below has to tell them apart. A pre-manifest app (section 14's second supported
+# form: a pyproject.toml and no app.toml) registers a VISIBLE row this way, so its
+# program is an app's, not a standalone program's. The registrations that are not
+# apps -- owner-exec, the VM exec service, previews, isolated test servers -- all
+# pass ``--internal``, because they have a port but no page; their own scripts say
+# so. So the discriminator is ``--name`` WITHOUT ``--internal``.
+_NAME_FLAG = re.compile(r"--name\s+(\S+)")
+_INTERNAL_FLAG = re.compile(r"--internal\b")
 
 # Where every app's console scripts are installed: the workspace venv, which
 # ``uv sync --all-packages`` writes and every app's program runs its entry point from.
@@ -200,7 +213,20 @@ def test_every_manifest_validates_against_the_repo_root(manifest_path: Path) -> 
 def test_every_convention_doc_the_scope_file_names_exists(convention_path: str) -> None:
     # The scope file points every review pass at these; a renamed doc would otherwise
     # send them to nothing without a test noticing.
-    assert (_REPO_ROOT / convention_path).is_file(), convention_path
+    named = _REPO_ROOT / convention_path
+    # One of them is a symlink into system/vendor/mngr-assets/, which is gitignored and
+    # filled by system/scripts/fetch_mngr_assets.sh at build time. In a checkout where
+    # that has not run -- a plain clone, and every CI run of a published template --
+    # the link dangles although nothing was renamed, which is what this test is for.
+    # Its sibling in workspace_profile/snapshot_contract_test.py skips for the same
+    # reason; the link itself is still checked, so a rename is still caught.
+    if named.is_symlink() and not named.exists():
+        if not _MNGR_ASSETS_DIR.is_dir():
+            pytest.skip(
+                "mngr assets are not vendored here; run system/scripts/fetch_mngr_assets.sh first"
+            )
+        pytest.fail(f"{convention_path} points outside the vendored mngr assets")
+    assert named.is_file(), convention_path
 
 
 @pytest.mark.parametrize(
@@ -243,16 +269,26 @@ def test_every_declared_wiring_program_has_a_supervisord_block() -> None:
 def test_the_first_label_of_every_standalone_program_is_a_reserved_app_name() -> None:
     # An app named after a standalone program's first label would claim that program as
     # its <name>-<role> sidecar when its footprint is computed, so the label is reserved.
+    command_by_program = _program_commands()
     manifests = [
         load_manifest(path, repo_root=_REPO_ROOT) for path in _every_manifest_path()
     ]
     # A program an app's manifest declares as its wiring (the Screen's stack members) is that app's, not standalone.
-    app_programs = {manifest.program for manifest in manifests} | {
+    app_programs: set[str] = {manifest.program for manifest in manifests} | {
         program for manifest in manifests for program in manifest.wiring.programs
+    }
+    # A pre-manifest app has no manifest to be found above, so its program is recognised
+    # from how it registers instead. Both forms are supported indefinitely, and neither is
+    # a standalone program.
+    app_programs |= {
+        program
+        for program, command in command_by_program.items()
+        if not _INTERNAL_FLAG.search(command)
+        and any(match.group(1).strip('"') == program for match in _NAME_FLAG.finditer(command))
     }
     standalone_labels = {
         program.partition("-")[0]
-        for program in _program_commands()
+        for program in command_by_program
         if "-" in program and program not in app_programs
     }
     unreserved = sorted(standalone_labels - RESERVED_APP_NAMES)

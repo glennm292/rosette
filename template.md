@@ -2,7 +2,7 @@
 title: "Rosette"
 description: "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail: "template.svg"
-version: v4
+version: v5
 format: v2
 ---
 
@@ -194,7 +194,7 @@ network.
 
 ## Recipe
 
-This template is version `v3`. It is not a fork of the
+This template is not a fork of the
 workspace it came from -- it is DERIVED from it by a recipe: include these
 paths, leave these out, apply these published-version rules. An update re-runs
 the recipe against the current workspace and publishes the result as the next
@@ -342,6 +342,8 @@ This is distinct from "Adaptation history" below, which is the ADOPTERS' log.
   back in English; glossing is only for the language being learned.
 
 ### v4 (2026-11-19) -- Review page for past sittings; short phrases translated rather than marked; the answer no longer redraws while you edit; rebuilt on the current workspace base.
+
+### v5 (2026-11-20) -- The notebook and the review page now draw a line with one shared formatter, so a correction reads the same in both; that formatter also gives the workspace's Data app a "rosette" view of past lines. Carries a fix to a workspace test that reported a build-time file as missing.
 
 ## Adaptation history
 

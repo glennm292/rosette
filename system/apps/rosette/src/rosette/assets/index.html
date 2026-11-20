@@ -614,6 +614,7 @@ body {
 <div class="offline" id="offline" hidden>Not saving right now. Your typing is safe on screen.</div>
 <div class="cut-undo" id="cut-undo" hidden><span id="cut-undo-text"></span><button type="button" id="cut-undo-button">Undo</button></div>
 
+<script src="/row_format.js"></script>
 <script>
 "use strict";
 
@@ -708,44 +709,11 @@ function renderGloss(row) {
       '<button class="retry" type="button" data-retry="' + escapeText(row.row_id) + '">Try again</button></p>';
   }
   // Reached with status "done", or "pending" while the answer above it is the
-  // previous one being kept on screen.
-  if (!row.analysis) return "";
-
-  const analysis = row.analysis;
-  const parts = [];
-
-  if (analysis.mode === "answer" && analysis.answer) {
-    parts.push('<p class="reply">' + escapeText(analysis.answer) + "</p>");
-  } else if (analysis.mode === "translate" && analysis.italian) {
-    parts.push('<p class="italian">' + escapeText(analysis.italian) + "</p>");
-  } else if (analysis.mode === "gloss" && analysis.english) {
-    parts.push('<p class="english">' + escapeText(analysis.english) + "</p>");
-  } else if (analysis.mode === "assess") {
-    if (analysis.verdict === "correct") {
-      parts.push('<p class="verdict ok">All correct.</p>');
-    } else if (analysis.verdict === null) {
-      // The tutor had something to say but could not mark it on the line, so
-      // the note below stands on its own rather than under a wrong verdict.
-    } else {
-      const fixCount = analysis.segments.filter(s => s.kind === "right").length;
-      parts.push('<p class="verdict">' + (fixCount === 1 ? "One fix." : fixCount + " fixes.") + "</p>");
-      const runs = analysis.segments.map((segment, index) => {
-        if (segment.kind === "wrong") return '<span class="wrong">' + escapeText(segment.text) + "</span>";
-        if (segment.kind === "right") {
-          // A replacement lands straight after the text it replaces, so it
-          // needs a real space to read (and to copy) as a separate word.
-          const isAfterWrong = index > 0 && analysis.segments[index - 1].kind === "wrong";
-          return (isAfterWrong ? " " : "") + '<span class="right">' + escapeText(segment.text) + "</span>";
-        }
-        return escapeText(segment.text);
-      });
-      parts.push('<p class="italian">' + runs.join("") + "</p>");
-    }
-  }
-
-  if (analysis.note) parts.push('<p class="note">' + escapeText(analysis.note) + "</p>");
-
-  return '<div class="answer">' + parts.join("") + "</div>";
+  // previous one being kept on screen. The answer itself is drawn by the one
+  // formatter all three views share (row_format.js).
+  const answer = RosetteFormat.answer(row.analysis);
+  if (!answer) return "";
+  return '<div class="answer">' + answer + "</div>";
 }
 
 function paintGloss(rowId) {

@@ -273,3 +273,27 @@ def test_the_review_page_is_served(runner_module) -> None:
 
     assert response.status_code == 200
     assert "/api/sessions" in response.get_data(as_text=True)
+
+
+def test_both_pages_draw_a_line_with_the_one_shared_formatter(runner_module) -> None:
+    """Three views draw a line now; a second copy of the drawing code is how they drift apart."""
+    client = runner_module.app.test_client()
+
+    formatter = client.get("/row_format.js")
+    assert formatter.status_code == 200
+    assert "RosetteFormat" in formatter.get_data(as_text=True)
+
+    for path in ("/", "/review"):
+        page = client.get(path).get_data(as_text=True)
+        assert '<script src="/row_format.js">' in page, path
+        assert "RosetteFormat.answer(" in page, path
+        # The marking of a corrected line used to be written out in both pages.
+        assert 'kind === "wrong"' not in page, path
+
+
+def test_the_query_pages_renderer_asks_for_the_shared_formatter(runner_module) -> None:
+    """The renderer the Data app loads must reach the same formatter, not carry its own."""
+    renderer = (runner_module.ASSETS_DIR / "dactal_render.js").read_text(encoding="utf-8")
+
+    assert 'import "./row_format.js";' in renderer
+    assert "add_renderer([\"rosette\"]" in renderer

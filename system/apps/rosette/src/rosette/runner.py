@@ -240,6 +240,15 @@ def review() -> Response:
     )
 
 
+@app.route("/row_format.js")
+def row_format() -> Response:
+    """The one formatter both pages draw a line with (and the Data app's query page borrows)."""
+    return Response(
+        (ASSETS_DIR / "row_format.js").read_text(encoding="utf-8"),
+        mimetype="text/javascript",
+    )
+
+
 @app.route("/api/sessions")
 def get_sessions() -> Response:
     """Every sitting written so far, the most recent first.
