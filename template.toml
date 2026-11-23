@@ -10,7 +10,7 @@ slug = "rosette"
 title = "Rosette"
 description = "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail = "template.svg"
-version = "v6"
+version = "v7"
 
 # How this template is DERIVED from the workspace it came from. An
 # update re-runs this recipe rather than diffing two repos, which is what

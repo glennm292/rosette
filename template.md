@@ -2,7 +2,7 @@
 title: "Rosette"
 description: "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail: "template.svg"
-version: v6
+version: v7
 format: v2
 ---
 
@@ -360,6 +360,8 @@ This is distinct from "Adaptation history" below, which is the ADOPTERS' log.
 ### v5 (2026-11-20) -- The notebook and the review page now draw a line with one shared formatter, so a correction reads the same in both; that formatter also gives the workspace's Data app a "rosette" view of past lines. Carries a fix to a workspace test that reported a build-time file as missing.
 
 ### v6 (2026-11-23) -- The review page now shows the result of Rosette's own published queries, run through the real DACTAL engine, instead of working past sittings out in code of its own; a "see the query" button opens that query in the workspace's Data app. The notebook also waits longer before answering a line that still reads as half-written. Newly needed: node, to run a query, and a DACTAL engine snapshot vendored into the app.
+
+### v7 (2026-11-23) -- The same app as v6, re-cut on a current workspace base: the September substrate this template had been published on since v1 is replaced by the November one (minds-v0.10.5) the app is actually developed and run against, so an adopter boots the pairing that is in daily use rather than one nobody has tried. The app itself is unchanged from v6.
 
 ## Adaptation history
 
