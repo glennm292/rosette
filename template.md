@@ -2,7 +2,7 @@
 title: "Rosette"
 description: "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail: "template.svg"
-version: v5
+version: v6
 format: v2
 ---
 
@@ -248,6 +248,12 @@ grammar checklist in `src/rosette/tutor.py` has a tuned list for Italian and a
 generic one for every other language, and adding a tuned list is one new entry
 in that dict; and `TUTOR_MODEL` in the same file is a single constant.
 
+One more optional thing, new in v6: the review page's "see the query" button opens the query
+behind what it is showing in the workspace's **Data app** (the `all-data-visible` skill). That
+app is not part of this template and is not required -- without it the button says there is
+nowhere to open the query, and nothing else changes, because the review page runs those queries
+itself. With it installed, Rosette also hands it four ready-made views of the notebook's lines.
+
 ## Environment
 
 What this template needs INSTALLED, beyond what the template already has.
@@ -256,15 +262,23 @@ converges it at ITS OWN pinned apt snapshot timestamp, so package versions come
 out consistent with the rest of that mind's environment rather than frozen to
 whatever this publisher happened to have.
 
-Nothing extra -- runs on the stock workspace environment. The app's only
-dependencies are ordinary Python packages declared in its own `pyproject.toml`
-(flask, flask-sock, litellm, loguru, pydantic, werkzeug). It is a standalone uv
-project: it carries its own `uv.lock` and its own `.venv`, and its supervisord
-program syncs that project from the lock before starting, so its dependencies
-never move a built-in's. Nothing has to be added to the workspace's own lock or
-venv. It shells out to nothing but the `claude` CLI the workspace already has,
-and only on the keyless route. The `[environment]` tables in
-`template.toml` are therefore empty by design, not by omission.
+Nothing extra to install -- it runs on the stock workspace environment -- but two things it
+needs are worth naming, because neither is a Python package. It runs **node**: the review page
+answers by running the app's own DACTAL queries through the real engine in a short-lived `node`
+process (`src/rosette/run_query.cjs`), and every Minds workspace ships node in its base image,
+so there is nothing to add -- but without node the review page cannot draw. And it carries a
+**snapshot of the DACTAL engine** (`src/rosette/assets/dactal_engine.js`, from dactal.org) so a
+query needs no network; that is third-party code, carried rather than fetched, and it can fall
+behind the live engine the Data app's query page runs.
+
+The app's own dependencies are ordinary Python packages declared in its `pyproject.toml`
+(flask, flask-sock, litellm, loguru, pydantic, werkzeug). It is a standalone uv project: it
+carries its own `uv.lock` and its own `.venv`, and its supervisord program syncs that project
+from the lock before starting, so its dependencies never move a built-in's. Nothing has to be
+added to the workspace's own lock or venv. The only other binary it shells out to is the
+`claude` CLI the workspace already has, and only on the keyless route. The `[environment]`
+tables in `template.toml` are therefore empty -- by design, and now with the two notes above
+rather than by omission.
 
 One runtime note that is not an environment declaration: the page loads two
 webfonts (EB Garamond and Archivo) from Google Fonts when it opens. With no
@@ -344,6 +358,8 @@ This is distinct from "Adaptation history" below, which is the ADOPTERS' log.
 ### v4 (2026-11-19) -- Review page for past sittings; short phrases translated rather than marked; the answer no longer redraws while you edit; rebuilt on the current workspace base.
 
 ### v5 (2026-11-20) -- The notebook and the review page now draw a line with one shared formatter, so a correction reads the same in both; that formatter also gives the workspace's Data app a "rosette" view of past lines. Carries a fix to a workspace test that reported a build-time file as missing.
+
+### v6 (2026-11-23) -- The review page now shows the result of Rosette's own published queries, run through the real DACTAL engine, instead of working past sittings out in code of its own; a "see the query" button opens that query in the workspace's Data app. The notebook also waits longer before answering a line that still reads as half-written. Newly needed: node, to run a query, and a DACTAL engine snapshot vendored into the app.
 
 ## Adaptation history
 

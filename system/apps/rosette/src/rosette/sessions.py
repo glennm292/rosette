@@ -1,45 +1,33 @@
-"""Past work, grouped into the sittings it was written in.
+"""Where one sitting of writing ends and the next begins.
 
-The notebook holds only what is on the page now: the margin scissors puts a
-finished passage into the cleared log, so an evening's work is almost entirely
-*cleared* by the time it is over. Reviewing it means reading both stores back
-together and cutting them where the student stopped writing.
+This is the one thing about past work that a query cannot find for itself. Everything else
+the review page shows -- which lines count, how many were looked up, when a sitting started --
+is a query over the rows ``datasets`` shapes (see ``datasets.SAVED_VIEWS``). Finding the gaps
+is not, because it means walking the lines in order and comparing each to the one before, so
+it happens here, once, and its answer rides along on every line as a property.
+
+The notebook holds only what is on the page now: the margin scissors puts a finished passage
+into the cleared log, so an evening's work is almost entirely *cleared* by the time it is
+over. Reading it back means folding both stores together first.
 """
 
+import re
 from datetime import datetime, timedelta
+from typing import Iterator
 
-from pydantic import BaseModel, Field
-
-from rosette.data_types import Analysis, ClearedLog, Notebook, Row
+from rosette.data_types import ClearedLog, Notebook, Row
 
 # A gap longer than this between one line and the next is a new sitting. Long
 # enough to cover looking a passage up, making tea, or an interruption inside
 # one class; short enough that two evenings never merge into one.
 SESSION_GAP = timedelta(minutes=90)
 
+_NOT_A_KEY = re.compile(r"[^0-9A-Za-z]+")
 
-class Session(BaseModel):
-    """One sitting: the lines written between two long gaps.
 
-    The lines stay in the order they were written. A sitting is usually one
-    passage worked through from the top, so that order is most of its sense --
-    which word was looked up to understand which line, and what was asked next.
-    The counts are only for saying what the sitting held.
-    """
-
-    session_id: str = Field(description="When the first line was written, UTC ISO 8601")
-    started_at: str = Field(description="When the first line was written, UTC ISO 8601")
-    ended_at: str = Field(description="When the last line was written, UTC ISO 8601")
-    languages: tuple[str, ...] = Field(
-        default=(), description="The languages the lines were answered in"
-    )
-    rows: tuple[Row, ...] = Field(
-        default=(), description="Every line of the sitting, oldest first"
-    )
-    line_count: int = Field(description="How many lines the sitting holds in all")
-    looked_up_count: int = Field(description="How many were words or phrases looked up")
-    checked_count: int = Field(description="How many were lines written to be checked")
-    asked_count: int = Field(description="How many were questions")
+def sitting_key(started_at: str) -> str:
+    """A sitting's name: when it began, with nothing in it a clickable link would misread."""
+    return _NOT_A_KEY.sub("_", started_at).strip("_")
 
 
 def _written_at(row: Row) -> datetime:
@@ -68,42 +56,14 @@ def all_rows(notebook: Notebook, cleared: ClearedLog) -> tuple[Row, ...]:
     return tuple(sorted(rows, key=lambda row: row.created_at))
 
 
-def _mode_of(row: Row) -> str | None:
-    analysis: Analysis | None = row.analysis
-    return None if analysis is None else analysis.mode
-
-
-def _as_session(rows: list[Row]) -> Session:
-    languages: list[str] = []
-    for row in rows:
-        if row.language is not None and row.language not in languages:
-            languages.append(row.language)
-    return Session(
-        session_id=rows[0].created_at,
-        started_at=rows[0].created_at,
-        ended_at=rows[-1].created_at,
-        languages=tuple(languages),
-        rows=tuple(rows),
-        line_count=len(rows),
-        # "translate" counts with the lookups: both are the student reaching for
-        # a word they did not have, only in opposite directions.
-        looked_up_count=sum(1 for r in rows if _mode_of(r) in ("gloss", "translate")),
-        checked_count=sum(1 for r in rows if _mode_of(r) == "assess"),
-        asked_count=sum(1 for r in rows if _mode_of(r) == "answer"),
-    )
-
-
-def group_into_sessions(notebook: Notebook, cleared: ClearedLog) -> tuple[Session, ...]:
-    """Cut everything written so far into sittings, the most recent first."""
-    reviewable = [row for row in all_rows(notebook, cleared) if _is_worth_reviewing(row)]
-    if not reviewable:
-        return ()
-
-    sittings: list[list[Row]] = [[reviewable[0]]]
-    for row in reviewable[1:]:
-        if _written_at(row) - _written_at(sittings[-1][-1]) > SESSION_GAP:
-            sittings.append([row])
-        else:
-            sittings[-1].append(row)
-
-    return tuple(reversed([_as_session(sitting) for sitting in sittings]))
+def sittings_of(notebook: Notebook, cleared: ClearedLog) -> Iterator[tuple[str, Row]]:
+    """Every line worth reading back, oldest first, paired with the sitting it belongs to."""
+    previous: Row | None = None
+    sitting = ""
+    for row in all_rows(notebook, cleared):
+        if not _is_worth_reviewing(row):
+            continue
+        if previous is None or _written_at(row) - _written_at(previous) > SESSION_GAP:
+            sitting = sitting_key(row.created_at)
+        previous = row
+        yield sitting, row

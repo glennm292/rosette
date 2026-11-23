@@ -8,7 +8,7 @@ from rosette.data_types import (
     ResponseMode,
     Row,
 )
-from rosette.sessions import SESSION_GAP, group_into_sessions
+from rosette.sessions import SESSION_GAP, sitting_key, sittings_of
 
 _START = datetime(2026, 11, 18, 20, 0, tzinfo=timezone.utc)
 
@@ -45,6 +45,11 @@ def _cleared(row: Row, restored_at: str | None = None) -> ClearedRow:
     )
 
 
+def _sittings(notebook: Notebook, cleared: ClearedLog) -> list[tuple[str, str]]:
+    """Each line as (its sitting, its row id), oldest first."""
+    return [(sitting, row.row_id) for sitting, row in sittings_of(notebook, cleared)]
+
+
 def test_a_long_gap_starts_a_new_sitting() -> None:
     gap_minutes = SESSION_GAP.total_seconds() / 60
     cleared = ClearedLog(
@@ -55,11 +60,11 @@ def test_a_long_gap_starts_a_new_sitting() -> None:
         )
     )
 
-    sessions = group_into_sessions(Notebook(), cleared)
+    sittings = _sittings(Notebook(), cleared)
 
-    assert [s.line_count for s in sessions] == [1, 2]
-    assert sessions[1].started_at == _at(0)
-    assert sessions[1].ended_at == _at(20)
+    assert [row_id for _, row_id in sittings] == ["a", "b", "c"]
+    first, second = sitting_key(_at(0)), sitting_key(_at(20 + gap_minutes + 1))
+    assert [sitting for sitting, _ in sittings] == [first, first, second]
 
 
 def test_lines_inside_the_gap_stay_one_sitting() -> None:
@@ -68,10 +73,10 @@ def test_lines_inside_the_gap_stay_one_sitting() -> None:
         rows=(_cleared(_row("a", 0)), _cleared(_row("b", gap_minutes - 1)))
     )
 
-    sessions = group_into_sessions(Notebook(), cleared)
+    sittings = _sittings(Notebook(), cleared)
 
-    assert len(sessions) == 1
-    assert sessions[0].line_count == 2
+    assert len({sitting for sitting, _ in sittings}) == 1
+    assert len(sittings) == 2
 
 
 def test_a_sitting_keeps_its_lines_in_the_order_they_were_written() -> None:
@@ -85,15 +90,9 @@ def test_a_sitting_keeps_its_lines_in_the_order_they_were_written() -> None:
         )
     )
 
-    (session,) = group_into_sessions(Notebook(), cleared)
+    sittings = _sittings(Notebook(), cleared)
 
-    assert [r.row_id for r in session.rows] == ["a", "b", "c", "d"]
-    assert session.line_count == 4
-    # A translation counts with the lookups: both are a reach for a word the
-    # student did not have, only in opposite directions.
-    assert session.looked_up_count == 2
-    assert session.checked_count == 1
-    assert session.asked_count == 1
+    assert [row_id for _, row_id in sittings] == ["a", "b", "c", "d"]
 
 
 def test_lines_written_out_of_step_are_still_read_oldest_first() -> None:
@@ -102,20 +101,13 @@ def test_lines_written_out_of_step_are_still_read_oldest_first() -> None:
         rows=(_cleared(_row("later", 5)), _cleared(_row("earlier", 1)))
     )
 
-    (session,) = group_into_sessions(Notebook(), cleared)
-
-    assert [r.row_id for r in session.rows] == ["earlier", "later"]
+    assert [row_id for _, row_id in _sittings(Notebook(), cleared)] == ["earlier", "later"]
 
 
-def test_the_newest_sitting_comes_first() -> None:
-    gap_minutes = SESSION_GAP.total_seconds() / 60
-    cleared = ClearedLog(
-        rows=(_cleared(_row("old", 0)), _cleared(_row("new", gap_minutes + 1)))
-    )
-
-    sessions = group_into_sessions(Notebook(), cleared)
-
-    assert [s.rows[0].row_id for s in sessions] == ["new", "old"]
+def test_a_sittings_name_sorts_it_into_place() -> None:
+    """The newest sitting comes first in the view, which sorts on this name alone."""
+    assert sitting_key(_at(0)) < sitting_key(_at(1))
+    assert "-" not in sitting_key(_at(0))
 
 
 def test_a_line_put_back_on_the_page_is_reviewed_once() -> None:
@@ -124,9 +116,7 @@ def test_a_line_put_back_on_the_page_is_reviewed_once() -> None:
     notebook = Notebook(rows=(restored,))
     cleared = ClearedLog(rows=(_cleared(restored, restored_at=_at(90)),))
 
-    (session,) = group_into_sessions(notebook, cleared)
-
-    assert session.line_count == 1
+    assert [row_id for _, row_id in _sittings(notebook, cleared)] == ["a"]
 
 
 def test_blank_lines_and_unanswered_lines_are_left_out() -> None:
@@ -134,25 +124,10 @@ def test_blank_lines_and_unanswered_lines_are_left_out() -> None:
     unanswered = Row(row_id="waiting", text="asino", status="pending", created_at=_at(1))
     notebook = Notebook(rows=(blank, unanswered, _row("answered", 2)))
 
-    (session,) = group_into_sessions(notebook, ClearedLog())
-
-    assert session.line_count == 1
-    assert session.rows[0].row_id == "answered"
+    assert [row_id for _, row_id in _sittings(notebook, ClearedLog())] == ["answered"]
 
 
 def test_nothing_written_yet_is_no_sittings() -> None:
-    assert group_into_sessions(Notebook(), ClearedLog()) == ()
+    assert _sittings(Notebook(), ClearedLog()) == []
 
 
-def test_the_languages_a_sitting_was_written_in_are_named() -> None:
-    notebook = Notebook(
-        rows=(
-            _row("a", 0, language="Italian"),
-            _row("b", 1, language="German"),
-            _row("c", 2, language="Italian"),
-        )
-    )
-
-    (session,) = group_into_sessions(notebook, ClearedLog())
-
-    assert session.languages == ("Italian", "German")

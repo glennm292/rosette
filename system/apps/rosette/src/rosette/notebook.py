@@ -15,6 +15,13 @@ class NotebookStorageError(RosetteError, OSError):
     """Raised when the notebook on disk cannot be read or written."""
 
 
+# Everything this app keeps lives under DATA_DIR. It defaults to
+# ``data/.apps/rosette/`` but is overridable via the ``ROSETTE_DATA_DIR`` env var so a
+# throwaway instance can run against a copy of the data while editing -- see the update-app
+# skill. It lives here, with the stores that read and write it, so every reader of the
+# notebook -- the server, and the datasets module the Data app runs -- agrees on one path.
+DATA_DIR = Path(os.environ.get("ROSETTE_DATA_DIR", "data/.apps/rosette"))
+
 NOTEBOOK_FILENAME = "notebook.json"
 
 # Every cleared line, each labelled with the clearing that removed it, so

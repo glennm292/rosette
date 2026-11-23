@@ -628,6 +628,13 @@ const IDLE_SEND_MS = 500;
 // still reading -- three times over one edit, in the logs. Enter and clicking
 // away both still send at once, so nothing waits on this that need not.
 const IDLE_RESEND_MS = 1800;
+// The wait when the line still reads as half-written -- a trailing article, a
+// comma, a space where the next word is about to go. A pause there is someone
+// reaching for the next word, not someone finished, and answering it wastes a
+// call on a fragment and puts a correction of half a sentence in front of
+// them. Enter and clicking away still send at once, so nothing a student has
+// actually finished waits this out.
+const IDLE_UNFINISHED_MS = 2200;
 // How long to hold off after the connection to the server drops.
 const RECONNECT_MS = 1000;
 
@@ -993,11 +1000,36 @@ function updateTally() {
 
 const idleTimerByRowId = new Map();
 
-function queueSend(rowId) {
+// A sentence that has stopped: ending punctuation, with any closing quote or
+// bracket after it.
+const FINISHED_TAIL = /[.!?…。？！]["'»”’)\]]*$/;
+// A line that cannot be where it ends: a comma or colon, an opened quote or
+// bracket, a hyphen, or an elided article ("l'", "dell'").
+const UNFINISHED_TAIL = /[,;:(\[{«¿¡"'‘“’–—\-\/]$/;
+// A word this short is almost always a word that leans on the next one -- an
+// article, a preposition, a conjunction ("il", "di", "a", "e", "ho").
+const LEANING_WORD_LENGTH = 2;
+
+// Does this line read as still being written? Checked by shape alone, so it
+// holds in whichever language the student is writing, and it only ever decides
+// how long to wait -- never whether to send at all.
+function looksUnfinished(text) {
+  const written = text.replace(/\s+$/, "");
+  if (written === "") return false;
+  if (FINISHED_TAIL.test(written)) return false;
+  // A space typed after the last word: the next word is already on its way.
+  if (written !== text) return true;
+  if (UNFINISHED_TAIL.test(written)) return true;
+  const lastWord = written.split(/\s+/).pop().replace(/^[^\p{L}\p{N}]+/u, "");
+  return lastWord.length <= LEANING_WORD_LENGTH;
+}
+
+function queueSend(rowId, text) {
   const existingTimer = idleTimerByRowId.get(rowId);
   if (existingTimer) window.clearTimeout(existingTimer);
   const stored = answerByRowId.get(rowId);
-  const wait = stored && stored.analysis ? IDLE_RESEND_MS : IDLE_SEND_MS;
+  const settled = stored && stored.analysis ? IDLE_RESEND_MS : IDLE_SEND_MS;
+  const wait = looksUnfinished(text) ? Math.max(settled, IDLE_UNFINISHED_MS) : settled;
   idleTimerByRowId.set(rowId, window.setTimeout(() => {
     idleTimerByRowId.delete(rowId);
     flushRow(rowId);
@@ -1106,7 +1138,7 @@ function handleInput(event) {
   const textarea = event.target;
   if (textarea.tagName !== "TEXTAREA") return;
   growTextarea(textarea);
-  queueSend(textarea.closest(".line").dataset.rowId);
+  queueSend(textarea.closest(".line").dataset.rowId, textarea.value);
 }
 
 function handleFocusIn(event) {

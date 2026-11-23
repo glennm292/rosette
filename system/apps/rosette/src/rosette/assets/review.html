@@ -274,6 +274,7 @@ main { padding: 0 2rem; }
   </div>
   <div class="tools">
     <button type="button" class="tool" id="cover">Cover the meanings</button>
+    <button type="button" class="tool" id="see" hidden>See the query</button>
     <a class="tool" href="/">Back to the notebook</a>
   </div>
 </header>
@@ -291,8 +292,14 @@ const sittingElement = document.getElementById("sitting");
 const whenElement = document.getElementById("when");
 const linesElement = document.getElementById("lines");
 const coverElement = document.getElementById("cover");
+const seeElement = document.getElementById("see");
 
-let sessions = [];
+// What this page shows is the result of running Rosette's own published queries -- the same
+// ones the workspace's Data app offers under "project: rosette", over the same lines. Nothing
+// here counts, groups or sorts anything a second time: each query comes back from the server
+// with its own text, which is what the "see the query" link opens.
+let sittings = [];
+let shownQuery = "";
 
 // Times are stored in UTC; everything shown is in the reader's own clock, so
 // an evening's work reads as the evening it was.
@@ -316,39 +323,39 @@ function countLabel(count, one, many) {
 
 // Short, because this one has to fit in the box: the long form is in the line
 // under the header, where there is room for it.
-function sittingLabel(session) {
-  const when = asDate(session.started_at).toLocaleDateString(undefined, {
+function sittingLabel(sitting) {
+  const when = asDate(sitting.started).toLocaleDateString(undefined, {
     weekday: "short", month: "short", day: "numeric",
   });
-  return when + ", " + timeLabel(session.started_at) +
-    " -- " + countLabel(session.line_count, "line", "lines");
+  return when + ", " + timeLabel(sitting.started) +
+    " -- " + countLabel(sitting.count, "line", "lines");
 }
 
-function buildEntry(row) {
+function buildEntry(line) {
   const entry = document.createElement("div");
-  const mode = RosetteFormat.mode(row);
   // A looked-up word is the only kind worth covering to test yourself on; a
   // correction or an answer has nothing to recall.
-  entry.className = mode === "gloss" || mode === "translate" ? "entry is-lookup" : "entry";
+  entry.className = line.mode === "gloss" || line.mode === "translate"
+    ? "entry is-lookup" : "entry";
 
   const wrote = document.createElement("div");
   wrote.className = "wrote";
   const phrase = document.createElement("p");
   phrase.className = "phrase";
-  phrase.textContent = row.text.trim();
+  phrase.textContent = line.name;
   wrote.appendChild(phrase);
 
   // The model's own reply, kept behind the time it arrived: always reachable,
   // never in the way of reading the list.
-  if (row.raw_response) {
+  if (line.raw_response) {
     const at = document.createElement("button");
     at.type = "button";
     at.className = "at";
-    at.textContent = timeLabel(row.created_at);
+    at.textContent = timeLabel(line.written);
     const raw = document.createElement("pre");
     raw.className = "raw";
     raw.hidden = true;
-    raw.textContent = prettyRaw(row.raw_response);
+    raw.textContent = prettyRaw(line.raw_response);
     at.addEventListener("click", () => { raw.hidden = !raw.hidden; });
     wrote.appendChild(at);
     wrote.appendChild(raw);
@@ -358,7 +365,7 @@ function buildEntry(row) {
   cameBack.className = "came-back";
   // The same formatter the notebook draws its answers with, so a line read back
   // here is the line that was on the page.
-  cameBack.innerHTML = RosetteFormat.answer(row.analysis);
+  cameBack.innerHTML = RosetteFormat.answer(line.analysis);
 
   entry.appendChild(wrote);
   entry.appendChild(cameBack);
@@ -374,33 +381,63 @@ function prettyRaw(raw) {
   }
 }
 
-function paintSession(session) {
-  const held = [
-    countLabel(session.looked_up_count, "word or phrase looked up", "words and phrases looked up"),
-    session.checked_count ? countLabel(session.checked_count, "line checked", "lines checked") : "",
-    session.asked_count ? countLabel(session.asked_count, "question asked", "questions asked") : "",
-  ].filter(Boolean);
-  whenElement.textContent =
-    dayLabel(session.started_at) + ", " + timeLabel(session.started_at) +
-    " to " + timeLabel(session.ended_at) + " -- " + held.join(", ");
-
-  // One list, in the order it was written: a sitting is usually one passage
-  // worked through from the top, and sorting it by what was asked of each line
-  // takes that away.
-  linesElement.replaceChildren(...session.rows.map(buildEntry));
+// A value a query hands back may arrive wrapped in a list of one.
+function one(value) {
+  return Array.isArray(value) ? value[0] : value;
 }
 
-function showNothingYet() {
+function paintHeading(sitting) {
+  const held = [
+    countLabel(sitting.looked_up, "word or phrase looked up", "words and phrases looked up"),
+    sitting.checked ? countLabel(sitting.checked, "line checked", "lines checked") : "",
+    sitting.asked ? countLabel(sitting.asked, "question asked", "questions asked") : "",
+  ].filter(Boolean);
+  whenElement.textContent =
+    dayLabel(sitting.started) + ", " + timeLabel(sitting.started) +
+    " to " + timeLabel(sitting.ended) + " -- " + held.join(", ");
+}
+
+async function showSitting(name) {
+  const sitting = sittings.find(s => s.name === name);
+  if (!sitting) return;
+  paintHeading(sitting);
+  let payload = null;
+  try {
+    const response = await fetch("/api/review/lines?sitting=" + encodeURIComponent(name));
+    if (response.ok) payload = await response.json();
+  } catch (error) { /* handled as nothing coming back */ }
+  if (!payload) {
+    say("Could not read that sitting back just now.");
+    return;
+  }
+  shownQuery = payload.query;
+  seeElement.hidden = false;
+  linesElement.replaceChildren(...payload.rows.map(buildEntry));
+}
+
+function say(words) {
   whenElement.textContent = "";
   const nothing = document.createElement("p");
   nothing.className = "empty";
-  nothing.textContent = "Nothing to review yet. Write a few lines in the notebook first.";
+  nothing.textContent = words;
   linesElement.replaceChildren(nothing);
 }
 
-sittingElement.addEventListener("change", () => {
-  const session = sessions.find(s => s.session_id === sittingElement.value);
-  if (session) paintSession(session);
+sittingElement.addEventListener("change", () => { showSitting(sittingElement.value); });
+
+// The query behind what is on screen, opened in the workspace's Data app, where it can be
+// read and changed. The page itself does not move.
+seeElement.addEventListener("click", async () => {
+  if (!shownQuery) return;
+  seeElement.disabled = true;
+  try {
+    const response = await fetch("/see-the-query?query=" + encodeURIComponent(shownQuery),
+                                 {method: "POST"});
+    if (!response.ok) seeElement.textContent = "No Data app to open it in";
+  } catch (error) {
+    seeElement.textContent = "No Data app to open it in";
+  }
+  seeElement.disabled = false;
 });
 
 coverElement.addEventListener("click", () => {
@@ -422,29 +459,39 @@ linesElement.addEventListener("click", event => {
 });
 
 async function start() {
-  let payload = {sessions: []};
+  let payload = null;
   try {
-    const response = await fetch("/api/sessions");
+    const response = await fetch("/api/review/sittings");
     if (response.ok) payload = await response.json();
-  } catch (error) {
-    showNothingYet();
-    return;
-  }
-  sessions = payload.sessions || [];
-  if (sessions.length === 0) {
-    showNothingYet();
+  } catch (error) { /* handled as nothing coming back */ }
+  if (!payload) {
+    say("Could not read your past sittings just now.");
     sittingElement.hidden = true;
     return;
   }
-  for (const session of sessions) {
+  sittings = payload.rows.map(row => ({
+    name: one(row.name),
+    count: one(row.count),
+    looked_up: one(row.looked_up),
+    checked: one(row.checked),
+    asked: one(row.asked),
+    started: one(row.started),
+    ended: one(row.ended),
+  }));
+  if (sittings.length === 0) {
+    say("Nothing to review yet. Write a few lines in the notebook first.");
+    sittingElement.hidden = true;
+    return;
+  }
+  for (const sitting of sittings) {
     const option = document.createElement("option");
-    option.value = session.session_id;
-    option.textContent = sittingLabel(session);
+    option.value = sitting.name;
+    option.textContent = sittingLabel(sitting);
     sittingElement.appendChild(option);
   }
   // The newest sitting is the one being reviewed almost every time.
-  sittingElement.value = sessions[0].session_id;
-  paintSession(sessions[0]);
+  sittingElement.value = sittings[0].name;
+  await showSitting(sittings[0].name);
 }
 
 start();

@@ -3,6 +3,7 @@ from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
+from urllib.parse import quote
 from typing import Final
 
 from flask import Flask, Response, jsonify, request
@@ -18,8 +19,8 @@ from rosette.credentials import (
     store_api_key,
 )
 from rosette.data_types import Analysis, Row
-from rosette.notebook import NotebookStorageError, NotebookStore, now_utc_iso
-from rosette.sessions import group_into_sessions
+from rosette.datasets import LINES_IN_A_SITTING_QUERY, SITTINGS_QUERY
+from rosette.notebook import DATA_DIR, NotebookStorageError, NotebookStore, now_utc_iso
 from rosette.settings import SettingsStore
 from rosette.tutor import (
     CONTEXT_LINE_COUNT,
@@ -28,14 +29,12 @@ from rosette.tutor import (
     RosetteError,
     analyze_line,
 )
+from rosette.views import QUERY_APP, ViewError, open_in_workspace, run_view
 
 ASSETS_DIR = Path(__file__).parent / "assets"
 
-# Persistent state for this app lives under DATA_DIR. It defaults to
-# ``data/.apps/rosette/`` but is overridable via the
-# ``ROSETTE_DATA_DIR`` env var so a throwaway instance can run against a
-# copy of the data while editing -- see the update-app skill.
-DATA_DIR = Path(os.environ.get("ROSETTE_DATA_DIR", "data/.apps/rosette"))
+# Where this app's own records live. Defined by ``notebook``, beside the stores that read and
+# write them, so the datasets module the Data app runs resolves the same path this does.
 
 # Listen port. Overridable via ``ROSETTE_PORT`` so an editing agent can
 # boot a throwaway instance on a spare port next to the live one.
@@ -249,17 +248,48 @@ def row_format() -> Response:
     )
 
 
-@app.route("/api/sessions")
-def get_sessions() -> Response:
-    """Every sitting written so far, the most recent first.
+@app.route("/see-the-query", methods=["POST"])
+def see_the_query() -> ResponseReturnValue:
+    """Open the workspace's Data app on the query behind what the page is showing.
 
-    Both stores are read: what is on the page now, and everything the margin
-    scissors has put away -- which is where a finished evening's work lives.
+    Answers 204 so the review page never navigates away from itself, the same way the Data
+    app's own links behave. If this workspace has no Data app, that is not an error worth
+    interrupting anyone over -- the page simply says so.
     """
-    sessions = group_into_sessions(
-        _notebook_store.load(), _notebook_store.load_cleared()
-    )
-    return jsonify({"sessions": [s.model_dump(mode="json") for s in sessions]})
+    query = request.args.get("query", "")
+    if not query:
+        return jsonify({"error": "No query to open."}), 400
+    path = f"/dactal.html?dbname=workspace&query={quote(query)}"
+    status = open_in_workspace(QUERY_APP, path, request.args.get("client", ""))
+    if status >= 300:
+        return jsonify({"error": "Could not open the Data app."}), 502
+    return Response(status=204)
+
+
+@app.route("/api/review/sittings")
+def get_sittings() -> ResponseReturnValue:
+    """Every sitting written so far, the most recent first, with what each one held.
+
+    The result of running the published query, not a second count of the same lines: the
+    query comes back with it, so the page can offer to open the very thing it just showed.
+    """
+    try:
+        return jsonify({"query": SITTINGS_QUERY, "rows": run_view(SITTINGS_QUERY, DATA_DIR)})
+    except ViewError as error:
+        return jsonify({"error": str(error)}), 503
+
+
+@app.route("/api/review/lines")
+def get_lines() -> ResponseReturnValue:
+    """One sitting's lines, oldest first, as the published query returns them."""
+    sitting = request.args.get("sitting", "")
+    if not sitting.replace("_", "").isalnum():
+        return jsonify({"error": "That is not the name of a sitting."}), 400
+    query = LINES_IN_A_SITTING_QUERY.format(sitting=sitting)
+    try:
+        return jsonify({"query": query, "rows": run_view(query, DATA_DIR)})
+    except ViewError as error:
+        return jsonify({"error": str(error)}), 503
 
 
 @app.route("/api/notebook")

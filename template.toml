@@ -10,7 +10,7 @@ slug = "rosette"
 title = "Rosette"
 description = "A two-column notebook for language class: your notes and work on the left, automatic translations and corrections on the right. Runs inside Mind, or standalone with your own Anthropic API key."
 thumbnail = "template.svg"
-version = "v5"
+version = "v6"
 
 # How this template is DERIVED from the workspace it came from. An
 # update re-runs this recipe rather than diffing two repos, which is what
@@ -47,8 +47,9 @@ modification_rules = []
 # This app needs LLM access and nothing else: no latchkey permission, no
 # third-party account and no required secret. An Anthropic API key is
 # optional (it is how the app runs outside a Mind), so it is described under
-# `llm` rather than declared as a secret. `permission`, `secret` and
-# `adaptation` are all genuinely empty and only `llm` is declared.
+# `llm` rather than declared as a secret. `permission` and `secret` are
+# genuinely empty; besides `llm`, one optional `adaptation` is declared (the
+# review page's "see the query" button and the workspace's Data app).
 [requirements]
 
 [requirements.llm]
@@ -64,17 +65,34 @@ required inside a Mind already signed in to Claude; a key is what lets the app \
 run standalone, outside one.\
 """
 
-# What the included code needs INSTALLED. apt takes bare names: versions
-# are a function of the apt snapshot timestamp, so replaying names at the
-# adopter's timestamp yields versions consistent with the rest of their
-# environment. The other sources are not snapshot-pinned, so for them the
-# recorded version IS the pin (name = version).
+[[requirements.adaptation]]
+summary = "the review page's \"see the query\" button opens the workspace's Data app"
+resolution = "optional: install the all-data-visible skill's Data app to get it. Without it the button says there is nowhere to open the query and nothing else changes -- the review page still runs the same queries itself. With it, Rosette also publishes four saved views of the notebook's lines."
+
+# What the included code needs INSTALLED. apt takes bare names: versions are a
+# function of the apt snapshot timestamp, so replaying names at the adopter's
+# timestamp yields versions consistent with the rest of their environment. The
+# other sources are not snapshot-pinned, so for them the recorded version IS the
+# pin (name = version).
 #
-# Nothing to install. The app's dependencies are ordinary Python packages
-# declared in system/apps/rosette/pyproject.toml (flask, flask-sock, litellm,
-# loguru, pydantic, werkzeug), and the only binary it shells out to is the
-# `claude` CLI the workspace already ships (keyless route only). Empty by
-# design, not by omission.
+# Nothing to install, but two things the app needs are worth naming, because
+# neither is a Python package in its pyproject.toml:
+#
+#   node -- the review page runs the app's own DACTAL queries through the real
+#   engine, in a short-lived `node` process (src/rosette/run_query.cjs). Every
+#   Minds workspace ships node in its base image (pinned by
+#   system/scripts/setup_system.sh), so there is nothing to add here; but
+#   without node the review page cannot draw, which is why it is named.
+#
+#   The DACTAL engine itself -- a snapshot of dactal.org's dactal.js, vendored
+#   at src/rosette/assets/dactal_engine.js so a query needs no network. Third
+#   party code, carried rather than fetched, and it can fall behind the live
+#   engine the Data app's query page runs.
+#
+# The app's Python dependencies are ordinary packages in
+# system/apps/rosette/pyproject.toml (flask, flask-sock, litellm, loguru,
+# pydantic, werkzeug), and the only other binary it shells out to is the
+# `claude` CLI the workspace already ships (keyless route only).
 #
 # (The page also pulls two webfonts from Google Fonts at runtime and falls
 # back to system serif/sans without network -- a runtime fetch, not an

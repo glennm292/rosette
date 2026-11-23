@@ -1,9 +1,13 @@
 import importlib
 import json
+import re
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
 import pytest
+import rosette.notebook
 import rosette.runner
 from rosette.credentials import API_KEY_FILENAME
 from rosette.data_types import Analysis, Row
@@ -14,10 +18,12 @@ from rosette.notebook import now_utc_iso
 def runner_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """The runner bound to a throwaway data directory.
 
-    Its stores are built at import time from the data directory, so the
-    override has to be in place before the module is reloaded.
+    The data directory is read from the environment when ``notebook`` is imported, and the
+    runner's stores are built from it when the runner is, so both are reloaded, in that
+    order, with the override in place.
     """
     monkeypatch.setenv("ROSETTE_DATA_DIR", str(tmp_path))
+    importlib.reload(rosette.notebook)
     return importlib.reload(rosette.runner)
 
 
@@ -262,17 +268,52 @@ def test_the_review_page_reads_both_what_is_on_the_page_and_what_was_cleared(
     )
     store.delete_row_and_below("put-away")
 
-    sessions = client.get("/api/sessions").get_json()["sessions"]
+    sittings = client.get("/api/review/sittings").get_json()["rows"]
 
-    assert len(sessions) == 1
-    assert [r["row_id"] for r in sessions[0]["rows"]] == ["put-away"]
+    assert len(sittings) == 1
+    lines = client.get(f"/api/review/lines?sitting={sittings[0]['name']}").get_json()["rows"]
+    assert [row["id"] for row in lines] == ["put_away"]
+
+
+def test_the_review_page_shows_what_the_query_says_and_says_which_query(
+    runner_module,
+) -> None:
+    """The two halves of the mirror: the page runs the published query, and offers to open it."""
+    client = runner_module.app.test_client()
+    store = runner_module._notebook_store
+    for row_id, mode, english in (("a", "gloss", "donkey"), ("b", "assess", None)):
+        store.upsert_row(
+            Row(
+                row_id=row_id,
+                text="asino",
+                status="done",
+                analysis=Analysis(mode=mode, english=english, verdict=None),
+                created_at=now_utc_iso(),
+            ),
+            None,
+        )
+
+    answered = client.get("/api/review/sittings").get_json()
+
+    # The counts are the query's, not a second tally in Python.
+    (sitting,) = answered["rows"]
+    assert (sitting["looked_up"], sitting["checked"], sitting["asked"]) == (1, 1, 0)
+    # And the query that produced them comes back with them, for "see the query".
+    assert answered["query"] == runner_module.SITTINGS_QUERY
+
+
+def test_a_sitting_that_is_not_a_sitting_is_refused(runner_module) -> None:
+    """The name goes into a query; nothing that is not a sitting's name may."""
+    answered = runner_module.app.test_client().get("/api/review/lines?sitting=rosette.lines")
+
+    assert answered.status_code == 400
 
 
 def test_the_review_page_is_served(runner_module) -> None:
     response = runner_module.app.test_client().get("/review")
 
     assert response.status_code == 200
-    assert "/api/sessions" in response.get_data(as_text=True)
+    assert "/api/review/sittings" in response.get_data(as_text=True)
 
 
 def test_both_pages_draw_a_line_with_the_one_shared_formatter(runner_module) -> None:
@@ -297,3 +338,68 @@ def test_the_query_pages_renderer_asks_for_the_shared_formatter(runner_module) -
 
     assert 'import "./row_format.js";' in renderer
     assert "add_renderer([\"rosette\"]" in renderer
+
+
+def _unfinished_check_source(runner_module) -> str:
+    """The page's own half-written-line check, lifted out so it can be run on its own."""
+    page = (runner_module.ASSETS_DIR / "index.html").read_text(encoding="utf-8")
+    start = page.index("const FINISHED_TAIL")
+    end = page.index("function queueSend(", start)
+    return page[start:end]
+
+
+def _number_in(page: str, name: str) -> int:
+    found = re.search(rf"const {name} = (\d+);", page)
+    assert found is not None, f"{name} is not in the page"
+    return int(found.group(1))
+
+
+def test_the_page_waits_longer_for_a_line_that_is_still_being_written(runner_module) -> None:
+    """The patient wait has to be the longer one, or the check makes things worse, not better."""
+    page = (runner_module.ASSETS_DIR / "index.html").read_text(encoding="utf-8")
+    sends = _number_in(page, "IDLE_SEND_MS")
+    unfinished = _number_in(page, "IDLE_UNFINISHED_MS")
+
+    assert unfinished > sends
+    assert "looksUnfinished(text) ? Math.max(settled, IDLE_UNFINISHED_MS) : settled" in page
+
+
+@pytest.mark.parametrize(
+    "line, still_writing",
+    [
+        ("Vorrei andare a", True),  # a preposition with nothing after it
+        ("Mi piace il", True),  # an article with nothing after it
+        ("Non ho", True),
+        ("Vorrei andare ", True),  # a space typed: the next word is coming
+        ("Ho mangiato,", True),
+        ("l'", True),  # an elided article
+        ("Ieri sono andato al mercato", False),
+        ("Ieri sono andato al mercato.", False),
+        ("Come stai?", False),
+        ("Buongiorno", False),
+        ("Ciao. ", False),  # finished, with a stray space after it
+        ("I want to", True),  # the shape holds outside Italian
+        ("", False),
+    ],
+)
+def test_a_half_written_line_is_recognised_by_shape(
+    runner_module, line: str, still_writing: bool
+) -> None:
+    """Every one of these is a real pause mid-sentence, or a real place to stop."""
+    if shutil.which("node") is None:
+        pytest.skip("no node available to run the page's own check")
+
+    program = (
+        _unfinished_check_source(runner_module)
+        + "\nprocess.stdout.write(String(looksUnfinished("
+        + json.dumps(line)
+        + ")));"
+    )
+    answer = subprocess.run(
+        ["node", "--input-type=module", "-e", program],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert answer.stdout == ("true" if still_writing else "false")
